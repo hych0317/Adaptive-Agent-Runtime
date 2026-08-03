@@ -1,0 +1,19 @@
+# Copy to llm.local.toml and fill only the providers you use.
+# llm.local.toml is application-owned persistent configuration and is ignored.
+
+schema_version = 1
+
+[providers.deepseek]
+# api_key = "sk-..."
+
+[providers.openai]
+# api_key = "sk-..."
+
+[providers.qwen_china]
+# api_key = "sk-..."
+
+[providers.qwen_international]
+# api_key = "sk-..."
+
+[providers.anthropic]
+# api_key = "sk-ant-..."

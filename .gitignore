@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.coverage
+.venv/
+dist/
+build/
+*.egg-info/
+config/llm.local.toml

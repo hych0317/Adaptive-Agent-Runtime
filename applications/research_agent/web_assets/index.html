@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#f3f7f6">
+    <title>Research Runtime Console</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#" aria-label="Adaptive Agent Runtime home">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span>
+          <strong>Adaptive Agent Runtime</strong>
+          <small>Research Operations Console</small>
+        </span>
+      </a>
+      <div class="runtime-meta">
+        <span class="connection"><i></i><span id="inferenceLabel">Runtime Ready</span></span>
+        <span class="mono" id="runId">NO ACTIVE RUN</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="command-bar" aria-labelledby="commandTitle">
+        <div class="command-copy">
+          <span class="eyebrow">RESEARCH MISSION</span>
+          <h1 id="commandTitle">让 Runtime 的每一步都可见</h1>
+        </div>
+        <form id="researchForm" class="research-form">
+          <label class="sr-only" for="taskInput">研究任务</label>
+          <input
+            id="taskInput"
+            name="task"
+            value="分析 Tesla 投资价值"
+            maxlength="500"
+            autocomplete="off"
+            required
+          >
+          <button id="runButton" type="submit">
+            <span class="button-label">开始研究</span>
+            <span class="button-arrow" aria-hidden="true">→</span>
+          </button>
+        </form>
+        <div class="run-message" id="runMessage" role="status">
+          默认使用无费用的 Demo Runtime；真实 LLM 需在启动服务时显式配置。
+        </div>
+      </section>
+
+      <section class="metric-strip" aria-label="Run metrics">
+        <div class="metric"><span>节点</span><strong id="metricNodes">—</strong></div>
+        <div class="metric"><span>Runtime Events</span><strong id="metricEvents">—</strong></div>
+        <div class="metric"><span>Tool Traces</span><strong id="metricTools">—</strong></div>
+        <div class="metric"><span>Context Assemblies</span><strong id="metricContext">—</strong></div>
+        <div class="metric"><span>Trajectory</span><strong id="metricScore">—</strong></div>
+        <div class="metric metric-status"><span>Run Status</span><strong id="metricStatus">IDLE</strong></div>
+      </section>
+
+      <nav class="view-tabs" aria-label="Console views">
+        <button class="tab is-active" data-view="overview" aria-selected="true">运行总览</button>
+        <button class="tab" data-view="report" aria-selected="false">研究报告</button>
+        <button class="tab" data-view="context" aria-selected="false">Context &amp; Memory</button>
+        <button class="tab" data-view="evaluation" aria-selected="false">Evaluation &amp; Governance</button>
+      </nav>
+
+      <section class="view is-active" id="view-overview">
+        <div class="overview-grid">
+          <section class="panel graph-panel">
+            <header class="panel-header">
+              <div>
+                <span class="eyebrow">DYNAMIC TASK GRAPH</span>
+                <h2>Execution topology</h2>
+              </div>
+              <div class="legend" aria-label="Node status legend">
+                <span><i class="dot running"></i>执行中</span>
+                <span><i class="dot complete"></i>完成</span>
+                <span><i class="dot dynamic"></i>动态新增</span>
+              </div>
+            </header>
+            <div class="graph-stage" id="graphStage">
+              <svg id="graphEdges" aria-hidden="true"></svg>
+              <div class="empty-state" id="graphEmpty">
+                <span class="empty-index">00</span>
+                <h3>Runtime awaiting mission</h3>
+                <p>提交研究任务后，这里将实时展示任务图的规划、动态扩展与节点状态。</p>
+              </div>
+            </div>
+          </section>
+
+          <aside class="panel inspector-panel" aria-live="polite">
+            <header class="panel-header compact">
+              <div>
+                <span class="eyebrow">NODE INSPECTOR</span>
+                <h2>节点详情</h2>
+              </div>
+              <span class="status-pill" id="nodeStatus">EMPTY</span>
+            </header>
+            <div id="nodeInspector" class="inspector-empty">
+              点击 Task Graph 中的节点查看 Strategy、依赖、输出与 Tool 调用。
+            </div>
+          </aside>
+        </div>
+
+        <section class="panel timeline-panel">
+          <header class="panel-header compact">
+            <div>
+              <span class="eyebrow">RUNTIME-NATIVE TRACE</span>
+              <h2>Plan → Execute → Observation → State</h2>
+            </div>
+            <div class="trace-filters" id="traceFilters">
+              <button class="is-active" data-filter="all">ALL</button>
+              <button data-filter="plan">PLAN</button>
+              <button data-filter="action">ACTION</button>
+              <button data-filter="observation">OBSERVATION</button>
+              <button data-filter="state">STATE</button>
+            </div>
+          </header>
+          <div class="timeline" id="timeline">
+            <div class="timeline-empty">执行完成后显示有序 Trace。</div>
+          </div>
+        </section>
+      </section>
+
+      <section class="view" id="view-report" hidden>
+        <div class="report-grid">
+          <article class="panel report-paper" id="reportContent">
+            <div class="empty-state report-empty">
+              <span class="empty-index">R</span>
+              <h3>Research report pending</h3>
+              <p>结构化报告将在 Task Graph 完成后生成。</p>
+            </div>
+          </article>
+          <aside class="panel evidence-panel">
+            <header class="panel-header compact">
+              <div>
+                <span class="eyebrow">EVIDENCE LINEAGE</span>
+                <h2>结论来源</h2>
+              </div>
+            </header>
+            <div id="evidenceList" class="stack-list">
+              <p class="muted">暂无可追溯证据。</p>
+            </div>
+            <div class="fixture-notice" id="fixtureNotice">
+              Demo 数据会在此明确标记，不与实时市场数据混淆。
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="view" id="view-context" hidden>
+        <div class="context-layout">
+          <section class="panel lifecycle-panel">
+            <header class="panel-header">
+              <div>
+                <span class="eyebrow">CONTEXT LIFECYCLE</span>
+                <h2>认知资源驻留状态</h2>
+              </div>
+              <span class="mono muted" id="contextTokenSummary">0 TOKENS</span>
+            </header>
+            <div class="lifecycle-board">
+              <div class="lifecycle-column">
+                <h3><i class="dot active"></i>Active</h3>
+                <div id="contextActive" class="context-list"></div>
+              </div>
+              <div class="lifecycle-column">
+                <h3><i class="dot compressed"></i>Compressed</h3>
+                <div id="contextCompressed" class="context-list"></div>
+              </div>
+              <div class="lifecycle-column">
+                <h3><i class="dot archived"></i>Archived</h3>
+                <div id="contextArchived" class="context-list"></div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel memory-panel">
+            <header class="panel-header">
+              <div>
+                <span class="eyebrow">CONDITIONAL MEMORY</span>
+                <h2>影响未来行为的经验</h2>
+              </div>
+              <span class="count-badge" id="memoryCount">0</span>
+            </header>
+            <div class="memory-grid" id="memoryGrid">
+              <p class="muted">暂无 Memory。</p>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" id="view-evaluation" hidden>
+        <div class="evaluation-grid">
+          <section class="panel score-panel">
+            <header class="panel-header">
+              <div>
+                <span class="eyebrow">AGENT EVALUATION</span>
+                <h2>执行质量</h2>
+              </div>
+              <strong class="overall-score" id="overallScore">—</strong>
+            </header>
+            <div class="score-list" id="scoreList">
+              <p class="muted">完成运行后生成评估。</p>
+            </div>
+            <div class="failure-chain" id="failureChain"></div>
+          </section>
+
+          <section class="panel governance-panel">
+            <header class="panel-header">
+              <div>
+                <span class="eyebrow">RUNTIME GOVERNANCE</span>
+                <h2>Rule → Confidence → Review</h2>
+              </div>
+              <span class="count-badge" id="reviewCount">0 REVIEW</span>
+            </header>
+            <div class="governance-list" id="governanceList">
+              <p class="muted">暂无治理决策。</p>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>APPLICATION LAYER DEMO</span>
+      <span>Core · Orchestration · Context-Memory · Tool · Evaluation · Governance</span>
+    </footer>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>
