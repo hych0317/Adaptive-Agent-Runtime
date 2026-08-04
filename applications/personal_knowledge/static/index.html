@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>砚台 · 个人知识库</title>
+  <style>
+    :root {
+      --paper: #f3efe4;
+      --paper-deep: #e8e0cf;
+      --ink: #20241f;
+      --ink-soft: #686b62;
+      --line: #c9c0ad;
+      --red: #a53b2c;
+      --green: #425e4b;
+      --white: #fffdf7;
+      --shadow: 0 18px 50px rgba(46, 39, 28, .12);
+      --serif: "Iowan Old Style", "Noto Serif SC", "Songti SC", Georgia, serif;
+      --sans: "Avenir Next", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; color: var(--ink); background: var(--paper);
+      font-family: var(--sans); min-height: 100vh;
+      background-image: linear-gradient(rgba(75, 68, 54, .035) 1px, transparent 1px);
+      background-size: 100% 28px;
+    }
+    button, input, textarea, select { font: inherit; }
+    button { cursor: pointer; }
+    :focus-visible { outline: 3px solid rgba(165, 59, 44, .28); outline-offset: 2px; }
+    .shell { display: grid; grid-template-columns: 232px minmax(0, 1fr); min-height: 100vh; }
+    aside {
+      padding: 34px 22px; border-right: 1px solid var(--line); background: rgba(243, 239, 228, .9);
+      position: sticky; top: 0; height: 100vh;
+    }
+    .brand { display: flex; align-items: center; gap: 12px; margin: 0 8px 42px; }
+    .seal {
+      width: 42px; height: 42px; display: grid; place-items: center; color: var(--white);
+      background: var(--red); font-family: var(--serif); font-size: 24px; box-shadow: 3px 3px 0 #773126;
+    }
+    .brand h1 { margin: 0; font: 700 21px/1 var(--serif); letter-spacing: .08em; }
+    .brand small { color: var(--ink-soft); letter-spacing: .12em; }
+    nav { display: grid; gap: 5px; }
+    nav button {
+      display: flex; justify-content: space-between; align-items: center; border: 0; color: var(--ink-soft);
+      background: transparent; padding: 12px 14px; text-align: left; border-left: 3px solid transparent;
+    }
+    nav button.active { color: var(--ink); background: var(--paper-deep); border-left-color: var(--red); }
+    nav .count { font-size: 12px; font-variant-numeric: tabular-nums; }
+    .aside-note { position: absolute; left: 30px; right: 26px; bottom: 30px; color: var(--ink-soft); font: 14px/1.6 var(--serif); }
+    main { padding: 52px clamp(28px, 6vw, 88px) 80px; max-width: 1400px; width: 100%; }
+    .topline { display: flex; justify-content: space-between; gap: 24px; align-items: end; margin-bottom: 38px; }
+    .eyebrow { color: var(--red); text-transform: uppercase; letter-spacing: .18em; font-size: 12px; font-weight: 700; }
+    h2 { margin: 7px 0 0; font: 700 clamp(32px, 4vw, 52px)/1.05 var(--serif); letter-spacing: -.025em; }
+    .topline p { max-width: 450px; color: var(--ink-soft); line-height: 1.7; margin: 0; }
+    .view[hidden] { display: none; }
+    .grid { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(270px, .6fr); gap: 24px; }
+    .panel { background: rgba(255, 253, 247, .72); border: 1px solid var(--line); box-shadow: var(--shadow); }
+    .panel-head { padding: 22px 24px 16px; border-bottom: 1px solid var(--line); }
+    .panel-head h3 { margin: 0; font: 700 22px/1.2 var(--serif); }
+    .panel-body { padding: 24px; }
+    .field { display: grid; gap: 8px; margin-bottom: 18px; }
+    label { color: var(--ink-soft); font-size: 13px; font-weight: 650; letter-spacing: .04em; }
+    input, textarea, select {
+      width: 100%; border: 1px solid var(--line); border-radius: 0; padding: 12px 13px;
+      background: var(--white); color: var(--ink);
+    }
+    textarea { min-height: 170px; resize: vertical; line-height: 1.65; }
+    .row { display: flex; gap: 12px; align-items: center; }
+    .row > * { flex: 1; }
+    .primary, .quiet, .danger {
+      border: 1px solid var(--ink); padding: 11px 17px; transition: transform .16s, box-shadow .16s, background .16s;
+    }
+    .primary { color: var(--white); background: var(--ink); }
+    .primary:hover { transform: translateY(-2px); box-shadow: 4px 4px 0 var(--red); }
+    .quiet { color: var(--ink); background: transparent; border-color: var(--line); }
+    .quiet:hover { background: var(--paper-deep); }
+    .danger { color: var(--white); background: var(--red); border-color: var(--red); }
+    .list { display: grid; gap: 12px; }
+    .item { background: var(--white); border: 1px solid var(--line); padding: 18px 20px; }
+    .item h4 { margin: 0 0 8px; font: 700 19px/1.3 var(--serif); }
+    .item p { margin: 0; color: var(--ink-soft); line-height: 1.55; }
+    .item-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 15px; gap: 12px; }
+    .tags { display: flex; flex-wrap: wrap; gap: 6px; }
+    .tag { padding: 4px 8px; background: var(--paper-deep); color: var(--ink-soft); font-size: 12px; }
+    .rule-stats { display: grid; gap: 0; }
+    .stat { padding: 20px 0; border-bottom: 1px solid var(--line); }
+    .stat strong { display: block; font: 700 28px/1 var(--serif); }
+    .stat span { color: var(--ink-soft); font-size: 13px; }
+    .empty { padding: 52px 24px; text-align: center; color: var(--ink-soft); border: 1px dashed var(--line); font-family: var(--serif); }
+    .searchbar { display: grid; grid-template-columns: 1fr auto; gap: 10px; margin-bottom: 14px; }
+    .check { display: flex; gap: 8px; align-items: center; color: var(--ink-soft); margin-bottom: 24px; }
+    .check input { width: auto; }
+    .scope { color: var(--red); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; }
+    .answer { border-left: 4px solid var(--green); padding: 18px 22px; background: #edf0e8; margin-bottom: 22px; line-height: 1.7; }
+    dialog { border: 1px solid var(--ink); padding: 0; width: min(880px, calc(100vw - 32px)); max-height: 92vh; background: var(--paper); box-shadow: 0 30px 90px rgba(20, 19, 16, .34); }
+    dialog::backdrop { background: rgba(26, 27, 24, .64); backdrop-filter: blur(3px); }
+    .modal-head { position: sticky; top: 0; z-index: 2; background: var(--paper); padding: 22px 28px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--line); }
+    .modal-head h3 { margin: 0; font: 700 24px/1 var(--serif); }
+    .modal-body { padding: 28px; overflow: auto; }
+    .modal-foot { position: sticky; bottom: 0; background: var(--paper); padding: 16px 28px; border-top: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; }
+    .assurance { color: var(--green); font-size: 13px; }
+    .conversation { margin: 22px 0; padding: 18px; border-left: 2px solid var(--line); background: var(--paper-deep); }
+    .toast { position: fixed; right: 24px; bottom: 24px; padding: 13px 18px; background: var(--ink); color: var(--white); transform: translateY(120px); opacity: 0; transition: .2s; z-index: 20; }
+    .toast.show { transform: none; opacity: 1; }
+    @media (max-width: 820px) {
+      .shell { display: block; }
+      aside { position: static; height: auto; padding: 18px; border-right: 0; border-bottom: 1px solid var(--line); }
+      .brand { margin: 0 0 16px; }
+      nav { grid-template-columns: repeat(3, 1fr); }
+      nav button { justify-content: center; gap: 8px; border-left: 0; border-bottom: 3px solid transparent; }
+      nav button.active { border-bottom-color: var(--red); }
+      .aside-note { display: none; }
+      main { padding: 34px 18px 60px; }
+      .topline { display: block; }
+      .topline p { margin-top: 16px; }
+      .grid { grid-template-columns: 1fr; }
+      .row { align-items: stretch; flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside>
+      <div class="brand"><div class="seal">砚</div><div><h1>砚台</h1><small>PERSONAL KNOWLEDGE</small></div></div>
+      <nav aria-label="主要导航">
+        <button class="active" data-view="inbox">待审 <span class="count" id="inbox-count">0</span></button>
+        <button data-view="library">知识 <span class="count" id="entry-count">0</span></button>
+        <button data-view="explore">检索 <span>⌕</span></button>
+      </nav>
+      <p class="aside-note">原文是材料，<br>经你确认的思考才是知识。</p>
+    </aside>
+
+    <main>
+      <section class="view" id="view-inbox">
+        <header class="topline"><div><span class="eyebrow">Review desk</span><h2>收拢，再沉淀</h2></div><p>来源与对话先留在存档区。只有你在确认界面编辑并按下“确认入库”，内容才会进入知识库。</p></header>
+        <div class="grid">
+          <section class="panel">
+            <div class="panel-head"><h3>记录新材料</h3></div>
+            <form class="panel-body" id="capture-form">
+              <div class="row">
+                <div class="field"><label for="capture-kind">输入类型</label><select id="capture-kind"><option value="idea">我的想法</option><option value="text">粘贴原文</option><option value="url">文章链接</option><option value="video">视频链接 / BV号</option></select></div>
+                <div class="field"><label for="capture-title">标题（可选）</label><input id="capture-title" placeholder="给这次记录一个线索"></div>
+              </div>
+              <div class="field"><label for="capture-value">内容或 URL</label><textarea id="capture-value" required placeholder="写下刚刚冒出的想法，或粘贴要审阅的材料……"></textarea></div>
+              <div class="field"><label for="capture-note">我的初步判断（可选）</label><input id="capture-note" placeholder="为什么它值得留下？"></div>
+              <button class="primary" type="submit">生成待审提案</button>
+            </form>
+          </section>
+          <aside class="panel" style="position:static;height:auto">
+            <div class="panel-head"><h3>边界状态</h3></div>
+            <div class="panel-body rule-stats"><div class="stat"><strong id="pending-stat">0</strong><span>份提案等待你的判断</span></div><div class="stat"><strong id="category-stat">0</strong><span>个经确认的内容分类</span></div><div class="stat"><strong id="subscription-stat">0</strong><span>个本地自动订阅</span></div><button class="quiet" id="manage-subscriptions" style="margin-top:18px">管理自动订阅</button></div>
+          </aside>
+        </div>
+        <div style="height:34px"></div>
+        <div class="list" id="review-list"></div>
+      </section>
+
+      <section class="view" id="view-library" hidden>
+        <header class="topline"><div><span class="eyebrow">Knowledge ledger</span><h2>我的知识</h2></div><button class="quiet" id="new-category">＋ 维护分类</button></header>
+        <div class="list" id="entry-list"></div>
+        <div style="height:46px"></div><div class="topline" style="margin-bottom:20px"><div><span class="eyebrow">Recoverable trash</span><h2 style="font-size:30px">回收站</h2></div><p>删除不会立即抹除内容，可在这里恢复。</p></div>
+        <div class="list" id="trash-list"></div>
+      </section>
+
+      <section class="view" id="view-explore" hidden>
+        <header class="topline"><div><span class="eyebrow">Evidence search</span><h2>带着出处寻找</h2></div><p>默认范围只有已确认知识。原始材料必须主动开启，避免把“看过”误当成“想过”。</p></header>
+        <form id="search-form" class="searchbar"><input id="search-query" placeholder="搜索一个概念或提出问题" required><button class="primary">检索</button></form>
+        <label class="check"><input type="checkbox" id="include-archive"> 同时搜索来源与转录存档</label>
+        <div id="answer-box"></div><div class="list" id="search-results"></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="review-dialog">
+    <div class="modal-head"><div><span class="eyebrow">Human confirmation</span><h3>最终入库内容</h3></div><button class="quiet" type="button" data-close>关闭</button></div>
+    <form id="review-form">
+      <div class="modal-body">
+        <input type="hidden" id="review-id"><input type="hidden" id="proposal-id"><input type="hidden" id="review-revision">
+        <div class="field"><label for="review-title">标题</label><input id="review-title" required></div>
+        <div class="field"><label for="review-category">内容分类</label><select id="review-category" required></select></div>
+        <div class="field"><label for="review-body">正文（可直接编辑）</label><textarea id="review-body" required style="min-height:300px"></textarea></div>
+        <div class="field"><label for="review-tags">标签（逗号分隔）</label><input id="review-tags"></div>
+        <div class="conversation"><label for="review-message">继续与 Agent 讨论</label><div class="row" style="margin-top:9px"><input id="review-message" placeholder="例如：把我的保留意见写得更明确"><button class="quiet" type="button" id="send-message">更新提案</button></div></div>
+        <div id="citation-note" class="assurance"></div>
+      </div>
+      <div class="modal-foot"><span class="assurance">✓ 点击前不会写入知识库</span><button class="danger" type="submit">确认入库</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="category-dialog">
+    <div class="modal-head"><h3>维护内容分类</h3><button class="quiet" type="button" data-close>关闭</button></div>
+    <form id="category-form" class="modal-body">
+      <div class="field"><label for="category-action">操作</label><select id="category-action"><option value="create">新增</option><option value="rename">重命名</option><option value="merge">合并到另一分类</option><option value="retire">停用空分类</option></select></div>
+      <div class="field" id="category-current-field" hidden><label for="category-current">当前分类</label><select id="category-current"></select></div>
+      <div class="field" id="category-name-field"><label for="category-name">分类名称</label><input id="category-name" placeholder="例如：认知与决策"></div>
+      <div class="field" id="category-target-field" hidden><label for="category-target">合并目标</label><select id="category-target"></select></div>
+      <p style="color:var(--ink-soft)">分类列表不会由 Agent 自动调整。本次变更只有在你再次确认后生效。</p><button class="danger">确认分类变更</button>
+    </form>
+  </dialog>
+  <dialog id="subscription-dialog">
+    <div class="modal-head"><h3>本地自动订阅</h3><button class="quiet" type="button" data-close>关闭</button></div>
+    <form id="subscription-form" class="modal-body">
+      <div class="field"><label for="subscription-name">名称</label><input id="subscription-name" required placeholder="例如：认可的技术频道"></div>
+      <div class="row"><div class="field"><label for="subscription-kind">来源类型</label><select id="subscription-kind"><option value="web">网页 / 频道页</option><option value="video">视频地址</option></select></div><div class="field"><label for="subscription-interval">轮询间隔（分钟）</label><input id="subscription-interval" type="number" min="5" value="60"></div></div>
+      <div class="field"><label for="subscription-url">订阅地址</label><input id="subscription-url" type="text" required placeholder="https://…"></div>
+      <div class="row"><button class="primary">新增订阅</button><button class="quiet" type="button" id="poll-once">立即轮询一次</button></div>
+      <div class="list" id="subscription-list" style="margin-top:24px"></div>
+    </form>
+  </dialog>
+  <div class="toast" id="toast" role="status"></div>
+
+  <script>
+    const state = { categories: [], entries: [], trash: [], reviews: [], subscriptions: [], preferences: [], activeReview: null };
+    const $ = (selector) => document.querySelector(selector);
+    const escapeText = (value='') => String(value);
+    async function api(path, options={}) {
+      const response = await fetch(path, { headers: {'Content-Type':'application/json'}, ...options });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || '请求失败');
+      return data;
+    }
+    function toast(message) { const node=$('#toast'); node.textContent=message; node.classList.add('show'); setTimeout(()=>node.classList.remove('show'),2200); }
+    function latest(review) { return review.proposals[review.proposals.length - 1]; }
+    function trim(text, max=150) { return text.length > max ? text.slice(0,max) + '…' : text; }
+    function makeItem(title, body, tags=[]) {
+      const el=document.createElement('article'); el.className='item';
+      const h=document.createElement('h4'); h.textContent=title; el.append(h);
+      const p=document.createElement('p'); p.textContent=trim(body); el.append(p);
+      if(tags.length){ const box=document.createElement('div'); box.className='tags'; box.style.marginTop='13px'; tags.forEach(t=>{const x=document.createElement('span');x.className='tag';x.textContent=t;box.append(x)});el.append(box); }
+      return el;
+    }
+    async function refresh() { Object.assign(state, await api('/api/state')); render(); }
+    function render() {
+      $('#inbox-count').textContent=state.reviews.length; $('#entry-count').textContent=state.entries.length;
+      $('#pending-stat').textContent=state.reviews.length; $('#category-stat').textContent=state.categories.length;
+      $('#subscription-stat').textContent=state.subscriptions.length;
+      const reviews=$('#review-list'); reviews.replaceChildren();
+      if(!state.reviews.length) reviews.innerHTML='<div class="empty">待审桌面是空的。新想法会先在这里停留。</div>';
+      state.reviews.forEach(review=>{ const p=latest(review); const el=makeItem(p.title,p.body,p.tags); const foot=document.createElement('div');foot.className='item-foot'; const meta=document.createElement('span');meta.className='scope';meta.textContent=`修订 ${review.revision} · 未入库`; const btn=document.createElement('button');btn.className='quiet';btn.textContent='审阅并确认';btn.onclick=()=>openReview(review.review_id);foot.append(meta,btn);el.append(foot);reviews.append(el); });
+      const entries=$('#entry-list'); entries.replaceChildren();
+      if(!state.entries.length) entries.innerHTML='<div class="empty">这里尚无知识。完成一次人工确认后，第一条会出现在这里。</div>';
+      state.entries.forEach(entry=>{ const category=state.categories.find(c=>c.category_id===entry.document.category_id); const el=makeItem(entry.document.title,entry.document.body,entry.document.tags); const foot=document.createElement('div');foot.className='item-foot';const meta=document.createElement('span');meta.className='scope';meta.textContent=`${category?.name || '未分类'} · v${entry.revision} · ${entry.document.citations.length} 个出处`;const actions=document.createElement('div');actions.className='row';const edit=document.createElement('button');edit.className='quiet';edit.textContent='再次审阅';edit.onclick=()=>startEntryReview(entry.entry_id);const remove=document.createElement('button');remove.className='quiet';remove.textContent='移入回收站';remove.onclick=()=>changeEntryStatus(entry,false);actions.append(edit,remove);foot.append(meta,actions);el.append(foot);entries.append(el); });
+      const trash=$('#trash-list');trash.replaceChildren();if(!state.trash.length)trash.innerHTML='<div class="empty">回收站为空。</div>';state.trash.forEach(entry=>{const el=makeItem(entry.document.title,entry.document.body,entry.document.tags);const foot=document.createElement('div');foot.className='item-foot';const meta=document.createElement('span');meta.className='scope';meta.textContent=`已删除 · v${entry.revision}`;const restore=document.createElement('button');restore.className='quiet';restore.textContent='恢复';restore.onclick=()=>changeEntryStatus(entry,true);foot.append(meta,restore);el.append(foot);trash.append(el)});
+      const subs=$('#subscription-list');subs.replaceChildren();state.subscriptions.forEach(sub=>{const el=makeItem(sub.name,sub.url,[sub.kind,`${sub.interval_minutes} 分钟`]);if(sub.last_error){const err=document.createElement('p');err.style.color='var(--red)';err.style.marginTop='10px';err.textContent=sub.last_error;el.append(err)}subs.append(el)});if(!state.subscriptions.length)subs.innerHTML='<div class="empty">还没有订阅。轮询只会生成待审提案，不会自动入库。</div>';
+    }
+    function openReview(id) {
+      const review=state.reviews.find(r=>r.review_id===id); if(!review)return; state.activeReview=review; const p=latest(review);
+      $('#review-id').value=review.review_id;$('#proposal-id').value=p.proposal_id;$('#review-revision').value=review.revision;$('#review-title').value=p.title;$('#review-body').value=p.body;$('#review-tags').value=p.tags.join(', ');
+      const select=$('#review-category');select.replaceChildren(); if(!state.categories.length){const option=new Option('请先创建分类','');select.add(option);} state.categories.forEach(c=>select.add(new Option(c.name,c.category_id))); if(p.suggested_category){const match=state.categories.find(c=>c.name===p.suggested_category);if(match)select.value=match.category_id;}
+      $('#citation-note').textContent=`将保留 ${p.citations.length} 个来源引用；完整原文与对话只留在存档区。`; $('#review-dialog').showModal();
+    }
+    async function startEntryReview(id){try{const review=await api(`/api/entries/${id}/review`,{method:'POST',body:'{}'});await refresh();openReview(review.review_id);toast('已创建新修订，原版本仍保持不变');}catch(err){toast(err.message)}}
+    async function changeEntryStatus(entry,restore){const label=restore?'恢复':'移入回收站';if(!confirm(`确认${label}“${entry.document.title}”？`))return;try{await api(`/api/entries/${entry.entry_id}/status`,{method:'POST',body:JSON.stringify({confirmed:true,action:restore?'restore':'delete',expected_revision:entry.revision})});await refresh();toast(`已${label}`)}catch(err){toast(err.message)}}
+    document.querySelectorAll('nav button').forEach(btn=>btn.onclick=()=>{document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('active',x===btn));document.querySelectorAll('.view').forEach(v=>v.hidden=v.id!==`view-${btn.dataset.view}`)});
+    document.querySelectorAll('[data-close]').forEach(btn=>btn.onclick=()=>btn.closest('dialog').close());
+    $('#capture-kind').onchange=()=>{ const kind=$('#capture-kind').value; $('#capture-value').placeholder=['url','video'].includes(kind)?'https://… 或 BV 号':kind==='idea'?'写下刚刚冒出的想法……':'粘贴要审阅的原文……'; };
+    $('#capture-form').onsubmit=async e=>{e.preventDefault();const button=e.submitter;button.disabled=true;try{await api('/api/ingest',{method:'POST',body:JSON.stringify({kind:$('#capture-kind').value,value:$('#capture-value').value,title:$('#capture-title').value,note:$('#capture-note').value})});e.target.reset();await refresh();toast('已生成待审提案，尚未入库');}catch(err){toast(err.message)}finally{button.disabled=false}};
+    function fillCategoryControls(){const current=$('#category-current'),target=$('#category-target');current.replaceChildren();target.replaceChildren();state.categories.forEach(c=>{current.add(new Option(c.name,c.category_id));target.add(new Option(c.name,c.category_id))});}
+    function categoryMode(){const action=$('#category-action').value;$('#category-current-field').hidden=action==='create';$('#category-name-field').hidden=['merge','retire'].includes(action);$('#category-target-field').hidden=action!=='merge';}
+    $('#new-category').onclick=()=>{fillCategoryControls();categoryMode();$('#category-dialog').showModal()};$('#category-action').onchange=categoryMode;
+    $('#category-form').onsubmit=async e=>{e.preventDefault();const action=$('#category-action').value,current=state.categories.find(c=>c.category_id===$('#category-current').value);const payload={confirmed:true,change_type:action,name:$('#category-name').value};if(action!=='create'){payload.category_id=current?.category_id;payload.expected_revision=current?.revision;}if(action==='merge')payload.target_category_id=$('#category-target').value;if(!confirm(`确认执行分类${{create:'新增',rename:'重命名',merge:'合并',retire:'停用'}[action]}？`))return;try{await api('/api/categories/confirm',{method:'POST',body:JSON.stringify(payload)});$('#category-dialog').close();e.target.reset();await refresh();toast('分类变更已确认');}catch(err){toast(err.message)}};
+    $('#manage-subscriptions').onclick=()=>$('#subscription-dialog').showModal();
+    $('#subscription-form').onsubmit=async e=>{e.preventDefault();try{await api('/api/subscriptions',{method:'POST',body:JSON.stringify({name:$('#subscription-name').value,kind:$('#subscription-kind').value,url:$('#subscription-url').value,interval_minutes:Number($('#subscription-interval').value)})});e.target.reset();await refresh();toast('订阅已保存；新内容只会进入待审区');}catch(err){toast(err.message)}};
+    $('#poll-once').onclick=async()=>{try{const result=await api('/api/subscriptions/poll-once',{method:'POST',body:'{}'});await refresh();toast(`轮询完成：${result.filter(x=>x.changed).length} 个来源有变化`)}catch(err){toast(err.message)}};
+    $('#send-message').onclick=async()=>{const content=$('#review-message').value.trim();if(!content)return;const id=$('#review-id').value;try{await api(`/api/reviews/${id}/messages`,{method:'POST',body:JSON.stringify({content})});$('#review-dialog').close();await refresh();openReview(id);toast('Agent 已根据讨论更新提案');}catch(err){toast(err.message)}};
+    $('#review-form').onsubmit=async e=>{e.preventDefault();if(!$('#review-category').value){toast('请先创建并选择分类');return;}const review=state.activeReview,p=latest(review),target=review.target_entry_id?state.entries.find(x=>x.entry_id===review.target_entry_id):null;const payload={proposal_id:$('#proposal-id').value,expected_review_revision:Number($('#review-revision').value),title:$('#review-title').value,category_id:$('#review-category').value,body:$('#review-body').value,tags:$('#review-tags').value.split(/[,，]/).map(x=>x.trim()).filter(Boolean),citations:p.citations,target_entry_id:target?.entry_id||null,expected_entry_revision:target?.revision??null};try{const result=await api(`/api/reviews/${review.review_id}/confirm`,{method:'POST',body:JSON.stringify(payload)});for(const suggestion of result.preference_suggestions||[]){if(confirm(`Agent 推断到偏好：${suggestion.value}\n\n是否允许写入 Runtime Memory？`)){await api('/api/preferences/confirm',{method:'POST',body:JSON.stringify(suggestion)})}}$('#review-dialog').close();await refresh();toast(target?'已生成新版本':'已按你编辑的版本入库');}catch(err){toast(err.message)}};
+    $('#search-form').onsubmit=async e=>{e.preventDefault();const q=$('#search-query').value,archive=$('#include-archive').checked;const box=$('#search-results');box.innerHTML='<div class="empty">正在检索证据…</div>';$('#answer-box').replaceChildren();try{const hits=await api(`/api/search?q=${encodeURIComponent(q)}&archive=${archive}`);box.replaceChildren();if(!hits.length){box.innerHTML='<div class="empty">没有找到可支持回答的内容。</div>';return;}hits.forEach(hit=>{const el=makeItem(hit.title,hit.snippet);const scope=document.createElement('div');scope.className='scope';scope.style.marginTop='12px';scope.textContent=hit.scope==='knowledge'?'已确认知识':'来源存档';el.append(scope);box.append(el)});const answer=await api('/api/answer',{method:'POST',body:JSON.stringify({question:q,include_archive:archive})});if(answer){const node=document.createElement('div');node.className='answer';node.textContent=answer.answer;$('#answer-box').append(node)}}catch(err){box.innerHTML='';toast(err.message)}};
+    refresh().catch(err=>toast(err.message));
+  </script>
+</body>
+</html>

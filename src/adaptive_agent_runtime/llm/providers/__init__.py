@@ -21,6 +21,7 @@ from adaptive_agent_runtime.llm.providers.claude_code import (
     ClaudeCodeInferenceTargetDefinition,
 )
 from adaptive_agent_runtime.llm.providers.config import (
+    LLMTargetSelection,
     TOMLProviderConfigRepository,
 )
 from adaptive_agent_runtime.llm.providers.http import (
@@ -67,6 +68,7 @@ __all__ = [
     "HTTPTransportTimeoutError",
     "HTTPTransportUnavailableError",
     "HttpxJSONTransport",
+    "LLMTargetSelection",
     "OpenAICompatibleChatBackend",
     "OpenAICompatibleChatConfig",
     "OpenAICompatibleProbeMode",

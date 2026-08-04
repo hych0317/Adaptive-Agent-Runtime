@@ -7,6 +7,8 @@ const state = {
   eventSource: null,
   eventChain: Promise.resolve(),
   streamTerminal: false,
+  llmSettings: null,
+  llmModelsRequest: 0,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -46,9 +48,204 @@ async function loadHealth() {
   }
 }
 
+async function loadLLMSettings() {
+  const response = await fetch("/api/llm/settings", { cache: "no-store" });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || "无法读取 LLM 配置");
+  state.llmSettings = payload;
+  renderLLMSettings();
+  return payload;
+}
+
+function renderLLMSettings() {
+  const settings = state.llmSettings;
+  if (!settings) return;
+  const select = $("#llmTargetSelect");
+  const previous = select.value;
+  select.innerHTML = settings.targets.map((target) => `
+    <option value="${escapeHtml(target.name)}">
+      ${escapeHtml(target.name)} · ${escapeHtml(target.model)}
+    </option>
+  `).join("");
+  const preferred = settings.activeTarget || previous || settings.defaultTarget;
+  if (settings.targets.some((target) => target.name === preferred)) select.value = preferred;
+  updateLLMTargetSummary();
+}
+
+function selectedLLMTarget() {
+  return state.llmSettings?.targets.find((target) => target.name === $("#llmTargetSelect").value) || null;
+}
+
+function updateLLMTargetSummary() {
+  const target = selectedLLMTarget();
+  if (!target) return;
+  const credentialLabel = target.requiresApiKey
+    ? (target.credentialConfigured ? `凭据已配置 · ${target.credentialSource}` : "尚未配置 API Key")
+    : (target.credentialSource === "oauth_cli" ? "使用宿主 CLI OAuth 会话" : "无需 API Key");
+  $("#llmTargetSummary").innerHTML = `
+    <strong>${escapeHtml(target.service)} · ${escapeHtml(target.model)}</strong><br>
+    Structured output: ${escapeHtml(target.structuredOutput)} · ${escapeHtml(credentialLabel)}
+  `;
+  const keyField = $("#llmApiKeyField");
+  const keyInput = $("#llmApiKeyInput");
+  keyInput.disabled = !target.requiresApiKey;
+  keyField.classList.toggle("is-disabled", !target.requiresApiKey);
+  keyInput.placeholder = target.credentialConfigured
+    ? "留空则保留 llm.local.toml 中现有密钥"
+    : "输入 Provider API Key";
+}
+
+async function loadLLMModels({ includeApiKey = false } = {}) {
+  const target = selectedLLMTarget();
+  if (!target) return;
+  const requestId = ++state.llmModelsRequest;
+  const select = $("#llmModelSelect");
+  const refresh = $("#llmModelsRefresh");
+  const save = $("#llmSettingsSave");
+  const apiKey = $("#llmApiKeyInput").value.trim();
+  select.disabled = true;
+  save.disabled = true;
+  select.innerHTML = "<option>正在探测 Provider…</option>";
+  refresh.disabled = true;
+  setLLMSettingsStatus(`正在获取 ${target.service} 实时模型列表…`, "running");
+  try {
+    const response = await fetch("/api/llm/models", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        target: target.name,
+        ...(includeApiKey && apiKey ? { apiKey } : {}),
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      const message = response.status === 404
+        ? "模型目录接口未加载，请重启 Research Web 服务"
+        : (payload.error || "模型列表获取失败");
+      throw new Error(message);
+    }
+    if (requestId !== state.llmModelsRequest) return;
+    const models = Array.isArray(payload.models) ? payload.models : [];
+    const visibleModels = models.length ? models : [payload.currentModel || target.model];
+    select.innerHTML = visibleModels.map((model) => `
+      <option value="${escapeHtml(model)}">${escapeHtml(model)}</option>
+    `).join("");
+    if (visibleModels.includes(payload.currentModel)) select.value = payload.currentModel;
+    select.disabled = false;
+    save.disabled = false;
+    if (models.length) {
+      const auth = payload.authMethod ? ` · ${payload.authMethod}` : "";
+      if (payload.availability === "available") {
+        setLLMSettingsStatus(`已实时获取 ${models.length} 个模型${auth}`, "success");
+      } else {
+        const diagnostics = payload.diagnostics?.join(" · ") || payload.availability;
+        setLLMSettingsStatus(
+          `已获取 ${models.length} 个模型，但连接状态为 ${payload.availability}：${diagnostics}`,
+          "error",
+        );
+      }
+    } else {
+      const diagnostics = payload.diagnostics?.join(" · ") || "Provider 未提供模型目录";
+      setLLMSettingsStatus(`未获取到实时列表：${diagnostics}`, "error");
+    }
+  } catch (error) {
+    if (requestId !== state.llmModelsRequest) return;
+    select.innerHTML = "<option>模型列表获取失败</option>";
+    select.disabled = true;
+    save.disabled = true;
+    setLLMSettingsStatus(error.message || "模型列表获取失败", "error");
+  } finally {
+    if (requestId === state.llmModelsRequest) refresh.disabled = false;
+  }
+}
+
+function setLLMSettingsStatus(message, kind = "") {
+  const status = $("#llmSettingsStatus");
+  status.textContent = message;
+  status.className = `settings-status${kind ? ` is-${kind}` : ""}`;
+}
+
+async function openLLMSettings() {
+  const dialog = $("#llmSettingsDialog");
+  dialog.showModal();
+  setLLMSettingsStatus("正在读取本地 LLM 配置…", "running");
+  try {
+    await loadLLMSettings();
+    await loadLLMModels();
+  } catch (error) {
+    setLLMSettingsStatus(error.message || "无法读取 LLM 配置", "error");
+  }
+}
+
+$("#llmSettingsButton").addEventListener("click", openLLMSettings);
+$("#llmSettingsClose").addEventListener("click", () => $("#llmSettingsDialog").close());
+$("#llmSettingsCancel").addEventListener("click", () => $("#llmSettingsDialog").close());
+$("#llmTargetSelect").addEventListener("change", async () => {
+  updateLLMTargetSummary();
+  await loadLLMModels();
+});
+$("#llmModelsRefresh").addEventListener("click", async () => {
+  await loadLLMModels({ includeApiKey: true });
+});
+
+$("#llmSettingsForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const target = selectedLLMTarget();
+  if (!target) return;
+  const saveButton = $("#llmSettingsSave");
+  const apiKeyInput = $("#llmApiKeyInput");
+  const apiKey = apiKeyInput.value.trim();
+  const model = $("#llmModelSelect").value;
+  if (!model) return;
+  saveButton.disabled = true;
+  setLLMSettingsStatus("正在保存本地配置…", "running");
+  try {
+    const settingsResponse = await fetch("/api/llm/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        target: target.name,
+        model,
+        ...(apiKey ? { apiKey } : {}),
+      }),
+    });
+    const settingsPayload = await settingsResponse.json();
+    if (!settingsResponse.ok) throw new Error(settingsPayload.error || "LLM 配置保存失败");
+    apiKeyInput.value = "";
+    state.llmSettings = settingsPayload;
+    renderLLMSettings();
+    setLLMSettingsStatus("配置已保存，正在执行真实连接验证…", "running");
+
+    const probeResponse = await fetch("/api/llm/probe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const probe = await probeResponse.json();
+    if (!probeResponse.ok) throw new Error(probe.error || "LLM 连接验证失败");
+    if (probe.availability !== "available") {
+      const diagnostics = probe.diagnostics?.join(" · ") || "未返回诊断信息";
+      throw new Error(`连接不可用：${diagnostics}`);
+    }
+    $("#inferenceLabel").textContent = probe.inference;
+    const authentication = probe.authMethod
+      || (target.credentialSource === "oauth_cli" ? "CLI OAuth 会话" : "无需认证");
+    setLLMSettingsStatus(
+      `模型已切换并连接成功 · ${probe.model} · ${authentication}`,
+      "success",
+    );
+    await loadLLMSettings();
+  } catch (error) {
+    setLLMSettingsStatus(error.message || "LLM 配置失败", "error");
+  } finally {
+    saveButton.disabled = false;
+  }
+});
+
 $("#researchForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const task = $("#taskInput").value.trim();
+  const mode = $("#researchMode").value;
   if (!task) return;
   setRunning(true);
   resetLiveRun();
@@ -56,7 +253,7 @@ $("#researchForm").addEventListener("submit", async (event) => {
     const response = await fetch("/api/runs", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ task }),
+      body: JSON.stringify({ task, mode }),
     });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "Research run failed");
@@ -64,6 +261,15 @@ $("#researchForm").addEventListener("submit", async (event) => {
   } catch (error) {
     failLiveRun(error.message || "Research run failed");
   }
+});
+
+$("#researchMode").addEventListener("change", () => {
+  const hints = {
+    auto: "自动模式会在 LLM 可用时优先执行模型研究流程。",
+    llm_research: "Information Retrieval 与报告生成使用所选模型；结果不是实时行情或联网检索。",
+    fixture_demo: "使用演示数据稳定触发 Context & Memory、Evaluation 与 Governance。",
+  };
+  $("#researchModeHint").textContent = hints[$("#researchMode").value];
 });
 
 function resetLiveRun() {
@@ -265,6 +471,7 @@ function failLiveRun(message) {
 function setRunning(running) {
   const button = $("#runButton");
   button.disabled = running;
+  $("#researchMode").disabled = running;
   button.querySelector(".button-label").textContent = running ? "Runtime 执行中" : "开始研究";
   if (running) {
     setMessage("正在规划任务图、执行能力并组装研究结果…", "running");
@@ -553,6 +760,32 @@ function renderEvaluation() {
       <span class="${record.reviewed ? "review-tag" : "automatic-tag"}">${record.reviewed ? "HUMAN REVIEW" : "AUTOMATIC"}</span>
     </article>
   `).join("") : '<p class="muted">No governance decisions.</p>';
+
+  const llm = state.data.llm || {};
+  const candidateTools = llm.candidateTools || [];
+  const toolIntentRecords = llm.toolIntentRecords || [];
+  $("#toolIntentCount").textContent = `${toolIntentRecords.length} INTENT`;
+  $("#toolIntentCatalog").innerHTML = candidateTools.length ? candidateTools.map((tool) => `
+    <article class="tool-intent-card capability-card">
+      <span class="intent-stage">RUNTIME CANDIDATE</span>
+      <strong>${escapeHtml(tool.name)}</strong>
+      <p>${escapeHtml(tool.description)}</p>
+      <code>${escapeHtml(tool.capabilityId)}</code>
+      <pre>${escapeHtml(JSON.stringify(tool.inputSchema, null, 2))}</pre>
+    </article>
+  `).join("") : '<p class="muted">Runtime 未向该模型暴露候选工具。</p>';
+  $("#toolIntentList").innerHTML = toolIntentRecords.length ? toolIntentRecords.map((record) => `
+    <article class="tool-intent-card">
+      <div class="intent-flow">
+        <span>LLM PROPOSAL</span><i>→</i><span>RUNTIME VALIDATION</span><i>→</i><span>${escapeHtml(record.provider)}</span><i>→</i><span class="${escapeHtml(record.status)}">${escapeHtml(record.status)}</span>
+      </div>
+      <strong>${escapeHtml(record.capabilityId)} · ${escapeHtml(record.callKey)}</strong>
+      <p>参数：${escapeHtml(compact(record.arguments, 180))}</p>
+      <p>Observation：${escapeHtml(compact(record.output || record.error || "无输出", 220))}</p>
+    </article>
+  `).join("") : `
+    <p class="muted">模型本次未提出 Tool Intent。候选能力可用不代表 Runtime 会强制模型调用；模型可在已有证据充分时直接完成分析。</p>
+  `;
 }
 
 function activateView(name) {

@@ -41,6 +41,19 @@ class StructuredOutputLevel(StrEnum):
     JSON_SCHEMA = "json_schema"
 
 
+class ReasoningEffort(StrEnum):
+    """Provider-neutral reasoning effort requested for one inference target."""
+
+    DEFAULT = "default"
+    NONE = "none"
+    MINIMAL = "minimal"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+    MAX = "max"
+
+
 class ToolIntentMode(StrEnum):
     DISABLED = "disabled"
     ALLOWED = "allowed"

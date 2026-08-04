@@ -20,8 +20,71 @@
       <div class="runtime-meta">
         <span class="connection"><i></i><span id="inferenceLabel">Runtime Ready</span></span>
         <span class="mono" id="runId">NO ACTIVE RUN</span>
+        <button class="settings-trigger" id="llmSettingsButton" type="button">
+          LLM 设置
+        </button>
       </div>
     </header>
+
+    <dialog class="settings-dialog" id="llmSettingsDialog" aria-labelledby="llmSettingsTitle">
+      <form class="settings-form" id="llmSettingsForm">
+        <header class="settings-header">
+          <div>
+            <span class="eyebrow">LOCAL LLM CONNECTION</span>
+            <h2 id="llmSettingsTitle">配置真实推理后端</h2>
+          </div>
+          <button class="dialog-close" id="llmSettingsClose" type="button" aria-label="关闭设置">×</button>
+        </header>
+
+        <div class="settings-body">
+          <label class="settings-field">
+            <span>LLM Target</span>
+            <select id="llmTargetSelect" required></select>
+          </label>
+
+          <div class="settings-model-row">
+            <label class="settings-field">
+              <span>实时模型列表</span>
+              <select id="llmModelSelect" required disabled>
+                <option>等待 Provider 探测…</option>
+              </select>
+            </label>
+            <button class="model-refresh" id="llmModelsRefresh" type="button">
+              刷新列表
+            </button>
+          </div>
+
+          <div class="target-summary" id="llmTargetSummary">
+            正在读取本地 LLM 配置…
+          </div>
+
+          <label class="settings-field" id="llmApiKeyField">
+            <span>Provider API Key</span>
+            <input
+              id="llmApiKeyInput"
+              type="password"
+              maxlength="8192"
+              autocomplete="new-password"
+              spellcheck="false"
+              placeholder="留空则保留 llm.local.toml 中现有密钥"
+            >
+          </label>
+
+          <div class="settings-note">
+            API Key 与模型选择仅发送到本机服务并写入 <code>config/llm.local.toml</code>，不会保存到浏览器、响应或 Runtime Trace。使用新 Key 刷新模型列表时也会更新本地私有配置。
+          </div>
+
+          <div class="settings-status" id="llmSettingsStatus" role="status">
+            选择 Target 和实时模型后保存并验证连接。
+          </div>
+        </div>
+
+        <div class="settings-actions">
+          <button class="secondary-button" id="llmSettingsCancel" type="button">取消</button>
+          <button class="primary-button" id="llmSettingsSave" type="submit">保存并验证</button>
+        </div>
+      </form>
+    </dialog>
 
     <main>
       <section class="command-bar" aria-labelledby="commandTitle">
@@ -44,8 +107,19 @@
             <span class="button-arrow" aria-hidden="true">→</span>
           </button>
         </form>
+        <div class="research-mode-control">
+          <label for="researchMode">运行模式</label>
+          <select id="researchMode">
+            <option value="auto" selected>自动 · 已配置 LLM 时优先真实模型</option>
+            <option value="llm_research">LLM Research · 模型信息综合</option>
+            <option value="fixture_demo">Fixture Demo · 稳定触发 Runtime 展示</option>
+          </select>
+          <span id="researchModeHint">
+            自动模式会在 LLM 可用时优先执行模型研究流程。
+          </span>
+        </div>
         <div class="run-message" id="runMessage" role="status">
-          默认使用无费用的 Demo Runtime；真实 LLM 需在启动服务时显式配置。
+          Fixture Demo 可稳定模拟 Context &amp; Memory、Evaluation 与 Governance 的触发过程。
         </div>
       </section>
 
@@ -216,6 +290,30 @@
             </header>
             <div class="governance-list" id="governanceList">
               <p class="muted">暂无治理决策。</p>
+            </div>
+          </section>
+
+          <section class="panel tool-intent-panel">
+            <header class="panel-header">
+              <div>
+                <span class="eyebrow">LLM → RUNTIME TOOL INTENT</span>
+                <h2>候选能力与受治理执行</h2>
+              </div>
+              <span class="count-badge" id="toolIntentCount">0 INTENT</span>
+            </header>
+            <div class="tool-intent-layout">
+              <div>
+                <h3 class="subsection-title">Runtime 暴露的候选能力</h3>
+                <div id="toolIntentCatalog" class="tool-intent-list">
+                  <p class="muted">完成运行后展示能力契约。</p>
+                </div>
+              </div>
+              <div>
+                <h3 class="subsection-title">LLM 提议与执行结果</h3>
+                <div id="toolIntentList" class="tool-intent-list">
+                  <p class="muted">当前运行尚无 Tool Intent。</p>
+                </div>
+              </div>
             </div>
           </section>
         </div>

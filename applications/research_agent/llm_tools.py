@@ -18,8 +18,8 @@ RESEARCH_INFORMATION_RETRIEVAL_TOOL = ToolSpecification(
     capability_id=INFORMATION_RETRIEVAL,
     name="retrieve_research_evidence",
     description=(
-        "Propose retrieval of bounded company, industry, competitor, or news "
-        "evidence. Adaptive Agent Runtime validates and executes the proposal."
+        "提议补充检索边界明确的公司、行业、竞争对手或新闻证据。"
+        "Adaptive Agent Runtime 将校验并执行该提议。"
     ),
     input_schema={
         "type": "object",

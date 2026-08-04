@@ -190,7 +190,11 @@ class OpenAICompatibleBackendTests(unittest.IsolatedAsyncioTestCase):
                 status_code=200,
                 body={
                     "object": "list",
-                    "data": [{"id": "test-model", "object": "model"}],
+                    "data": [
+                        {"id": "test-model", "object": "model"},
+                        {"id": "text-embedding-3-large", "object": "model"},
+                        {"id": "BAAI/bge-large-en-v1.5", "object": "model"},
+                    ],
                 },
             )
         )
@@ -209,6 +213,7 @@ class OpenAICompatibleBackendTests(unittest.IsolatedAsyncioTestCase):
             probe = await backend.probe()
 
         self.assertEqual(probe.availability.value, "available")
+        self.assertEqual(probe.available_model_ids, ("test-model",))
         self.assertEqual(
             probe.diagnostics, ("connectivity_and_model_verified",)
         )
@@ -217,6 +222,26 @@ class OpenAICompatibleBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(headers["Authorization"], "Bearer test-secret")
         self.assertEqual(timeout, 4.0)
         self.assertNotIn("test-secret", repr(probe))
+
+    async def test_reasoning_effort_is_forwarded_to_compatible_api(self) -> None:
+        from adaptive_agent_runtime.llm import ReasoningEffort
+
+        transport = RecordingJSONTransport(chat_response(content="ok"))
+        backend = OpenAICompatibleChatBackend(
+            profile(structured_output=StructuredOutputLevel.NONE),
+            OpenAICompatibleChatConfig(
+                base_url="https://api.example.test/v1",
+                requires_api_key=False,
+                reasoning_effort=ReasoningEffort.HIGH,
+            ),
+            transport,
+        )
+
+        await backend.invoke(
+            InferenceRequest(cognitive_capability_id="generation", input="write")
+        )
+
+        self.assertEqual(transport.requests[0][2]["reasoning_effort"], "high")
 
     async def test_private_config_key_is_masked_and_environment_can_override(
         self,
@@ -326,6 +351,32 @@ class OpenAICompatibleBackendTests(unittest.IsolatedAsyncioTestCase):
                 probe = await backend.probe()
                 self.assertEqual(probe.availability.value, availability)
                 self.assertEqual(probe.diagnostics, (diagnostic,))
+
+    async def test_stale_selection_still_returns_discovered_models(self) -> None:
+        transport = RecordingJSONTransport(
+            probe_response=HTTPJSONResponse(
+                status_code=200,
+                body={"data": [{"id": "other-model"}, {"id": "next-model"}]},
+            )
+        )
+        backend = OpenAICompatibleChatBackend(
+            profile(),
+            OpenAICompatibleChatConfig(
+                base_url="https://api.example.test/v1",
+                requires_api_key=False,
+                probe_mode=OpenAICompatibleProbeMode.MODELS_ENDPOINT,
+            ),
+            transport,
+        )
+
+        result = await backend.probe()
+
+        self.assertEqual(result.availability.value, "unavailable")
+        self.assertEqual(result.diagnostics, ("model_not_available",))
+        self.assertEqual(
+            result.available_model_ids,
+            ("other-model", "next-model"),
+        )
 
     async def test_structured_request_and_usage_are_normalized(self) -> None:
         transport = RecordingJSONTransport(

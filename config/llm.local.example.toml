@@ -1,5 +1,5 @@
 # Copy to llm.local.toml and fill only the providers you use.
-# llm.local.toml is application-owned persistent configuration and is ignored.
+# llm.local.toml is Runtime-owned persistent configuration and is ignored.
 
 schema_version = 1
 
@@ -17,3 +17,13 @@ schema_version = 1
 
 [providers.anthropic]
 # api_key = "sk-ant-..."
+
+# Model and reasoning selections are stored by stable public target name.
+# They override only the corresponding model/effort in llm.toml.
+[selections.deepseek-research]
+model = "deepseek-chat"
+reasoning_effort = "high"
+
+[selections.codex-research]
+model = "gpt-5.6-terra"
+reasoning_effort = "high"

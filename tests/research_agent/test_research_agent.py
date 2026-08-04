@@ -68,6 +68,7 @@ from applications.research_agent import (
     ResearchAgent,
     ResearchCognitiveCapabilities,
     ResearchContextProjection,
+    ResearchInformationMode,
     ResearchReportContextProjection,
     build_research_task,
     build_research_task_from_draft,
@@ -76,10 +77,16 @@ from applications.research_agent.capabilities import (
     CALCULATION,
     DOCUMENT_ANALYSIS,
     INFORMATION_RETRIEVAL,
+    LLM_COMPANY_PROVIDER,
+    LLM_COMPETITOR_PROVIDER,
+    LLM_INDUSTRY_PROVIDER,
+    LLM_NEWS_PROVIDER,
     REPORT_GENERATION,
 )
 from applications.research_agent.cli import format_result
+from applications.research_agent.prompts import CHINESE_OUTPUT_INSTRUCTION
 from applications.research_agent.report import ReportSection, ResearchReport
+from applications.research_agent.web import build_research_view
 from applications.research_agent.tasks import (
     NEWS_ANALYSIS,
     RISK_REVIEW,
@@ -203,6 +210,61 @@ class FakeReportGenerator:
                 evidence_reference_ids=tuple(
                     item.reference_id for item in request.evidence
                 ),
+            ),
+        )
+
+
+class FakeHybridResearchGenerator(FakeReportGenerator):
+    async def generate(
+        self,
+        request: GenerationRequest,
+        *,
+        invocation: CapabilityInvocationMetadata | None = None,
+    ) -> CapabilityTurnResult[GeneratedArtifactDraft]:
+        context = request.context
+        assert isinstance(context, Mapping)
+        topic = context.get("research_topic")
+        if topic is None:
+            return await super().generate(request, invocation=invocation)
+        self.requests.append(request)
+        self.invocations.append(invocation)
+        company = str(context["company"])
+        outputs = {
+            "company profile": {
+                "company": company,
+                "business": "LLM synthesized business profile",
+                "research_scope": "LLM research scope",
+                "key_facts": ["Model-synthesized company fact"],
+                "caveats": ["Verify against primary sources"],
+            },
+            "industry analysis": {
+                "company": company,
+                "industry": "LLM synthesized industry",
+                "outlook": "LLM synthesized outlook",
+                "drivers": ["Model-synthesized driver"],
+                "caveats": ["Verify against primary sources"],
+            },
+            "competitor analysis": {
+                "company": company,
+                "peers": ["LLM Peer"],
+                "differentiation": "LLM synthesized differentiation",
+                "competitive_risks": ["Model-synthesized risk"],
+                "caveats": ["Verify against primary sources"],
+            },
+            "news and catalyst analysis": {
+                "company": company,
+                "signal": "uncertain",
+                "catalyst": "LLM synthesized catalyst",
+                "controversy": "LLM synthesized controversy",
+                "as_of": str(context["requested_at"]),
+                "caveats": ["No live news retrieval"],
+            },
+        }
+        return CapabilityTurnResult[GeneratedArtifactDraft](
+            kind=CapabilityTurnKind.COMPLETED,
+            result=GeneratedArtifactDraft(
+                media_type=request.media_type,
+                content=outputs[str(topic)],
             ),
         )
 
@@ -837,6 +899,46 @@ class ResearchAgentFlowTests(unittest.IsolatedAsyncioTestCase):
         rendered = format_result(result)
         self.assertIn("LLM Judge:", rendered)
 
+    async def test_llm_research_mode_uses_llm_information_providers(self) -> None:
+        generator = FakeHybridResearchGenerator()
+
+        result = await ResearchAgent(
+            cognitive_capabilities=ResearchCognitiveCapabilities(
+                report_generator=generator,
+            ),
+            information_mode=ResearchInformationMode.LLM_RESEARCH,
+        ).run("分析 Tesla 投资价值")
+
+        information = {
+            item.provider_id: item
+            for item in result.tool_observations
+            if item.capability_id == INFORMATION_RETRIEVAL
+        }
+        self.assertEqual(
+            set(information),
+            {
+                LLM_COMPANY_PROVIDER,
+                LLM_INDUSTRY_PROVIDER,
+                LLM_COMPETITOR_PROVIDER,
+                LLM_NEWS_PROVIDER,
+            },
+        )
+        for observation in information.values():
+            self.assertIsInstance(observation.output, Mapping)
+            assert isinstance(observation.output, Mapping)
+            self.assertEqual(
+                observation.output["source"],
+                "llm model synthesis (not live retrieval)",
+            )
+        self.assertEqual(len(generator.requests), 5)
+        self.assertTrue(
+            all(
+                CHINESE_OUTPUT_INSTRUCTION in request.instruction
+                for request in generator.requests
+            )
+        )
+        self.assertIn("LLM Investment Research", result.report.markdown)
+
     async def test_report_context_is_projected_and_redacted_before_egress(
         self,
     ) -> None:
@@ -1073,6 +1175,21 @@ class ResearchAgentFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(tool_governance), 1)
         self.assertEqual(tool_governance[0].final.outcome, DecisionOutcome.ALLOW)
         self.assertIsNotNone(tool_governance[0].authorization)
+        self.assertIn(
+            CHINESE_OUTPUT_INSTRUCTION,
+            reasoner.requests[0].constraints,
+        )
+        view = build_research_view(
+            result,
+            task="分析 Tesla 投资价值",
+            elapsed_seconds=0.1,
+            inference_label="Fake Tool Calling LLM",
+            tool_intent_enabled=True,
+        )
+        projected = view["llm"]["toolIntentRecords"][0]
+        self.assertEqual(projected["callKey"], "retrieve-industry-once")
+        self.assertEqual(projected["provider"], record.observation.provider_id)
+        self.assertEqual(projected["status"], "succeeded")
 
     async def test_compression_and_memory_extraction_are_governed_drafts(
         self,

@@ -191,17 +191,22 @@ class ResearchLLMHTTPIntegrationTests(unittest.IsolatedAsyncioTestCase):
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
                 state["gets"].append((self.path, dict(self.headers)))
-                if self.path != "/v1/models/claude-loopback":
+                if self.path != "/v1/models?limit=1000":
                     self._send(404, {"error": {"type": "not_found_error"}})
                     return
                 self._send(
                     200,
                     {
-                        "id": "claude-loopback",
-                        "type": "model",
-                        "capabilities": {
-                            "structured_outputs": {"supported": True}
-                        },
+                        "data": [
+                            {
+                                "id": "claude-loopback",
+                                "type": "model",
+                                "capabilities": {
+                                    "structured_outputs": {"supported": True}
+                                },
+                            }
+                        ],
+                        "has_more": False,
                     },
                 )
 
@@ -304,7 +309,7 @@ class ResearchLLMHTTPIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(state["gets"]), 1)
         self.assertEqual(len(state["posts"]), 1)
         get_path, get_headers = state["gets"][0]
-        self.assertEqual(get_path, "/v1/models/claude-loopback")
+        self.assertEqual(get_path, "/v1/models?limit=1000")
         lowered_get_headers = {
             key.lower(): value for key, value in get_headers.items()
         }

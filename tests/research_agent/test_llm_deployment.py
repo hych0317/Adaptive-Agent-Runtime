@@ -133,11 +133,16 @@ class RecordingAnthropicReportTransport:
         return HTTPJSONResponse(
             status_code=200,
             body={
-                "id": "claude-test-model",
-                "type": "model",
-                "capabilities": {
-                    "structured_outputs": {"supported": True}
-                },
+                "data": [
+                    {
+                        "id": "claude-test-model",
+                        "type": "model",
+                        "capabilities": {
+                            "structured_outputs": {"supported": True}
+                        },
+                    }
+                ],
+                "has_more": False,
             },
         )
 
@@ -523,7 +528,7 @@ class ResearchLLMDeploymentTests(unittest.IsolatedAsyncioTestCase):
         probe_url, probe_headers = transport.probes[0]
         self.assertEqual(
             probe_url,
-            "https://api.anthropic.example/v1/models/claude-test-model",
+            "https://api.anthropic.example/v1/models?limit=1000",
         )
         self.assertEqual(probe_headers["x-api-key"], "test-secret")
         url, headers, body = transport.requests[0]
@@ -758,11 +763,17 @@ class ResearchLLMDeploymentTests(unittest.IsolatedAsyncioTestCase):
         backend_config = config.target.build_config()
         self.assertEqual(backend_config.base_url, "https://api.deepseek.com")
         self.assertEqual(backend_config.api_key_env, "DEEPSEEK_API_KEY")
+        assert backend_config.reasoning_effort is not None
+        self.assertEqual(backend_config.reasoning_effort.value, "high")
         self.assertNotIn("api_key =", config_path.read_text(encoding="utf-8"))
         self.assertEqual(
             config.enabled_capabilities,
-            (ResearchLLMCapability.GENERATION,),
+            (
+                ResearchLLMCapability.GENERATION,
+                ResearchLLMCapability.REASONING,
+            ),
         )
+        self.assertEqual(config.reasoner_tool_intent_limit, 1)
 
     def test_private_provider_config_is_merged_and_masked(self) -> None:
         config_path = Path(__file__).parents[2] / "config" / "llm.toml"
@@ -790,6 +801,36 @@ api_key = "private-deepseek-secret"
             "private-deepseek-secret",
         )
         self.assertNotIn("private-deepseek-secret", repr(config))
+
+    def test_private_target_selection_overrides_model_and_effort(self) -> None:
+        config_path = Path(__file__).parents[2] / "config" / "llm.toml"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            private_path = Path(temp_dir) / "llm.local.toml"
+            private_path.write_text(
+                """
+schema_version = 1
+[selections.deepseek-research]
+model = "deepseek-reasoner"
+reasoning_effort = "max"
+""".strip(),
+                encoding="utf-8",
+            )
+
+            config = load_llm_config_file(
+                config_path,
+                private_path=private_path,
+            )
+
+        self.assertIsInstance(config.target, OpenAICompatibleTargetDefinition)
+        assert isinstance(config.target, OpenAICompatibleTargetDefinition)
+        self.assertEqual(config.target.model_id, "deepseek-reasoner")
+        effort = config.target.build_config().reasoning_effort
+        assert effort is not None
+        self.assertEqual(effort.value, "max")
+        self.assertEqual(
+            config.target.target_id,
+            "research/deepseek/deepseek-v4-flash",
+        )
 
     def test_private_provider_config_rejects_unknown_fields(self) -> None:
         config_path = Path(__file__).parents[2] / "config" / "llm.toml"
@@ -823,6 +864,8 @@ base_url = "https://unexpected.example"
         assert isinstance(config.target, CodexCLIInferenceTargetDefinition)
         self.assertEqual(config.target.model_id, "gpt-5.6-terra")
         self.assertEqual(config.target.config.executable, "codex")
+        assert config.target.config.reasoning_effort is not None
+        self.assertEqual(config.target.config.reasoning_effort.value, "high")
 
     def test_llm_target_selects_slot_from_unified_config(self) -> None:
         parser = build_parser()

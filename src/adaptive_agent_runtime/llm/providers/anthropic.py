@@ -36,6 +36,7 @@ from adaptive_agent_runtime.llm.models import (
     ModelResponseKind,
     NormalizedFinishReason,
     NormalizedModelResponse,
+    ReasoningEffort,
     StructuredOutputLevel,
     ToolIntentDraft,
     ToolIntentMode,
@@ -70,6 +71,7 @@ class AnthropicMessagesConfig(LLMModel):
     probe_timeout_seconds: float = Field(default=10.0, gt=0.0)
     allow_insecure_http: bool = False
     max_schema_characters: int = Field(default=24_000, ge=1)
+    reasoning_effort: ReasoningEffort | None = None
 
     @model_validator(mode="after")
     def validate_config(self) -> AnthropicMessagesConfig:
@@ -96,6 +98,10 @@ class AnthropicMessagesConfig(LLMModel):
     @property
     def messages_url(self) -> str:
         return self.base_url.rstrip("/") + "/messages"
+
+    @property
+    def models_url(self) -> str:
+        return self.base_url.rstrip("/") + "/models?limit=1000"
 
     def model_url(self, model_id: str) -> str:
         return self.base_url.rstrip("/") + "/models/" + quote(model_id, safe="")
@@ -126,6 +132,19 @@ class AnthropicAPITargetDefinition(LLMModel):
         if self.features.multimodal:
             raise ValueError(
                 "Anthropic Messages adapter does not support multimodal input"
+            )
+        if self.config.reasoning_effort not in {
+            None,
+            ReasoningEffort.DEFAULT,
+            ReasoningEffort.LOW,
+            ReasoningEffort.MEDIUM,
+            ReasoningEffort.HIGH,
+            ReasoningEffort.XHIGH,
+            ReasoningEffort.MAX,
+        }:
+            raise ValueError(
+                "Anthropic reasoning effort must be low, medium, high, "
+                "xhigh, max, or default"
             )
         return self
 
@@ -201,7 +220,7 @@ class AnthropicMessagesBackend:
             )
         try:
             response = await self._transport.get_json(
-                self._config.model_url(cast(str, self.profile.model_id)),
+                self._config.models_url,
                 headers=self._headers(api_key, content_type=False),
                 timeout_seconds=self._config.probe_timeout_seconds,
             )
@@ -220,10 +239,6 @@ class AnthropicMessagesBackend:
                 protocol_version=protocol_version,
                 diagnostics=("credentials_rejected",),
             )
-        if response.status_code == 404:
-            return _probe_unavailable(
-                self.target_id, "model_not_available", protocol_version
-            )
         if response.status_code == 429:
             return _probe_unavailable(
                 self.target_id, "probe_rate_limited", protocol_version
@@ -236,12 +251,21 @@ class AnthropicMessagesBackend:
             return _probe_unavailable(
                 self.target_id, "probe_rejected", protocol_version
             )
-        model = _mapping_or_none(response.body)
-        if model is None or not isinstance(model.get("id"), str):
+        models = _anthropic_models(response.body)
+        if models is None:
             return _probe_unavailable(
                 self.target_id,
-                "invalid_model_response",
+                "invalid_models_response",
                 protocol_version,
+            )
+        available_model_ids = tuple(models)
+        model = models.get(cast(str, self.profile.model_id))
+        if model is None:
+            return _probe_unavailable(
+                self.target_id,
+                "model_not_available",
+                protocol_version,
+                available_model_ids=available_model_ids,
             )
         if (
             self.profile.features.structured_output
@@ -258,6 +282,7 @@ class AnthropicMessagesBackend:
             availability=BackendAvailability.AVAILABLE,
             active_auth_method=auth_method,
             protocol_version=protocol_version,
+            available_model_ids=available_model_ids,
             diagnostics=("connectivity_and_model_verified",),
         )
 
@@ -369,6 +394,13 @@ class AnthropicMessagesBackend:
                 }
             ],
         }
+        if (
+            self._config.reasoning_effort is not None
+            and self._config.reasoning_effort is not ReasoningEffort.DEFAULT
+        ):
+            body["output_config"] = {
+                "effort": self._config.reasoning_effort.value
+            }
         if request.response_schema is not None:
             schema = request.model_dump(mode="json")["response_schema"]
             encoded = json.dumps(
@@ -378,8 +410,12 @@ class AnthropicMessagesBackend:
             )
             if len(encoded) > self._config.max_schema_characters:
                 raise UnsupportedFeatureError(self.target_id, "schema_size")
-            body["output_config"] = {
-                "format": {"type": "json_schema", "schema": schema}
+            output_config = cast(
+                dict[str, Any], body.setdefault("output_config", {})
+            )
+            output_config["format"] = {
+                "type": "json_schema",
+                "schema": schema,
             }
         tool_names: dict[str, str] = {}
         if request.requirements.tool_intent is not ToolIntentMode.DISABLED:
@@ -614,6 +650,27 @@ def _structured_output_supported(model: Mapping[str, Any]) -> bool | None:
     return supported if isinstance(supported, bool) else None
 
 
+def _anthropic_models(
+    body: Any,
+) -> dict[str, Mapping[str, Any]] | None:
+    root = _mapping_or_none(body)
+    if root is None:
+        return None
+    data = root.get("data")
+    if not isinstance(data, (list, tuple)):
+        return None
+    models: dict[str, Mapping[str, Any]] = {}
+    for item in data:
+        model = _mapping_or_none(item)
+        if model is None:
+            return None
+        model_id = model.get("id")
+        if not isinstance(model_id, str) or not model_id:
+            return None
+        models.setdefault(model_id, model)
+    return models
+
+
 def _error_type(body: Any) -> str | None:
     mapping = _mapping_or_none(body)
     if mapping is None:
@@ -645,10 +702,13 @@ def _probe_unavailable(
     target_id: str,
     diagnostic: str,
     protocol_version: str,
+    *,
+    available_model_ids: tuple[str, ...] = (),
 ) -> BackendProbeResult:
     return BackendProbeResult(
         target_id=target_id,
         availability=BackendAvailability.UNAVAILABLE,
         protocol_version=protocol_version,
+        available_model_ids=available_model_ids,
         diagnostics=(diagnostic,),
     )

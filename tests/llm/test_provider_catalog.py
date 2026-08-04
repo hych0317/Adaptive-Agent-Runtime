@@ -79,14 +79,14 @@ class ProviderCatalogTests(unittest.IsolatedAsyncioTestCase):
                 "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
                 "DASHSCOPE_API_KEY",
                 BackendKind.API,
-                OpenAICompatibleProbeMode.CREDENTIALS_ONLY,
+                OpenAICompatibleProbeMode.MODELS_ENDPOINT,
             ),
             (
                 OpenAICompatibleService.QWEN_INTERNATIONAL,
                 "https://dashscope-us.aliyuncs.com/compatible-mode/v1/chat/completions",
                 "DASHSCOPE_API_KEY",
                 BackendKind.API,
-                OpenAICompatibleProbeMode.CREDENTIALS_ONLY,
+                OpenAICompatibleProbeMode.MODELS_ENDPOINT,
             ),
             (
                 OpenAICompatibleService.DEEPSEEK,

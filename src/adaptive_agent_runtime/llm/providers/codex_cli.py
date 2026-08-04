@@ -36,6 +36,7 @@ from adaptive_agent_runtime.llm.models import (
     ModelResponseKind,
     NormalizedFinishReason,
     NormalizedModelResponse,
+    ReasoningEffort,
     StructuredOutputLevel,
     ToolIntentMode,
 )
@@ -112,6 +113,7 @@ class CodexCLIInferenceConfig(LLMModel):
     max_capture_characters: int = Field(default=2_000_000, ge=1)
     auth_probe_mode: CodexCLIAuthProbeMode = CodexCLIAuthProbeMode.ADVISORY
     inherited_environment_variables: tuple[str, ...] = _DEFAULT_ENVIRONMENT
+    reasoning_effort: ReasoningEffort | None = None
 
     @model_validator(mode="after")
     def validate_config(self) -> CodexCLIInferenceConfig:
@@ -120,6 +122,20 @@ class CodexCLIInferenceConfig(LLMModel):
             raise ValueError("inherited environment variables must be unique")
         if any(not _ENVIRONMENT_NAME.fullmatch(name) for name in names):
             raise ValueError("inherited environment variable name is invalid")
+        if self.reasoning_effort not in {
+            None,
+            ReasoningEffort.DEFAULT,
+            ReasoningEffort.NONE,
+            ReasoningEffort.MINIMAL,
+            ReasoningEffort.LOW,
+            ReasoningEffort.MEDIUM,
+            ReasoningEffort.HIGH,
+            ReasoningEffort.XHIGH,
+        }:
+            raise ValueError(
+                "Codex CLI reasoning effort must be none, minimal, low, "
+                "medium, high, xhigh, or default"
+            )
         return self
 
 
@@ -337,6 +353,17 @@ class CodexCLIInferenceBackend:
             "-c",
             'web_search="disabled"',
         ]
+        if (
+            self._config.reasoning_effort is not None
+            and self._config.reasoning_effort is not ReasoningEffort.DEFAULT
+        ):
+            arguments.extend(
+                (
+                    "-c",
+                    "model_reasoning_effort="
+                    + json.dumps(self._config.reasoning_effort.value),
+                )
+            )
         if schema_path is not None:
             arguments.extend(("--output-schema", schema_path))
         return tuple(arguments)

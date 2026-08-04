@@ -1,6 +1,10 @@
 """Financial Research Agent Application built on Adaptive Agent Runtime."""
 
-from applications.research_agent.agent import ResearchAgent, company_from_task
+from applications.research_agent.agent import (
+    ResearchAgent,
+    ResearchInformationMode,
+    company_from_task,
+)
 from applications.research_agent.cognition import (
     ResearchCognitiveCapabilities,
     ResearchContextProjection,
@@ -38,6 +42,7 @@ __all__ = [
     "GovernanceRecord",
     "ReportSection",
     "ResearchAgent",
+    "ResearchInformationMode",
     "ResearchCognitiveCapabilities",
     "ResearchContextProjection",
     "ResearchReportContextProjection",

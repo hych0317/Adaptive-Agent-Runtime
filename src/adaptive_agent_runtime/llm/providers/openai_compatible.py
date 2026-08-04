@@ -33,6 +33,7 @@ from adaptive_agent_runtime.llm.models import (
     ModelResponseKind,
     NormalizedFinishReason,
     NormalizedModelResponse,
+    ReasoningEffort,
     StructuredOutputLevel,
     ToolIntentDraft,
     ToolIntentMode,
@@ -76,6 +77,7 @@ class OpenAICompatibleChatConfig(LLMModel):
         OpenAICompatibleProbeMode.CREDENTIALS_ONLY
     )
     probe_timeout_seconds: float = Field(default=10.0, gt=0.0)
+    reasoning_effort: ReasoningEffort | None = None
 
     @model_validator(mode="after")
     def validate_config(self) -> OpenAICompatibleChatConfig:
@@ -201,7 +203,11 @@ class OpenAICompatibleChatBackend:
             )
         model_id = cast(str, self.profile.model_id)
         if model_id not in model_ids:
-            return _probe_unavailable(self.target_id, "model_not_available")
+            return _probe_unavailable(
+                self.target_id,
+                "model_not_available",
+                available_model_ids=model_ids,
+            )
         return BackendProbeResult(
             target_id=self.target_id,
             availability=BackendAvailability.AVAILABLE,
@@ -209,6 +215,7 @@ class OpenAICompatibleChatBackend:
                 auth_method if self._config.requires_api_key else None
             ),
             protocol_version="openai-chat-completions",
+            available_model_ids=model_ids,
             diagnostics=("connectivity_and_model_verified",),
         )
 
@@ -318,6 +325,11 @@ class OpenAICompatibleChatBackend:
             ],
             "stream": False,
         }
+        if (
+            self._config.reasoning_effort is not None
+            and self._config.reasoning_effort is not ReasoningEffort.DEFAULT
+        ):
+            body["reasoning_effort"] = self._config.reasoning_effort.value
         requirements = request.requirements
         if requirements.max_output_tokens is not None:
             body[self._config.max_tokens_parameter.value] = (
@@ -458,31 +470,73 @@ def _response_name(capability_id: str) -> str:
     return sanitized or "runtime_response"
 
 
-def _model_ids(body: Any) -> frozenset[str] | None:
+def _model_ids(body: Any) -> tuple[str, ...] | None:
     if not isinstance(body, Mapping):
         return None
     data = body.get("data")
     if not isinstance(data, (list, tuple)):
         return None
-    model_ids: set[str] = set()
+    model_ids: list[str] = []
+    seen: set[str] = set()
     for item in data:
         if not isinstance(item, Mapping):
             return None
         model_id = item.get("id")
         if not isinstance(model_id, str) or not model_id:
             return None
-        model_ids.add(model_id)
-    return frozenset(model_ids)
+        if not _is_chat_model_id(model_id):
+            continue
+        if model_id not in seen:
+            model_ids.append(model_id)
+            seen.add(model_id)
+    return tuple(model_ids)
+
+
+def _is_chat_model_id(model_id: str) -> bool:
+    """Filter non-chat catalogue entries using Open Design's allow logic."""
+
+    normalized = model_id.strip().lower()
+    excluded_fragments = (
+        "embedding",
+        "moderation",
+        "rerank",
+        "whisper",
+        "tts",
+        "transcribe",
+        "speech",
+        "image",
+        "video",
+        "dall-e",
+        "stable-diffusion",
+        "flux",
+    )
+    if not normalized or any(
+        fragment in normalized for fragment in excluded_fragments
+    ):
+        return False
+    if re.search(r"(?:^|[/_-])bge(?:[-_]|$)", normalized):
+        return False
+    if "wan" in normalized and re.search(
+        r"(?:^|[-_.:])(?:t2v|i2v|v2v)(?:[-_.:]|$)", normalized
+    ):
+        return False
+    return re.search(
+        r"(?:^|[-_.:])(?:t2i|i2i|t2v|i2v|v2v|tts|asr|ocr)(?:[-_.:]|$)",
+        normalized,
+    ) is None
 
 
 def _probe_unavailable(
     target_id: str,
     diagnostic: str,
+    *,
+    available_model_ids: tuple[str, ...] = (),
 ) -> BackendProbeResult:
     return BackendProbeResult(
         target_id=target_id,
         availability=BackendAvailability.UNAVAILABLE,
         protocol_version="openai-chat-completions",
+        available_model_ids=available_model_ids,
         diagnostics=(diagnostic,),
     )
 

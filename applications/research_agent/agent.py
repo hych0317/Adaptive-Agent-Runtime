@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from enum import StrEnum
 from tempfile import TemporaryDirectory
 from uuid import UUID, uuid4
 
@@ -131,6 +132,7 @@ from applications.research_agent.progress import (
     ResearchProgressSink,
     publish_progress,
 )
+from applications.research_agent.prompts import CHINESE_OUTPUT_INSTRUCTION
 from applications.research_agent.strategies import (
     DeterministicContextCompressor,
     DeterministicRiskAgent,
@@ -175,6 +177,13 @@ def company_from_task(task: str) -> str:
     return value or task.strip() or "Unknown Company"
 
 
+class ResearchInformationMode(StrEnum):
+    """Application-owned choice of evidence Provider composition."""
+
+    FIXTURE_DEMO = "fixture_demo"
+    LLM_RESEARCH = "llm_research"
+
+
 class ResearchAgent:
     """Application facade demonstrating the full Adaptive Runtime stack."""
 
@@ -183,11 +192,28 @@ class ResearchAgent:
         *,
         autonomous_risk_backend: AutonomousAgentBackend | None = None,
         cognitive_capabilities: ResearchCognitiveCapabilities | None = None,
+        information_mode: ResearchInformationMode = (
+            ResearchInformationMode.FIXTURE_DEMO
+        ),
     ) -> None:
         self._cognitive_capabilities = (
             cognitive_capabilities or ResearchCognitiveCapabilities()
         )
-        self._tools = build_research_tool_stack()
+        if (
+            information_mode is ResearchInformationMode.LLM_RESEARCH
+            and self._cognitive_capabilities.report_generator is None
+        ):
+            raise ValueError(
+                "LLM Research mode requires the generation capability"
+            )
+        self._information_mode = information_mode
+        self._tools = build_research_tool_stack(
+            llm_information_generator=(
+                self._cognitive_capabilities.report_generator
+                if information_mode is ResearchInformationMode.LLM_RESEARCH
+                else None
+            )
+        )
         self._context_store = InMemoryContextStore()
         self._context_archive = InMemoryContextArchive()
         compressor: ContextCompressor
@@ -351,6 +377,12 @@ class ResearchAgent:
             executor=governed_executor,
             resolver=self._tools.resolver,
             selector=self._tools.selector,
+            timeout_seconds=(
+                300.0
+                if self._information_mode
+                is ResearchInformationMode.LLM_RESEARCH
+                else 2.0
+            ),
         )
         research_strategy = ResearchStrategy(
             tool_strategy=tool_strategy,
@@ -377,6 +409,12 @@ class ResearchAgent:
                     selector=self._tools.selector,
                     executor=governed_executor,
                     workspace=workspace,
+                    timeout_seconds=(
+                        300.0
+                        if self._information_mode
+                        is ResearchInformationMode.LLM_RESEARCH
+                        else 2.0
+                    ),
                 )
                 if self._cognitive_capabilities.reasoner_tool_intent_limit
                 else None
@@ -843,6 +881,7 @@ class ResearchAgent:
             TaskPlanningRequest(
                 task=task,
                 constraints=(
+                    CHINESE_OUTPUT_INSTRUCTION,
                     "Use exactly the eight documented research node keys.",
                     "Keep news_analysis in the final plan; Runtime adds it dynamically.",
                     "Use only Runtime-supplied strategy identifiers.",
@@ -987,6 +1026,7 @@ class ResearchAgent:
                     "report": report_value,
                 },
                 criteria=(
+                    CHINESE_OUTPUT_INSTRUCTION,
                     "The report is supported by the supplied research evidence.",
                     "The execution outcome and trajectory are internally consistent.",
                     "Findings identify uncertainty without inventing facts.",

@@ -1,0 +1,2 @@
+"""Personal knowledge application tests."""
+

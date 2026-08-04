@@ -38,6 +38,7 @@ from adaptive_agent_runtime.llm import (
     NormalizedFinishReason,
     ProviderNeutralResponseValidator,
     RateLimitedError,
+    ReasoningEffort,
     ReasoningContext,
     StructuredOutputLevel,
     ToolIntentMode,
@@ -104,12 +105,18 @@ def model_response(
         body=cast(
             Any,
             {
-                "id": "claude-test-model",
-                "type": "model",
-                "display_name": "Claude Test",
-                "capabilities": {
-                    "structured_outputs": {"supported": structured}
-                },
+                "data": [
+                    {
+                        "id": "claude-test-model",
+                        "type": "model",
+                        "display_name": "Claude Test",
+                        "capabilities": {
+                            "structured_outputs": {"supported": structured}
+                        },
+                    },
+                    {"id": "claude-other-model", "type": "model"},
+                ],
+                "has_more": False,
             },
         ),
     )
@@ -237,7 +244,11 @@ class AnthropicMessagesBackendTests(unittest.IsolatedAsyncioTestCase):
         url, headers, timeout = transport.gets[0]
         self.assertEqual(
             url,
-            "https://api.anthropic.example/v1/models/claude-test-model",
+            "https://api.anthropic.example/v1/models?limit=1000",
+        )
+        self.assertEqual(
+            available.available_model_ids,
+            ("claude-test-model", "claude-other-model"),
         )
         self.assertEqual(headers["x-api-key"], "test-secret")
         self.assertEqual(headers["anthropic-version"], "2023-06-01")
@@ -277,7 +288,7 @@ class AnthropicMessagesBackendTests(unittest.IsolatedAsyncioTestCase):
     async def test_probe_normalizes_remote_and_capability_failures(self) -> None:
         cases = (
             (RecordingAnthropicTransport(probe_response=model_response(status=401)), "auth_required", "credentials_rejected"),
-            (RecordingAnthropicTransport(probe_response=model_response(status=404)), "unavailable", "model_not_available"),
+            (RecordingAnthropicTransport(probe_response=HTTPJSONResponse(status_code=200, body={"data": []})), "unavailable", "model_not_available"),
             (RecordingAnthropicTransport(probe_response=model_response(status=429)), "unavailable", "probe_rate_limited"),
             (RecordingAnthropicTransport(probe_response=model_response(structured=False)), "unavailable", "structured_output_not_supported"),
             (RecordingAnthropicTransport(probe_error=HTTPTransportTimeoutError()), "unavailable", "probe_timed_out"),
@@ -320,6 +331,22 @@ class AnthropicMessagesBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             body["output_config"]["format"]["type"], "json_schema"
         )
+
+    async def test_reasoning_effort_merges_with_structured_output(self) -> None:
+        transport = RecordingAnthropicTransport()
+        configured = config().model_copy(
+            update={"reasoning_effort": ReasoningEffort.XHIGH}
+        )
+        backend = AnthropicMessagesBackend(profile(), configured, transport)
+
+        with patch.dict(
+            os.environ, {"AAR_ANTHROPIC_TEST_KEY": "test-secret"}
+        ):
+            await backend.invoke(reasoning_request())
+
+        output_config = transport.posts[0][2]["output_config"]
+        self.assertEqual(output_config["effort"], "xhigh")
+        self.assertEqual(output_config["format"]["type"], "json_schema")
 
     async def test_tool_use_is_only_a_runtime_proposal(self) -> None:
         transport = RecordingAnthropicTransport(

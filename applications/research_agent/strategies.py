@@ -113,11 +113,12 @@ from adaptive_agent_runtime.tool_ecosystem import (
 
 from applications.research_agent.capabilities import (
     CALCULATION,
-    COMPANY_PROVIDER,
+    PRIVILEGED_INFORMATION_PROVIDERS,
     DOCUMENT_ANALYSIS,
     INFORMATION_RETRIEVAL,
     REPORT_GENERATION,
 )
+from applications.research_agent.prompts import CHINESE_OUTPUT_INSTRUCTION
 from applications.research_agent.cognition import (
     ResearchContextProjection,
     ResearchReportContextProjection,
@@ -520,7 +521,7 @@ class GovernedRecordingToolExecutor:
         invocation: ToolInvocation,
         policy: ToolExecutionPolicy,
     ) -> ToolObservation:
-        privileged = invocation.provider_id == COMPANY_PROVIDER
+        privileged = invocation.provider_id in PRIVILEGED_INFORMATION_PROVIDERS
         request = self._adapter.to_request(
             invocation,
             privileged=privileged,
@@ -988,12 +989,13 @@ class GovernedToolIntentExecutor:
         selector: ToolSelector,
         executor: ToolExecutor,
         workspace: ResearchWorkspace,
+        timeout_seconds: float = 2.0,
     ) -> None:
         self._resolver = resolver
         self._selector = selector
         self._executor = executor
         self._workspace = workspace
-        self._policy = ToolExecutionPolicy(timeout_seconds=2.0)
+        self._policy = ToolExecutionPolicy(timeout_seconds=timeout_seconds)
         schema = RESEARCH_INFORMATION_RETRIEVAL_TOOL.model_dump(mode="json")[
             "input_schema"
         ]
@@ -1146,9 +1148,14 @@ class ResearchStrategy(_ContextAwareStrategy):
                     },
                     evidence=tuple(evidence),
                     constraints=(
+                        CHINESE_OUTPUT_INSTRUCTION,
                         "Do not invent facts beyond the supplied Tool output.",
                         "Return analysis only; do not propose state changes.",
                         "Tool calls are proposals executed only by Runtime.",
+                        (
+                            "如果候选工具能显著降低关键不确定性，可优先提出一次 "
+                            "Tool Intent；否则直接完成分析。"
+                        ),
                     ),
                 ),
                     invocation=CapabilityInvocationMetadata(
@@ -1452,7 +1459,7 @@ class LLMRiskAgent:
         state: AgentState,
     ) -> NodeExecutionResult:
         request = AutonomousAgentRequest(
-            goal=node.goal,
+            goal=f"{node.goal}\n{CHINESE_OUTPUT_INSTRUCTION}",
             input={
                 "company": self._workspace.definition.company,
                 "node_id": str(node.node_id),
@@ -1731,7 +1738,8 @@ class ReportStrategy(_ContextAwareStrategy):
         request = GenerationRequest(
             instruction=(
                 "Generate the final structured investment research report. "
-                "Use only supplied analyses and cite their evidence reference IDs."
+                "Use only supplied analyses and cite their evidence reference IDs. "
+                + CHINESE_OUTPUT_INSTRUCTION
             ),
             context=context,
             media_type="application/json",
@@ -1779,6 +1787,7 @@ def build_tool_execution_strategy(
     executor: ToolExecutor,
     resolver: CapabilityCandidateResolver,
     selector: ToolSelector,
+    timeout_seconds: float = 2.0,
 ) -> ToolExecutionStrategy:
     """Small typed seam kept here so Strategies reuse the Runtime adapter."""
 
@@ -1787,6 +1796,6 @@ def build_tool_execution_strategy(
         resolver=resolver,
         selector=selector,
         executor=executor,
-        policy=ToolExecutionPolicy(timeout_seconds=2.0),
+        policy=ToolExecutionPolicy(timeout_seconds=timeout_seconds),
         strategy_id="research-tool-delegate",
     )

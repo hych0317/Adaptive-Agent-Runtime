@@ -15,6 +15,7 @@ from adaptive_agent_runtime.llm.models import (
     BackendMetering,
     BackendTransportFeatures,
     InferenceTargetProfile,
+    ReasoningEffort,
 )
 from adaptive_agent_runtime.llm.providers.http import AsyncJSONTransport
 from adaptive_agent_runtime.llm.providers.openai_compatible import (
@@ -57,7 +58,7 @@ _SERVICE_DEFAULTS = {
         api_key_env="DASHSCOPE_API_KEY",
         backend_kind=BackendKind.API,
         requires_api_key=True,
-        probe_mode=OpenAICompatibleProbeMode.CREDENTIALS_ONLY,
+        probe_mode=OpenAICompatibleProbeMode.MODELS_ENDPOINT,
     ),
     OpenAICompatibleService.QWEN_INTERNATIONAL: _ServiceDefaults(
         backend_id="openai-compatible.qwen",
@@ -65,7 +66,7 @@ _SERVICE_DEFAULTS = {
         api_key_env="DASHSCOPE_API_KEY",
         backend_kind=BackendKind.API,
         requires_api_key=True,
-        probe_mode=OpenAICompatibleProbeMode.CREDENTIALS_ONLY,
+        probe_mode=OpenAICompatibleProbeMode.MODELS_ENDPOINT,
     ),
     OpenAICompatibleService.DEEPSEEK: _ServiceDefaults(
         backend_id="openai-compatible.deepseek",
@@ -108,6 +109,7 @@ class OpenAICompatibleTargetDefinition(LLMModel):
     allow_insecure_http: bool = False
     probe_mode: OpenAICompatibleProbeMode | None = None
     probe_timeout_seconds: float = Field(default=10.0, gt=0.0)
+    reasoning_effort: ReasoningEffort | None = None
 
     @model_validator(mode="after")
     def validate_definition(self) -> OpenAICompatibleTargetDefinition:
@@ -133,6 +135,30 @@ class OpenAICompatibleTargetDefinition(LLMModel):
             self.supported_cognitive_capability_ids
         ):
             raise ValueError("compatible target cognitive capabilities must be unique")
+        supported_efforts = {
+            OpenAICompatibleService.OPENAI: {
+                ReasoningEffort.NONE,
+                ReasoningEffort.MINIMAL,
+                ReasoningEffort.LOW,
+                ReasoningEffort.MEDIUM,
+                ReasoningEffort.HIGH,
+                ReasoningEffort.XHIGH,
+            },
+            OpenAICompatibleService.DEEPSEEK: {
+                ReasoningEffort.HIGH,
+                ReasoningEffort.MAX,
+            },
+        }.get(self.service, set())
+        effort = self.reasoning_effort
+        if (
+            effort not in {None, ReasoningEffort.DEFAULT}
+            and effort not in supported_efforts
+        ):
+            assert effort is not None
+            raise ValueError(
+                f"{self.service.value} does not support reasoning effort "
+                f"'{effort.value}' through this adapter"
+            )
         OpenAICompatibleChatConfig(
             base_url=base_url,
             api_key_env=key_env or "UNUSED_API_KEY",
@@ -143,6 +169,7 @@ class OpenAICompatibleTargetDefinition(LLMModel):
             strict_json_schema=self.strict_json_schema,
             probe_mode=self.probe_mode or defaults.probe_mode,
             probe_timeout_seconds=self.probe_timeout_seconds,
+            reasoning_effort=self.reasoning_effort,
         )
         return self
 
@@ -194,6 +221,7 @@ class OpenAICompatibleTargetDefinition(LLMModel):
             strict_json_schema=self.strict_json_schema,
             probe_mode=self.probe_mode or defaults.probe_mode,
             probe_timeout_seconds=self.probe_timeout_seconds,
+            reasoning_effort=self.reasoning_effort,
         )
 
     def build_backend(

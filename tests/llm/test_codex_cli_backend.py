@@ -37,6 +37,7 @@ from adaptive_agent_runtime.llm import (
     ProcessTransportTimeoutError,
     ProviderNeutralResponseValidator,
     ReasoningContext,
+    ReasoningEffort,
     StructuredOutputLevel,
     SubprocessTransport,
     ToolIntentMode,
@@ -320,7 +321,8 @@ class CodexCLIInferenceBackendTests(unittest.IsolatedAsyncioTestCase):
         backend = CodexCLIInferenceBackend(
             cli_profile(),
             CodexCLIInferenceConfig(
-                inherited_environment_variables=("AAR_SAFE_TEST",)
+                inherited_environment_variables=("AAR_SAFE_TEST",),
+                reasoning_effort=ReasoningEffort.HIGH,
             ),
             transport,
         )
@@ -340,6 +342,8 @@ class CodexCLIInferenceBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--ignore-rules", argv)
         self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only")
         self.assertEqual(argv[argv.index("--ask-for-approval") + 1], "never")
+        effort_index = argv.index('model_reasoning_effort="high"')
+        self.assertEqual(argv[effort_index - 1], "-c")
         self.assertEqual(environment["AAR_SAFE_TEST"], "allowed")
         self.assertIn("PATH", environment)
         self.assertIn("C:/tools", environment["PATH"].replace("\\", "/"))

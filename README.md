@@ -53,29 +53,34 @@ Persistence 通过各模块已有的窄接口提供可选 SQLite 实现，持久
 
 ## 核心技术设计
 
-### 1. Runtime-owned Proposal Pipeline
+### 1. 运行时控制的提案流水线（Runtime-owned Proposal Pipeline）
 
-模型或 Agent 只产生 Proposal，不直接获得工具执行和状态修改权限。Action Proposal 必须落在 Runtime 计算出的 Ready Set 内；Graph Mutation 必须满足节点、依赖与策略白名单；ToolIntent 还要重新经过能力匹配、Provider 选择和治理授权。
+模型或 Agent 只产生提案（Proposal），不直接获得工具执行和状态修改权限。动作提案必须落在运行时计算出的可执行集合内；任务图变更（Graph Mutation）必须满足节点、依赖与策略白名单；工具意图还要重新经过能力匹配、服务选择和治理授权。
 
-系统将动态能力统一拆成 **Proposal → Validation → Governance → Execution**，使模型负责语义判断，Runtime 保留最终控制权。Authorization 与请求指纹、策略版本和目标快照绑定，避免审批结果被复用于已经变化的操作。
+系统将动态能力统一拆分为 **提案生成（Proposal）→ 校验（Validation）→ 治理决策（Governance）→ 执行（Execution）** 四个阶段，使模型负责语义判断，运行时保留最终控制权。授权信息与请求指纹、策略版本和目标快照绑定，避免审批结果被复用于已经变化的操作。
 
-### 2. Versioned Dynamic Task Graph
+### 2. 版本化动态任务图（Versioned Dynamic Task Graph）
 
-任务图不是可被任意改写的共享对象，而是经过不变量校验的不可变 DAG Snapshot。节点状态、Graph Version、Action 和 Observation 具有明确关联；只有成功执行产生的合法 Mutation 才能形成下一版本，失败则沿依赖关系传播阻塞状态。
+任务图不是可被任意修改的共享对象，而是经过不变量校验的不可变 DAG 快照。节点状态、图版本、动作和观测结果具有明确关联；只有成功执行产生的合法变更才能形成下一版本，失败则沿依赖关系传播阻塞状态。
 
-这种设计在“固定 Workflow”和“模型自由规划”之间建立了受约束的动态层：执行反馈能够改变后续任务，同时每次变化都可追踪、可验证，也不会绕过调度规则。节点失败后由 Failure Classifier 与 Recovery Planner 生成 Retry、策略替换、恢复节点或依赖重连方案；恢复计划经过 Governance 后写入新图版本并继续调度，而不是直接终止整个计划。
+这种设计在“固定工作流”和“模型自由规划”之间建立了受约束的动态层：执行反馈能够改变后续任务，同时每次变化都可追踪、可验证，也不会绕过调度规则。节点失败后，由失败分类器（Failure Classifier）与恢复规划器（Recovery Planner）生成重试、策略替换、恢复节点或依赖重连方案；恢复计划经过治理审核后写入新图版本并继续调度，而不是直接终止整个计划。
 
-### 3. Evidence-bound Cognitive State Evolution
+### 3. 基于证据约束的认知状态演化（Evidence-bound Cognitive State Evolution）
 
-Context 压缩不是覆盖原文：Runtime 会先归档完整快照，再保存核心结论和 Recovery Reference；压缩、归档、恢复均采用版本化写入与冲突检查，失败时执行补偿操作。每次节点执行前，Context Lifecycle Runtime 会测量驻留 Token 压力，结合重要性、驻留策略和访问历史自动选择压缩/归档动作；Required Context 缺失时会从 Archive 自动恢复，随后重新调度并把实际访问写回下一版本快照。
+上下文压缩（Context Compression）不是覆盖原始内容：运行时会先归档完整快照，再保存核心结论和恢复引用。压缩、归档和恢复均采用版本化写入与冲突检查，失败时执行补偿操作。
 
-Memory 更新同样不是直接覆盖。每个 Candidate 必须携带 Condition、Evidence、Confidence 和 Evolution Type；Support 累积证据，Modify 产生新版本，Conflict 保留原结论并记录反证，冲突记忆默认退出召回。Candidate Fingerprint、幂等写入和 Revision Check 共同保证重复执行与并发更新不会静默污染长期状态。
+每次节点执行前，上下文生命周期管理（Context Lifecycle Runtime）会测量当前 Token 压力，结合信息重要性、驻留策略和访问历史自动选择压缩或归档动作。缺失必要上下文时，会从归档中自动恢复，随后重新调度，并将实际访问情况写回下一版本快照。
 
-### 4. Trace-to-Proposal Conservative Evolution
+记忆更新（Memory Update）同样不是直接覆盖。每个候选记忆必须携带条件、证据、置信度和演化类型。支持关系（Support）用于累积证据，修改关系（Modify）产生新版本，冲突关系（Conflict）保留原结论并记录反证，冲突记忆默认退出召回。通过候选指纹、幂等写入和版本检查共同保证重复执行与并发更新不会静默污染长期状态。
 
-Runtime 将不同模块的记录归一为带 Correlation 和 Coverage 的 Execution Fact，而不是只保存日志文本。Outcome、Trajectory 与 Component Evaluator 可以定位失败属于任务结果、执行顺序还是具体运行组件，并在 Trace 不完整时降低评估置信度。
+### 4. 从运行轨迹到保守优化提案（Trace-to-Proposal Conservative Evolution）
 
-Failure Analyzer 按组件和错误模式聚合跨 Run 证据。只有重复失败、模式置信度、证据数量和预期收益同时达到阈值，系统才生成 Optimization Proposal。Evolution Runtime 把提案转成候选配置，在持久化 Replay Case 上通过隔离 Runtime 重放做非回归验证；通过后仍需 Governance 授权才能原子激活下一配置版本。应用后配置可跨进程读取，回滚也是独立的高风险治理操作。
+运行时将不同模块产生的记录统一整理为带有关联信息和覆盖范围的执行事实，而不是简单保存日志文本。结果评估、轨迹分析与组件评估器能够定位失败来源，包括任务结果、执行顺序或具体运行组件；当轨迹信息不完整时，系统会主动降低评估置信度。
+
+失败分析器（Failure Analyzer）按照组件和错误模式聚合跨运行记录。只有当重复失败情况、模式置信度、证据数量和预期收益同时达到阈值时，系统才生成优化提案。
+
+演化运行时（Evolution Runtime）会将提案转换为候选配置，并在持久化重放案例上通过隔离运行时进行非回归验证。验证通过后，仍需经过治理授权才能原子激活下一配置版本。应用后的配置可跨进程读取，回滚同样属于独立的高风险治理操作。
+
 
 ## Research Agent 验证
 
@@ -99,7 +104,11 @@ python examples/research_demo.py "分析 Tesla 投资价值"
 python examples/research_web.py
 ```
 
-然后访问 `http://127.0.0.1:8765`。LLM Target 配置示例见 `config/llm.toml` 和 `config/llm.local.example.toml`。
+然后访问 `http://127.0.0.1:8765`。未激活 LLM 时使用 Fixture Demo；激活 Target 后，“自动”模式优先执行 LLM Research。右上角“LLM 设置”支持获取 Provider 实时模型列表、动态切换模型，并将 Provider API Key 与目标级模型选择保存到被 Git 忽略的 `config/llm.local.toml`。Codex CLI Target 使用启动 Web 服务的宿主用户 OAuth 会话。
+
+Research Agent 的双模式、运行边界和操作说明见 [应用文档](applications/research_agent/README.md)。
+
+Runtime 的私有配置仓库同时持久化 Provider Key 与目标级模型选择。应用可以调用 `TOMLProviderConfigRepository.save_target_selection()` 写入 `[selections.<target-name>]`；加载 Target 时，私有的 `model` 与 `reasoning_effort` 会覆盖 `config/llm.toml` 中的部署默认值。API Target 的探测结果通过 `BackendProbeResult.available_model_ids` 返回实时可用的文本模型列表，界面如何展示与交互由上层应用负责。
 
 持久化运行时在 Composition Root 中显式装配：
 

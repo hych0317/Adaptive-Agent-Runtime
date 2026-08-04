@@ -18,14 +18,19 @@ from adaptive_agent_runtime.llm import (
     CodexCLIInferenceConfig,
     CodexCLIInferenceTargetDefinition,
     ContextSensitivity,
+    LLMTargetSelection,
     OpenAICompatibleService,
     OpenAICompatibleProbeMode,
     OpenAICompatibleTargetDefinition,
+    ReasoningEffort,
     StructuredOutputLevel,
     TOMLProviderConfigRepository,
 )
 
-from applications.research_agent.agent import ResearchAgent
+from applications.research_agent.agent import (
+    ResearchAgent,
+    ResearchInformationMode,
+)
 from applications.research_agent.llm_deployment import (
     ResearchInferenceTargetDefinition,
     ResearchLLMCapability,
@@ -47,6 +52,7 @@ _LLM_TARGET_KEYS = frozenset(
         "service",
         "executable",
         "model",
+        "reasoning_effort",
         "structured_output",
         "target_id",
         "base_url",
@@ -70,6 +76,7 @@ _LLM_FILE_DEFAULTS: dict[str, object] = {
     "llm_service": None,
     "llm_executable": None,
     "llm_model": None,
+    "llm_reasoning_effort": None,
     "llm_structured_output": None,
     "llm_target_id": None,
     "llm_base_url": None,
@@ -191,6 +198,7 @@ async def async_main(
             print("LLM preflight diagnostics: " + ",".join(probe.diagnostics))
         result = await ResearchAgent(
             cognitive_capabilities=deployment.cognitive_capabilities,
+            information_mode=ResearchInformationMode.LLM_RESEARCH,
         ).run(task)
     print(format_result(result))
     return result
@@ -244,6 +252,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--llm-model",
         help="Explicit provider model identifier.",
+    )
+    parser.add_argument(
+        "--llm-reasoning-effort",
+        choices=tuple(item.value for item in ReasoningEffort),
+        help=(
+            "Select provider reasoning effort; default omits the provider "
+            "override. Support is validated for the selected backend."
+        ),
     )
     parser.add_argument(
         "--llm-structured-output",
@@ -347,6 +363,7 @@ def llm_config_from_args(
         explicit_llm_option = any(
             (
                 args.llm_model is not None,
+                args.llm_reasoning_effort is not None,
                 args.llm_structured_output is not None,
                 args.llm_executable is not None,
                 args.llm_base_url is not None,
@@ -369,6 +386,11 @@ def llm_config_from_args(
             "--llm-structured-output is required; model features are not inferred"
         )
     model_id = str(args.llm_model)
+    reasoning_effort = (
+        ReasoningEffort(args.llm_reasoning_effort)
+        if args.llm_reasoning_effort is not None
+        else None
+    )
     target_id = args.llm_target_id or f"research/{service_value}/{model_id}"
     capabilities = tuple(
         ResearchLLMCapability(item)
@@ -421,10 +443,16 @@ def llm_config_from_args(
                 ),
                 config=CodexCLIInferenceConfig(
                     executable=args.llm_executable or "codex",
+                    reasoning_effort=reasoning_effort,
                 ),
                 tags=("research", "oauth-cli"),
             )
         else:
+            if reasoning_effort not in {None, ReasoningEffort.DEFAULT}:
+                raise ValueError(
+                    "Claude Code inference does not expose a Runtime-controlled "
+                    "reasoning effort option"
+                )
             target = ClaudeCodeInferenceTargetDefinition(
                 target_id=target_id,
                 model_id=model_id,
@@ -473,6 +501,7 @@ def llm_config_from_args(
                 api_key_env=args.llm_api_key_env or "ANTHROPIC_API_KEY",
                 api_key=getattr(args, "llm_api_key", None),
                 allow_insecure_http=args.llm_allow_insecure_http,
+                reasoning_effort=reasoning_effort,
             ),
             tags=("research", "anthropic-api"),
         )
@@ -506,6 +535,7 @@ def llm_config_from_args(
                 if args.llm_api_probe is not None
                 else None
             ),
+            reasoning_effort=reasoning_effort,
         )
     return ResearchLLMDeploymentConfig(
         target=target,
@@ -525,7 +555,7 @@ def load_llm_config_file(
     target_name: str | None = None,
     private_path: str | Path | None = None,
 ) -> ResearchLLMDeploymentConfig:
-    """Load a target and merge its API key from private provider config."""
+    """Load a target and merge private credentials and target selection."""
 
     config_path = Path(path)
     try:
@@ -607,6 +637,7 @@ def load_llm_config_file(
         )
 
     service = table.get("service")
+    selection: LLMTargetSelection | None = None
     if isinstance(service, str):
         selected_private_path = (
             Path(private_path)
@@ -616,10 +647,13 @@ def load_llm_config_file(
             )
         )
         if private_path is not None or selected_private_path.is_file():
-            api_keys = TOMLProviderConfigRepository(
+            private_repository = TOMLProviderConfigRepository(
                 selected_private_path
-            ).load_api_keys()
+            )
+            api_keys = private_repository.load_api_keys()
+            selections = private_repository.load_target_selections()
             provider_key = api_keys.get(service)
+            selection = selections.get(selected_name)
         else:
             provider_key = None
     else:
@@ -631,6 +665,10 @@ def load_llm_config_file(
             "llm_capability" if key == "capabilities" else f"llm_{key}"
         )
         values[argument_name] = value
+    if selection is not None:
+        values["llm_model"] = selection.model_id
+        if selection.reasoning_effort is not None:
+            values["llm_reasoning_effort"] = selection.reasoning_effort.value
     values["llm_api_key"] = provider_key
     config = llm_config_from_args(argparse.Namespace(**values))
     if config is None:
@@ -644,6 +682,7 @@ def _has_explicit_llm_options(args: argparse.Namespace) -> bool:
             args.llm_service is not None,
             args.llm_executable is not None,
             args.llm_model is not None,
+            args.llm_reasoning_effort is not None,
             args.llm_structured_output is not None,
             args.llm_target_id is not None,
             args.llm_base_url is not None,
@@ -671,6 +710,7 @@ def _validate_llm_file_values(
         "service",
         "executable",
         "model",
+        "reasoning_effort",
         "structured_output",
         "target_id",
         "base_url",
