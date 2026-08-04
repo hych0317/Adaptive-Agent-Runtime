@@ -32,6 +32,11 @@ from adaptive_agent_runtime.governance.enforcement import (
     InMemoryAuthorizationConsumptionStore,
     StrictAuthorizationVerifier,
 )
+from adaptive_agent_runtime.governance.decisioning import (
+    DecisionGovernanceBinding,
+    GovernedDecisionApplier,
+    RuntimeDecisionGovernanceAdapter,
+)
 from adaptive_agent_runtime.governance.integration import (
     ContextGovernanceAdapter,
     ContextGovernanceOperation,
@@ -93,6 +98,7 @@ __all__ = [
     "ContextGovernanceAdapter",
     "ContextGovernanceOperation",
     "DecisionLevel",
+    "DecisionGovernanceBinding",
     "DecisionOutcome",
     "DeterministicConfidenceEvaluator",
     "DeterministicRuleEvaluator",
@@ -112,6 +118,7 @@ __all__ = [
     "GovernanceTarget",
     "governance_fingerprint",
     "GovernedOperationError",
+    "GovernedDecisionApplier",
     "GovernedOperationExecutor",
     "GovernedOperationTarget",
     "GraphMutationGovernanceAdapter",
@@ -134,6 +141,7 @@ __all__ = [
     "RuleEvaluation",
     "RuleEvaluator",
     "RuntimeGovernanceEvaluator",
+    "RuntimeDecisionGovernanceAdapter",
     "SUBJECT_FINGERPRINT_ATTRIBUTE",
     "StrictAuthorizationVerifier",
     "ToolGovernanceAdapter",

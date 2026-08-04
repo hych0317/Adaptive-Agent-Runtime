@@ -39,6 +39,9 @@ from adaptive_agent_runtime.orchestration.recovery import (
     RecoveryPlanApplier,
     RecoveryRecord,
 )
+from adaptive_agent_runtime.orchestration.recovery_decision import (
+    RecoveryDecisionHandler,
+)
 from adaptive_agent_runtime.orchestration.selection import (
     FirstReadyTaskNodeSelector,
 )
@@ -59,12 +62,19 @@ class DynamicTaskGraphPlanner:
         mutation_applier: GraphMutationApplier | None = None,
         recovery_planner: FailureDrivenReplanner | None = None,
         recovery_applier: RecoveryPlanApplier | None = None,
+        recovery_decision_handler: RecoveryDecisionHandler | None = None,
     ) -> None:
         if any(
             node.status is not TaskNodeStatus.PENDING
             for node in initial_graph.nodes
         ):
             raise ValueError("an initial task graph must contain only pending nodes")
+        if recovery_decision_handler is not None and (
+            recovery_planner is not None or recovery_applier is not None
+        ):
+            raise ValueError(
+                "RecoveryDecisionHandler cannot be combined with legacy recovery ports"
+            )
         self._initial_graph = initial_graph
         self._scheduler = scheduler or GraphScheduler()
         self._ready_node_selector = (
@@ -74,6 +84,7 @@ class DynamicTaskGraphPlanner:
         self._mutation_applier = mutation_applier
         self._recovery_planner = recovery_planner
         self._recovery_applier = recovery_applier
+        self._recovery_decision_handler = recovery_decision_handler
         self._graphs: dict[UUID, DynamicTaskGraph] = {}
         self._in_flight: defaultdict[UUID, dict[UUID, UUID]] = defaultdict(dict)
         self._processed_actions: defaultdict[UUID, set[UUID]] = defaultdict(set)
@@ -88,7 +99,10 @@ class DynamicTaskGraphPlanner:
         graph, failed_node_id = await self._consume_observation(state, graph)
         if failed_node_id is None:
             failed_node_id = self._unhandled_failure_node(state, graph)
-        if failed_node_id is not None and self._recovery_planner is not None:
+        if failed_node_id is not None and (
+            self._recovery_planner is not None
+            or self._recovery_decision_handler is not None
+        ):
             self._graphs[state.run_id] = graph
             await self._save_checkpoint(state, graph)
             graph = await self._recover_failure(state, graph, failed_node_id)
@@ -317,7 +331,8 @@ class DynamicTaskGraphPlanner:
         node_id: UUID,
     ) -> DynamicTaskGraph:
         planner = self._recovery_planner
-        if planner is None:
+        handler = self._recovery_decision_handler
+        if planner is None and handler is None:
             return graph
         failed_node = graph.get_node(node_id)
         observation = failed_node.observation
@@ -332,7 +347,14 @@ class DynamicTaskGraphPlanner:
             observation=observation,
             prior_attempts=self._recovery_attempts[state.run_id].get(node_id, 0),
         )
-        recovery_plan = await planner.replan(context)
+        recovered = graph
+        if handler is not None:
+            outcome = await handler.handle(context)
+            recovery_plan = outcome.effect.plan
+            recovered = outcome.graph
+        else:
+            assert planner is not None
+            recovery_plan = await planner.replan(context)
         if recovery_plan.analysis.node_id != node_id:
             raise OrchestrationStateError(
                 "Recovery Planner analyzed a different task node"
@@ -342,8 +364,7 @@ class DynamicTaskGraphPlanner:
                 "Recovery Planner analyzed a different action"
             )
         before_version = graph.version
-        recovered = graph
-        if not recovery_plan.aborts:
+        if handler is None and not recovery_plan.aborts:
             if self._recovery_applier is None:
                 raise OrchestrationStateError(
                     "adaptive recovery requires a RecoveryPlanApplier"
@@ -372,6 +393,7 @@ class DynamicTaskGraphPlanner:
             )
         )
         self._graphs[state.run_id] = recovered
+        await self._save_checkpoint(state, recovered)
         return recovered
 
     @staticmethod

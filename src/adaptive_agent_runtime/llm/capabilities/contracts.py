@@ -22,6 +22,10 @@ from adaptive_agent_runtime.llm.capabilities.models import (
     MemoryExtractionRequest,
     ReasoningContext,
     ReasoningResult,
+    RecoveryDraft,
+    RecoveryProposalRequest,
+    RootCauseAnalysisRequest,
+    RootCauseDraft,
     TaskGraphDraft,
     TaskPlanningRequest,
 )
@@ -53,6 +57,26 @@ class TaskGraphProposalCapability(CognitiveCapability, Protocol):
         *,
         invocation: CapabilityInvocationMetadata | None = None,
     ) -> CapabilityTurnResult[TaskGraphDraft]: ...
+
+
+@runtime_checkable
+class RecoveryProposalCapability(CognitiveCapability, Protocol):
+    async def propose_recovery(
+        self,
+        request: RecoveryProposalRequest,
+        *,
+        invocation: CapabilityInvocationMetadata | None = None,
+    ) -> CapabilityTurnResult[RecoveryDraft]: ...
+
+
+@runtime_checkable
+class RootCauseAnalysisCapability(CognitiveCapability, Protocol):
+    async def analyze_root_cause(
+        self,
+        request: RootCauseAnalysisRequest,
+        *,
+        invocation: CapabilityInvocationMetadata | None = None,
+    ) -> CapabilityTurnResult[RootCauseDraft]: ...
 
 
 @runtime_checkable

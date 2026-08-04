@@ -5,6 +5,10 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from adaptive_agent_runtime import StateStore, TraceSink
+from adaptive_agent_runtime.decisioning import (
+    DecisionCheckpoint,
+    DecisionCheckpointStore,
+)
 from adaptive_agent_runtime.context_memory import (
     ContextArchive,
     ContextStore,
@@ -29,7 +33,13 @@ class PersistenceBoundaryTests(unittest.TestCase):
     def test_runtime_modules_do_not_depend_on_persistence_implementations(
         self,
     ) -> None:
-        for package in ("core", "orchestration", "context_memory", "evolution"):
+        for package in (
+            "core",
+            "orchestration",
+            "context_memory",
+            "decisioning",
+            "evolution",
+        ):
             for path in (SOURCE_ROOT / package).glob("*.py"):
                 source = path.read_text(encoding="utf-8")
                 self.assertNotIn(
@@ -62,6 +72,12 @@ class PersistenceBoundaryTests(unittest.TestCase):
             self.assertIsInstance(
                 persistence.replay_case_store,
                 ReplayCaseStore,
+            )
+            self.assertIsInstance(
+                persistence.create_decision_checkpoint_store(
+                    DecisionCheckpoint
+                ),
+                DecisionCheckpointStore,
             )
             persistence.close()
 

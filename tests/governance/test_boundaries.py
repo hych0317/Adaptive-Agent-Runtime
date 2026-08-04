@@ -20,6 +20,7 @@ EXECUTION_PACKAGES = (
     "context_memory",
     "tool_ecosystem",
     "evaluation",
+    "decisioning",
 )
 
 
@@ -57,7 +58,7 @@ class GovernanceBoundaryTests(unittest.TestCase):
         )
         violations: list[str] = []
         for path in governance_root.glob("*.py"):
-            if path.name in {"integration.py", "__init__.py"}:
+            if path.name in {"integration.py", "decisioning.py", "__init__.py"}:
                 continue
             allowed = allowed_upstream.get(path.name, set())
             for module in imports(path):

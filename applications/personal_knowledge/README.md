@@ -11,7 +11,18 @@ pip install -e .
 python -m applications.personal_knowledge.web --database data/knowledge.sqlite3
 ```
 
-浏览器访问 `http://127.0.0.1:8765`。服务默认只监听回环地址。
+浏览器访问 `http://127.0.0.1:8775`。服务默认只监听回环地址；该端口与 Research Application 的 `8765` 分离。
+
+左侧“模型设置”读取同一工作区的 `config/llm.toml` target 目录。可在界面中选择 Provider target、读取完整模型下拉列表、保存模型覆盖/API Key。“测试并激活”会探测当前表单中的 target 与模型，连接成功后直接激活；失败时保留原模型。API Key 只写入被 Git 忽略的 `config/llm.local.toml`，不会由设置接口返回。
+
+也可以启动时直接选择：
+
+```powershell
+python -m applications.personal_knowledge.web `
+  --database data/knowledge.sqlite3 `
+  --llm-config config/llm.toml `
+  --llm-target deepseek-research
+```
 
 数据被刻意分为两个 SQLite 文件：
 
@@ -55,14 +66,22 @@ app = PersonalKnowledgeApplication(
 
 视频 Provider 遵循 Hermes `video-summary` 的 transcript-first 流程：先 probe，再严格使用脚本返回的动态超时运行 ASR；读取 `transcript_path` 与 JSONL 时间戳片段；长内容分块覆盖；绝不根据标题、简介或评论生成摘要。
 
-通过环境变量配置兼容 helper：
+应用会自动查找同级 `Hermes/hermes-data/skills/media/video-summary/scripts/fetch_video_transcript.py`。也可通过启动参数显式指定（优先级最高）：
+
+```powershell
+python -m applications.personal_knowledge.web `
+  --database data/knowledge.sqlite3 `
+  --video-script "C:\path\to\fetch_video_transcript.py"
+```
+
+或通过环境变量覆盖：
 
 ```powershell
 $env:PERSONAL_KNOWLEDGE_VIDEO_SCRIPT="C:\path\to\fetch_video_transcript.py"
 python -m applications.personal_knowledge.web --database data/knowledge.sqlite3
 ```
 
-媒体和音频只存在于每次调用的临时目录，成功、失败或超时后都会清理。数据库只保存视频链接、元数据、全文转录和时间戳片段。如果 helper 未配置，视频 Tool 仍会注册，但调用会返回明确的配置错误。
+解析顺序为 `--video-script`、`PERSONAL_KNOWLEDGE_VIDEO_SCRIPT`、同级 Hermes 仓库。媒体和音频只存在于每次调用的临时目录，成功、失败或超时后都会清理。数据库只保存视频链接、元数据、全文转录和时间戳片段。如果 helper 仍未找到，视频 Tool 会返回明确配置错误，并在服务终端保留完整 traceback。
 
 ## 自动订阅
 

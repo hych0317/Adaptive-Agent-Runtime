@@ -15,6 +15,7 @@ from adaptive_agent_runtime.llm import (
 from adaptive_agent_runtime.orchestration import (
     DynamicTaskGraph,
     GraphMutation,
+    PlanningGraphEffect,
     TaskNode,
 )
 
@@ -85,6 +86,8 @@ class ResearchTaskDefinition:
         """Add news research after the company discovery node completes."""
 
         news = self.node(NEWS_ANALYSIS)
+        if news.node_id in {node.node_id for node in self.initial_graph.nodes}:
+            return ()
         risk = self.node(RISK_REVIEW)
         return (
             GraphMutation.add_node(
@@ -188,6 +191,41 @@ def build_research_task_from_draft(
 ) -> ResearchTaskDefinition:
     """Validate an LLM graph proposal before assigning Runtime identities."""
 
+    validate_research_task_graph_draft(draft)
+    by_role = {node.node_key: node for node in draft.nodes}
+
+    identities = {role: uuid4() for role in RESEARCH_NODE_ROLES}
+    nodes_by_role = {
+        role: TaskNode(
+            node_id=identities[role],
+            goal=node.goal,
+            dependencies=tuple(
+                identities[dependency]
+                for dependency in node.dependency_keys
+                if not (
+                    role == RISK_REVIEW and dependency == NEWS_ANALYSIS
+                )
+            ),
+            expected_output=node.expected_output,
+            strategy_id=node.requested_strategy_id,
+        )
+        for role, node in by_role.items()
+    }
+    initial_roles = tuple(
+        role for role in RESEARCH_NODE_ROLES if role != NEWS_ANALYSIS
+    )
+    return ResearchTaskDefinition(
+        company=company,
+        initial_graph=DynamicTaskGraph(
+            nodes=tuple(nodes_by_role[role] for role in initial_roles)
+        ),
+        nodes=MappingProxyType(nodes_by_role),
+    )
+
+
+def validate_research_task_graph_draft(draft: TaskGraphDraft) -> None:
+    """Apply Research-domain constraints without assigning Runtime identity."""
+
     by_role = {node.node_key: node for node in draft.nodes}
     expected = set(RESEARCH_NODE_ROLES)
     actual = set(by_role)
@@ -217,31 +255,23 @@ def build_research_task_from_draft(
     if by_role[COMPANY_RESEARCH].dependency_keys:
         raise ValueError("company_research must be a root node")
 
-    identities = {role: uuid4() for role in RESEARCH_NODE_ROLES}
+
+def build_research_task_from_effect(
+    company: str,
+    effect: PlanningGraphEffect,
+) -> ResearchTaskDefinition:
+    """Adopt the exact Runtime-owned graph effect after Governance Apply."""
+
+    bindings = {item.node_key: item.node_id for item in effect.node_bindings}
+    if set(bindings) != set(RESEARCH_NODE_ROLES):
+        raise ValueError("planning graph effect does not cover Research roles")
+    graph_nodes = {node.node_id: node for node in effect.graph.nodes}
     nodes_by_role = {
-        role: TaskNode(
-            node_id=identities[role],
-            goal=node.goal,
-            dependencies=tuple(
-                identities[dependency]
-                for dependency in node.dependency_keys
-                if not (
-                    role == RISK_REVIEW and dependency == NEWS_ANALYSIS
-                )
-            ),
-            expected_output=node.expected_output,
-            strategy_id=node.requested_strategy_id,
-        )
-        for role, node in by_role.items()
+        role: graph_nodes[node_id] for role, node_id in bindings.items()
     }
-    initial_roles = tuple(
-        role for role in RESEARCH_NODE_ROLES if role != NEWS_ANALYSIS
-    )
     return ResearchTaskDefinition(
         company=company,
-        initial_graph=DynamicTaskGraph(
-            nodes=tuple(nodes_by_role[role] for role in initial_roles)
-        ),
+        initial_graph=effect.graph,
         nodes=MappingProxyType(nodes_by_role),
     )
 

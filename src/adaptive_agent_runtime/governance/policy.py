@@ -95,5 +95,17 @@ def default_governance_policy() -> GovernancePolicy:
                 risk_levels=(RiskLevel.LOW,),
                 priority=100,
             ),
+            GovernanceRule(
+                rule_id="allow.low_risk.root_cause_record",
+                description=(
+                    "Allow append-only advisory Root Cause assessments that do "
+                    "not alter execution or deterministic Evaluation results."
+                ),
+                effect=RuleEffect.ALLOW,
+                scopes=(GovernanceScope.STATE,),
+                operations=("evaluation.root_cause.record",),
+                risk_levels=(RiskLevel.LOW,),
+                priority=100,
+            ),
         ),
     )

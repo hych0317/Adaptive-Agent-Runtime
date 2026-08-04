@@ -58,9 +58,11 @@ from adaptive_agent_runtime.evaluation import (
     EvaluationReport,
     EvaluationResult,
     GraphSnapshotAdapter,
+    InMemoryRootCauseAssessmentStore,
     OrchestrationComponentEvaluator,
     RuntimeNativeTraceCollector,
     RecoveryTraceAdapter,
+    RootCauseExecutionPolicy,
     ToolComponentEvaluator,
 )
 from adaptive_agent_runtime.governance import (
@@ -96,7 +98,10 @@ from adaptive_agent_runtime.orchestration import (
     DeterministicFailureDrivenReplanner,
     DynamicTaskGraphPlanner,
     IsolatedAgentExecutor,
+    PlanningExecutionPolicy,
+    RecoveryExecutionPolicy,
     StrategyActionExecutor,
+    TaskGraphStore,
 )
 from adaptive_agent_runtime.llm import (
     AutonomousAgentBackend,
@@ -109,7 +114,6 @@ from adaptive_agent_runtime.llm import (
     MemoryCandidateDraft,
     MemoryExtractionRequest,
     TaskGraphDraft,
-    TaskPlanningRequest,
 )
 from adaptive_agent_runtime.tool_ecosystem import ToolExecutionStrategy
 
@@ -131,6 +135,12 @@ from applications.research_agent.progress import (
     ResearchProgressKind,
     ResearchProgressSink,
     publish_progress,
+)
+from applications.research_agent.planning import run_adaptive_planning
+from applications.research_agent.recovery import ResearchRecoveryDecisionHandler
+from applications.research_agent.root_cause import (
+    ResearchRootCauseDecisionHandler,
+    ResearchRootCauseRecoveryBridge,
 )
 from applications.research_agent.prompts import CHINESE_OUTPUT_INSTRUCTION
 from applications.research_agent.strategies import (
@@ -155,10 +165,9 @@ from applications.research_agent.tasks import (
     REPORT_GENERATION,
     REPORT_STRATEGY_ID,
     RESEARCH_STRATEGY_ID,
-    ResearchTaskDefinition,
     REVIEW_STRATEGY_ID,
+    ResearchTaskDefinition,
     build_research_task,
-    build_research_task_from_draft,
 )
 
 
@@ -192,6 +201,7 @@ class ResearchAgent:
         *,
         autonomous_risk_backend: AutonomousAgentBackend | None = None,
         cognitive_capabilities: ResearchCognitiveCapabilities | None = None,
+        planning_execution_policy: PlanningExecutionPolicy | None = None,
         information_mode: ResearchInformationMode = (
             ResearchInformationMode.FIXTURE_DEMO
         ),
@@ -207,6 +217,17 @@ class ResearchAgent:
                 "LLM Research mode requires the generation capability"
             )
         self._information_mode = information_mode
+        planner_capability = self._cognitive_capabilities.task_planner
+        self._planning_execution_policy = (
+            planning_execution_policy
+            or PlanningExecutionPolicy(
+                model=(
+                    f"{planner_capability.capability_id}:configured"
+                    if planner_capability is not None
+                    else "runtime.static"
+                )
+            )
+        )
         self._tools = build_research_tool_stack(
             llm_information_generator=(
                 self._cognitive_capabilities.report_generator
@@ -281,12 +302,44 @@ class ResearchAgent:
             description=task,
             input={"company": company, "application": "research_agent"},
         )
-        definition, llm_task_graph_draft, planning_record = (
+        runtime_trace_sink = InMemoryTraceSink()
+        runtime_trace_writer: TraceSink = runtime_trace_sink
+        if progress_sink is not None:
+            runtime_trace_writer = ObservableTraceSink(
+                runtime_trace_sink,
+                progress_sink,
+            )
+        root_cause_store = InMemoryRootCauseAssessmentStore()
+        root_cause_handler = (
+            ResearchRootCauseDecisionHandler(
+                capability=self._cognitive_capabilities.root_cause_analyzer,
+                execution_policy=RootCauseExecutionPolicy(),
+                governance=self._governance,
+                reviews=self._reviews,
+                issuer=self._issuer,
+                operation_executor=self._operation_executor,
+                trace_sink=runtime_trace_writer,
+                assessment_store=root_cause_store,
+            )
+            if self._cognitive_capabilities.root_cause_analyzer is not None
+            else None
+        )
+        root_cause_recovery_bridge = (
+            ResearchRootCauseRecoveryBridge(
+                handler=root_cause_handler,
+                assessment_store=root_cause_store,
+                trace_reader=runtime_trace_sink.entries_for,
+            )
+            if root_cause_handler is not None
+            else None
+        )
+        definition, llm_task_graph_draft, planning_record, graph_store = (
             await self._build_task_definition(
                 company=company,
                 task=task,
                 run_id=run_id,
                 agent_task=agent_task,
+                trace_sink=runtime_trace_writer,
             )
         )
         await publish_progress(
@@ -333,13 +386,6 @@ class ResearchAgent:
         if planning_record is not None:
             workspace.governance_records.append(planning_record)
         context_trace = ContextMemoryTraceAdapter()
-        runtime_trace_sink = InMemoryTraceSink()
-        runtime_trace_writer: TraceSink = runtime_trace_sink
-        if progress_sink is not None:
-            runtime_trace_writer = ObservableTraceSink(
-                runtime_trace_sink,
-                progress_sink,
-            )
         goal_context = ContextUnit(
             content={"research_goal": task, "company": company},
             metadata=ContextMetadata(
@@ -474,6 +520,7 @@ class ResearchAgent:
             )
             planner = DynamicTaskGraphPlanner(
                 definition.initial_graph,
+                graph_store=graph_store,
                 ready_node_selector=ready_node_selector,
                 mutation_applier=ResearchGraphMutationApplier(
                     authorize=lambda request: self._authorize_with_demo_review(
@@ -483,16 +530,48 @@ class ResearchAgent:
                     operation_executor=self._operation_executor,
                     workspace=workspace,
                 ),
-                recovery_planner=DeterministicFailureDrivenReplanner(
-                    max_attempts_per_node=2,
+                recovery_planner=(
+                    None
+                    if self._cognitive_capabilities.recovery_planner is not None
+                    else DeterministicFailureDrivenReplanner(
+                        max_attempts_per_node=2,
+                    )
                 ),
-                recovery_applier=ResearchRecoveryPlanApplier(
-                    authorize=lambda request: self._authorize_with_demo_review(
-                        request,
-                        scenario="failure_recovery",
-                    ),
-                    operation_executor=self._operation_executor,
-                    workspace=workspace,
+                recovery_applier=(
+                    None
+                    if self._cognitive_capabilities.recovery_planner is not None
+                    else ResearchRecoveryPlanApplier(
+                        authorize=lambda request: self._authorize_with_demo_review(
+                            request,
+                            scenario="failure_recovery",
+                        ),
+                        operation_executor=self._operation_executor,
+                        workspace=workspace,
+                    )
+                ),
+                recovery_decision_handler=(
+                    ResearchRecoveryDecisionHandler(
+                        capability=self._cognitive_capabilities.recovery_planner,
+                        execution_policy=RecoveryExecutionPolicy(
+                            max_recovery_attempts=2,
+                        ),
+                        governance=self._governance,
+                        reviews=self._reviews,
+                        issuer=self._issuer,
+                        operation_executor=self._operation_executor,
+                        trace_sink=runtime_trace_writer,
+                        workspace=workspace,
+                        available_strategy_ids=(
+                            RESEARCH_STRATEGY_ID,
+                            REVIEW_STRATEGY_ID,
+                            REPORT_STRATEGY_ID,
+                        ),
+                        diagnostic_evidence_provider=(
+                            root_cause_recovery_bridge
+                        ),
+                    )
+                    if self._cognitive_capabilities.recovery_planner is not None
+                    else None
                 ),
             )
             runtime = AgentRuntime(
@@ -564,6 +643,11 @@ class ResearchAgent:
             subject,
             EvaluationCriteria(required_output_keys=("graph_id", "nodes")),
         )
+        if root_cause_handler is not None:
+            await root_cause_handler.analyze_post_run(
+                evaluation,
+                subject.trace,
+            )
         self._evaluation_history.extend(evaluation.results)
         llm_judgement = await self._judge_evaluation(
             evaluation,
@@ -609,6 +693,8 @@ class ResearchAgent:
             if use is not None:
                 authorization_uses_list.append(use)
         authorization_uses = tuple(authorization_uses_list)
+        root_cause_assessments = await root_cause_store.list_for_run(run_id)
+        runtime_entries = runtime_trace_sink.entries_for(run_id)
         return ResearchRunResult(
             runtime_result=runtime_result,
             task_graph=final_graph,
@@ -635,6 +721,7 @@ class ResearchAgent:
             llm_memory_candidates=tuple(workspace.memory_candidate_drafts),
             llm_context_packages=tuple(workspace.llm_context_packages),
             llm_tool_intents=tuple(workspace.llm_tool_intents),
+            root_cause_assessments=root_cause_assessments,
             evaluation_history_runs=history_runs,
         )
 
@@ -868,122 +955,35 @@ class ResearchAgent:
         task: str,
         run_id: UUID,
         agent_task: AgentTask,
+        trace_sink: TraceSink,
     ) -> tuple[
         ResearchTaskDefinition,
         TaskGraphDraft | None,
         GovernanceRecord | None,
+        TaskGraphStore | None,
     ]:
         planner = self._cognitive_capabilities.task_planner
         if planner is None:
-            return build_research_task(company), None, None
-        planner_action_id = uuid4()
-        turn = await planner.propose(
-            TaskPlanningRequest(
-                task=task,
-                constraints=(
-                    CHINESE_OUTPUT_INSTRUCTION,
-                    "Use exactly the eight documented research node keys.",
-                    "Keep news_analysis in the final plan; Runtime adds it dynamically.",
-                    "Use only Runtime-supplied strategy identifiers.",
-                ),
-                available_strategies=(
-                    RESEARCH_STRATEGY_ID,
-                    REVIEW_STRATEGY_ID,
-                    REPORT_STRATEGY_ID,
-                ),
-                available_execution_capability_ids=(
-                    INFORMATION_RETRIEVAL,
-                    DOCUMENT_ANALYSIS,
-                    CALCULATION,
-                ),
-            ),
-            invocation=CapabilityInvocationMetadata(
-                correlation=InferenceCorrelation(
-                    run_id=run_id,
-                    task_id=agent_task.task_id,
-                    action_id=planner_action_id,
-                ),
-                trace_attributes={"operation": "graph.initialize.propose"},
-            ),
+            return build_research_task(company), None, None, None
+        planning = await run_adaptive_planning(
+            company=company,
+            task=task,
+            run_id=run_id,
+            agent_task=agent_task,
+            planner=planner,
+            execution_policy=self._planning_execution_policy,
+            governance=self._governance,
+            reviews=self._reviews,
+            issuer=self._issuer,
+            operation_executor=self._operation_executor,
+            trace_sink=trace_sink,
         )
-        if turn.kind is CapabilityTurnKind.TOOL_INTENT:
-            raise RuntimeError("Task Planner returned ToolIntent to Runtime")
-        if turn.result is None:
-            raise RuntimeError("Task Planner returned no graph draft")
-        definition = build_research_task_from_draft(company, turn.result)
-        governance_request = GovernanceRequest(
-            scope=GovernanceScope.STATE,
-            operation="graph.initialize",
-            target=GovernanceTarget(
-                target_type="task_graph_draft",
-                target_id=str(agent_task.task_id),
-            ),
-            risk=RiskLevel.MEDIUM,
-            signals=ConfidenceSignals(
-                stated_confidence=0.9,
-                evidence=(
-                    GovernanceEvidence(
-                        evidence_id=f"task:{agent_task.task_id}",
-                        kind="user.task",
-                        source="conversation",
-                        reliability=1.0,
-                        summary="The graph proposal originates from the user task.",
-                    ),
-                    GovernanceEvidence(
-                        evidence_id=f"graph-validation:{agent_task.task_id}",
-                        kind="graph.validation",
-                        source="research_agent",
-                        reliability=1.0,
-                        summary=(
-                            "The proposal passed role, strategy, dependency, and DAG validation."
-                        ),
-                    ),
-                ),
-                impact=ImpactAssessment(
-                    score=0.4,
-                    reversible=True,
-                    description=(
-                        "The draft initializes only this run's task graph."
-                    ),
-                ),
-                history=GovernanceHistory(successful_similar=5),
-            ),
-            correlation=GovernanceCorrelation(
-                run_id=run_id,
-                task_id=agent_task.task_id,
-                action_id=planner_action_id,
-            ),
-            attributes={
-                SUBJECT_FINGERPRINT_ATTRIBUTE: governance_fingerprint(
-                    turn.result
-                ),
-                "node_keys": [node.node_key for node in turn.result.nodes],
-                "planner_capability_id": planner.capability_id,
-            },
+        return (
+            planning.definition,
+            planning.draft,
+            planning.governance_record,
+            planning.graph_store,
         )
-        governance_record = self._authorize_with_demo_review(
-            governance_request,
-            scenario="planning",
-        )
-        if governance_record.authorization is None:
-            raise RuntimeError("Governance denied LLM task graph proposal")
-
-        async def adopt_definition() -> ResearchTaskDefinition:
-            return definition
-
-        accepted_definition = await self._operation_executor.execute(
-            request=governance_request,
-            decision=governance_record.final,
-            authorization=governance_record.authorization,
-            target=BoundGovernedOperation(
-                module_id="research_agent.graph_initialization",
-                operation=governance_request.operation,
-                target=governance_request.target,
-                subject=turn.result,
-                apply=adopt_definition,
-            ),
-        )
-        return accepted_definition, turn.result, governance_record
 
     async def _judge_evaluation(
         self,

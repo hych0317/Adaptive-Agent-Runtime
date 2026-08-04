@@ -14,6 +14,7 @@ from applications.personal_knowledge.cognition import (
     KnowledgeSynthesisDraft,
     KnowledgeSynthesizer,
     RuntimeKnowledgeSynthesizer,
+    SwitchableKnowledgeSynthesizer,
 )
 from applications.personal_knowledge.errors import (
     KnowledgeConflictError,
@@ -48,6 +49,10 @@ from applications.personal_knowledge.models import (
     TranscriptSegment,
     SubscriptionKind,
 )
+from applications.personal_knowledge.llm_runtime import (
+    PersonalKnowledgeLLMDeployment,
+    PersonalKnowledgeLLMManager,
+)
 from applications.personal_knowledge.persistence import (
     KnowledgeSQLiteDatabase,
     SQLitePersonalKnowledgeStore,
@@ -65,6 +70,7 @@ from applications.personal_knowledge.retrieval import (
     KnowledgeQuestionAnswerer,
     KnowledgeRetrievalService,
     RuntimeKnowledgeQuestionAnswerer,
+    SwitchableKnowledgeQuestionAnswerer,
 )
 from applications.personal_knowledge.service import (
     EditableKnowledgeConfirmation,
@@ -121,6 +127,8 @@ __all__ = [
     "KnowledgeSQLiteDatabase",
     "KnowledgeStatus",
     "PersonalKnowledgeError",
+    "PersonalKnowledgeLLMDeployment",
+    "PersonalKnowledgeLLMManager",
     "PersonalKnowledgeService",
     "PersonalKnowledgeStore",
     "PreferenceMemoryService",
@@ -134,7 +142,9 @@ __all__ = [
     "SearchScope",
     "ReviewSessionResult",
     "RuntimeKnowledgeSynthesizer",
+    "SwitchableKnowledgeSynthesizer",
     "RuntimeKnowledgeQuestionAnswerer",
+    "SwitchableKnowledgeQuestionAnswerer",
     "SQLitePersonalKnowledgeStore",
     "SourceKind",
     "SourceRecord",

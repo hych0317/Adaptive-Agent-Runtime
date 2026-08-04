@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from threading import Lock
 from typing import Protocol, cast
 
 from pydantic import Field
@@ -38,6 +39,33 @@ class KnowledgeSynthesizer(Protocol):
         source_title: str | None,
         conversation: Sequence[ReviewMessage],
     ) -> KnowledgeSynthesisDraft: ...
+
+
+class SwitchableKnowledgeSynthesizer:
+    """Thread-safe application seam for changing the active Runtime model."""
+
+    def __init__(self, delegate: KnowledgeSynthesizer) -> None:
+        self._delegate = delegate
+        self._lock = Lock()
+
+    def use(self, delegate: KnowledgeSynthesizer) -> None:
+        with self._lock:
+            self._delegate = delegate
+
+    async def synthesize(
+        self,
+        *,
+        source_text: str,
+        source_title: str | None,
+        conversation: Sequence[ReviewMessage],
+    ) -> KnowledgeSynthesisDraft:
+        with self._lock:
+            delegate = self._delegate
+        return await delegate.synthesize(
+            source_text=source_text,
+            source_title=source_title,
+            conversation=conversation,
+        )
 
 
 class DeterministicKnowledgeSynthesizer:

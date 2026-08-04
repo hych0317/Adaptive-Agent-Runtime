@@ -47,6 +47,7 @@ class ResearchLLMCapability(StrEnum):
     PLANNING = "planning"
     GENERATION = "generation"
     JUDGE = "judge"
+    ROOT_CAUSE = "root_cause"
     COMPRESSION = "compression"
     EXTRACTION = "extraction"
 
@@ -57,9 +58,11 @@ _MANAGED_CAPABILITY_IDS = {
         "task_graph_proposal",
         "action_proposal",
         "graph_mutation_proposal",
+        "recovery_proposal",
     ),
     ResearchLLMCapability.GENERATION: ("artifact_generation",),
     ResearchLLMCapability.JUDGE: ("evidence_judge",),
+    ResearchLLMCapability.ROOT_CAUSE: ("root_cause_analysis",),
     ResearchLLMCapability.COMPRESSION: ("semantic_compression",),
     ResearchLLMCapability.EXTRACTION: ("memory_extraction",),
 }
@@ -242,6 +245,8 @@ def build_research_llm_deployment(
             "graph_mutation_proposal",
             "artifact_generation",
             "evidence_judge",
+            "root_cause_analysis",
+            "recovery_proposal",
             "semantic_compression",
             "memory_extraction",
         )
@@ -348,6 +353,16 @@ def build_research_llm_deployment(
         mutation_planner=(
             managed.mutation_planner
             if ResearchLLMCapability.PLANNING in enabled
+            else None
+        ),
+        recovery_planner=(
+            managed.recovery_planner
+            if ResearchLLMCapability.PLANNING in enabled
+            else None
+        ),
+        root_cause_analyzer=(
+            managed.root_cause_analyzer
+            if ResearchLLMCapability.ROOT_CAUSE in enabled
             else None
         ),
         reasoner=(

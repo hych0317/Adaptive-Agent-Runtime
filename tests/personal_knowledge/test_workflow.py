@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import unittest
 from datetime import timedelta
+import os
 from pathlib import Path
 import sys
 import tempfile
+from unittest.mock import patch
 from uuid import uuid4
 
 from adaptive_agent_runtime.context_memory import InMemoryMemoryStore
@@ -41,6 +43,10 @@ from applications.personal_knowledge import (
 )
 from applications.personal_knowledge.models import utc_now
 from applications.personal_knowledge.source_tools import VIDEO_EXTRACT_TRANSCRIPT
+from applications.personal_knowledge import source_tools as source_tools_module
+from applications.personal_knowledge.source_tools import (
+    resolve_video_transcript_script,
+)
 from applications.personal_knowledge.errors import KnowledgeConflictError
 
 
@@ -382,6 +388,37 @@ else:
             Path(tempfile.gettempdir()).glob("personal-knowledge-video-*")
         )
         self.assertEqual(after, before)
+
+    async def test_video_helper_is_discovered_in_sibling_hermes_repository(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            module_path = (
+                root
+                / "Adaptive_Agent_Runtime"
+                / "applications"
+                / "personal_knowledge"
+                / "source_tools.py"
+            )
+            helper = (
+                root
+                / "Hermes"
+                / "hermes-data"
+                / "skills"
+                / "media"
+                / "video-summary"
+                / "scripts"
+                / "fetch_video_transcript.py"
+            )
+            helper.parent.mkdir(parents=True)
+            helper.write_text("# test helper\n", encoding="utf-8")
+            with (
+                patch.object(source_tools_module, "__file__", str(module_path)),
+                patch.dict(os.environ, {"PERSONAL_KNOWLEDGE_VIDEO_SCRIPT": ""}),
+            ):
+                resolved = resolve_video_transcript_script()
+            self.assertEqual(resolved, helper.resolve())
 
 
 if __name__ == "__main__":

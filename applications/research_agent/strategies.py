@@ -183,6 +183,17 @@ class ResearchWorkspace:
     def role_for(self, node: TaskNode) -> str:
         return self._roles_by_node[node.node_id]
 
+    def register_recovery_node(
+        self,
+        recovery_node: TaskNode,
+        failed_node: TaskNode,
+    ) -> None:
+        """Give a Runtime-created recovery node the failed node's domain role."""
+
+        if recovery_node.node_id in self._roles_by_node:
+            raise ValueError("recovery node is already registered")
+        self._roles_by_node[recovery_node.node_id] = self.role_for(failed_node)
+
     def set_output(self, node: TaskNode, output: JsonValue) -> None:
         self.outputs[node.node_id] = output
 

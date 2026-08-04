@@ -960,6 +960,7 @@ api_key = "fixture-secret"
                 "task_graph_proposal",
                 "action_proposal",
                 "graph_mutation_proposal",
+                "recovery_proposal",
             ),
         )
         parser = build_parser()
@@ -987,6 +988,7 @@ api_key = "fixture-secret"
                 "task_graph_proposal",
                 "action_proposal",
                 "graph_mutation_proposal",
+                "recovery_proposal",
             ),
         )
         deployment = build_research_llm_deployment(
@@ -997,7 +999,14 @@ api_key = "fixture-secret"
         self.assertIsNotNone(cognition.task_planner)
         self.assertIsNotNone(cognition.action_planner)
         self.assertIsNotNone(cognition.mutation_planner)
+        self.assertIsNotNone(cognition.recovery_planner)
         self.assertIsNotNone(cognition.mutation_context)
+
+    def test_root_cause_is_a_distinct_negotiated_capability(self) -> None:
+        self.assertEqual(
+            managed_capability_ids((ResearchLLMCapability.ROOT_CAUSE,)),
+            ("root_cause_analysis",),
+        )
 
 
 if __name__ == "__main__":

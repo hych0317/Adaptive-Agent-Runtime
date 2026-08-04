@@ -29,6 +29,8 @@ from adaptive_agent_runtime.llm import (
     GatewayMemoryExtractionCapability,
     GatewayGraphMutationProposalCapability,
     GatewayReasoningCapability,
+    GatewayRecoveryProposalCapability,
+    GatewayRootCauseAnalysisCapability,
     GatewaySemanticCompressionCapability,
     GatewayTaskGraphProposalCapability,
     GenerationRequest,
@@ -51,6 +53,12 @@ from adaptive_agent_runtime.llm import (
     ProviderNeutralResponseValidator,
     ReasoningCapability,
     ReasoningContext,
+    RecoveryActionDraftKind,
+    RecoveryNodeCandidate,
+    RecoveryProposalCapability,
+    RecoveryProposalRequest,
+    RootCauseAnalysisCapability,
+    RootCauseAnalysisRequest,
     ResponseSchemaValidationError,
     SemanticCompressionCapability,
     StructuredOutputLevel,
@@ -148,6 +156,103 @@ def gateway_with(
 
 
 class ManagedCapabilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_root_cause_analysis_completes_through_managed_gateway(
+        self,
+    ) -> None:
+        backend = CapabilityResponseBackend(
+            {
+                "root_cause_analysis": {
+                    "conclusion": "supported",
+                    "primary": {
+                        "code": "source.input_invalid",
+                        "description": "The source returned invalid input.",
+                        "supporting_evidence_reference_ids": ["failure:1"],
+                        "counter_evidence_reference_ids": [],
+                    },
+                    "alternatives": [],
+                    "assumptions": [],
+                    "unresolved_questions": [],
+                    "rationale": "The direct failure evidence is explicit.",
+                    "confidence": 0.8,
+                }
+            }
+        )
+        capability = GatewayRootCauseAnalysisCapability(
+            gateway=gateway_with(backend),
+            draft_validator=CapabilityDraftValidator(),
+        )
+
+        turn = await capability.analyze_root_cause(
+            RootCauseAnalysisRequest(
+                trigger="inline_failure",
+                failure_summary="source input is invalid",
+                trace_completeness="partial",
+                evidence_catalog=(evidence("failure:1"),),
+                constraints=("Cite only supplied evidence.",),
+            )
+        )
+
+        self.assertEqual(turn.kind, CapabilityTurnKind.COMPLETED)
+        self.assertIsInstance(capability, RootCauseAnalysisCapability)
+        self.assertEqual(
+            turn.result.primary.code
+            if turn.result is not None and turn.result.primary is not None
+            else None,
+            "source.input_invalid",
+        )
+
+    async def test_recovery_proposal_completes_through_managed_gateway(self) -> None:
+        backend = CapabilityResponseBackend(
+            {
+                "recovery_proposal": {
+                    "failure_kind": "transient",
+                    "hypothesis": "The upstream failure is transient.",
+                    "alternatives": ["Abort"],
+                    "selected_action": {
+                        "kind": "retry_node",
+                        "target_node_ref": "node:failed",
+                        "reason": "Retry once.",
+                    },
+                    "rationale": "A retry has the smallest impact.",
+                    "evidence_reference_ids": ["failure:1"],
+                    "confidence": 0.8,
+                }
+            }
+        )
+        capability = GatewayRecoveryProposalCapability(
+            gateway=gateway_with(backend),
+            draft_validator=CapabilityDraftValidator(),
+        )
+
+        turn = await capability.propose_recovery(
+            RecoveryProposalRequest(
+                task="Recover the run",
+                failed_node_ref="node:failed",
+                failed_goal="Collect evidence",
+                error="temporary timeout",
+                graph_nodes=(
+                    RecoveryNodeCandidate(
+                        node_ref="node:failed",
+                        goal="Collect evidence",
+                        status="failed",
+                        strategy_id="research",
+                    ),
+                ),
+                available_strategies=("research",),
+                allowed_recovery_actions=(RecoveryActionDraftKind.RETRY_NODE,),
+                prior_attempts=0,
+                max_attempts=1,
+                evidence=(evidence("failure:1"),),
+            )
+        )
+
+        self.assertEqual(turn.kind, CapabilityTurnKind.COMPLETED)
+        self.assertIsInstance(capability, RecoveryProposalCapability)
+        self.assertEqual(
+            turn.result.hypothesis if turn.result is not None else None,
+            "The upstream failure is transient.",
+        )
+
     async def test_capability_propagates_required_target_binding(self) -> None:
         backend = CapabilityResponseBackend(
             {
@@ -482,6 +587,8 @@ class ManagedCapabilityTests(unittest.IsolatedAsyncioTestCase):
         properties = cast(Mapping[str, Any], captured_schema["properties"])
         self.assertIsInstance(properties, Mapping)
         assert isinstance(properties, Mapping)
+        media_type = cast(Mapping[str, Any], properties["media_type"])
+        self.assertEqual(media_type["const"], "application/json")
         content = cast(Mapping[str, Any], properties["content"])
         self.assertIsInstance(content, Mapping)
         assert isinstance(content, Mapping)

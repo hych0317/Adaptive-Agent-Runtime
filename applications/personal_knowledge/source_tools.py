@@ -148,7 +148,7 @@ class UnavailableVideoTranscriptExtractor:
     async def extract(self, url: str) -> ExtractedVideoTranscript:
         del url
         raise RuntimeError(
-            "video transcript helper is not configured; set "
+            "video transcript helper is not configured; pass --video-script or set "
             "PERSONAL_KNOWLEDGE_VIDEO_SCRIPT"
         )
 
@@ -584,6 +584,7 @@ def build_source_tool_stack(
     *,
     fetcher: HTTPTextFetcher | None = None,
     video_extractor: VideoTranscriptExtractor | None = None,
+    video_script_path: str | Path | None = None,
 ) -> KnowledgeSourceToolStack:
     catalog = InMemoryCapabilityCatalog()
     catalog.register(
@@ -607,10 +608,10 @@ def build_source_tool_stack(
     web = WebTextProvider(fetcher or HttpxTextFetcher())
     configured_video_extractor = video_extractor
     if configured_video_extractor is None:
-        script = os.environ.get("PERSONAL_KNOWLEDGE_VIDEO_SCRIPT")
+        script = resolve_video_transcript_script(video_script_path)
         configured_video_extractor = (
             SubprocessVideoTranscriptExtractor(script)
-            if script
+            if script is not None
             else UnavailableVideoTranscriptExtractor()
         )
     video = VideoTranscriptProvider(configured_video_extractor)
@@ -681,6 +682,30 @@ def build_source_tool_stack(
         trace_sink=trace_sink,
         executor=LowRiskGovernedToolExecutor(managed),
     )
+
+
+def resolve_video_transcript_script(
+    configured_path: str | Path | None = None,
+) -> Path | None:
+    """Resolve an explicit helper, an environment override, or sibling Hermes."""
+
+    if configured_path is not None:
+        return Path(configured_path).expanduser().resolve()
+    environment_path = os.environ.get("PERSONAL_KNOWLEDGE_VIDEO_SCRIPT")
+    if environment_path:
+        return Path(environment_path).expanduser().resolve()
+    repository_root = Path(__file__).resolve().parents[2]
+    sibling_hermes = (
+        repository_root.parent
+        / "Hermes"
+        / "hermes-data"
+        / "skills"
+        / "media"
+        / "video-summary"
+        / "scripts"
+        / "fetch_video_transcript.py"
+    )
+    return sibling_hermes if sibling_hermes.is_file() else None
 
 
 class SourceToolRunner:

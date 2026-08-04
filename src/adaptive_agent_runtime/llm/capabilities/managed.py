@@ -26,6 +26,10 @@ from adaptive_agent_runtime.llm.capabilities.models import (
     MemoryExtractionRequest,
     ReasoningContext,
     ReasoningResult,
+    RecoveryDraft,
+    RecoveryProposalRequest,
+    RootCauseAnalysisRequest,
+    RootCauseDraft,
     TaskGraphDraft,
     TaskPlanningRequest,
 )
@@ -227,6 +231,50 @@ class GatewayTaskGraphProposalCapability(_GatewayCapability):
         )
 
 
+class GatewayRecoveryProposalCapability(_GatewayCapability):
+    module_id = "llm.capability.recovery_proposal.gateway"
+    capability_id = "recovery_proposal"
+
+    async def propose_recovery(
+        self,
+        request: RecoveryProposalRequest,
+        *,
+        invocation: CapabilityInvocationMetadata | None = None,
+    ) -> CapabilityTurnResult[RecoveryDraft]:
+        return await self._execute_model(
+            request,
+            RecoveryDraft,
+            lambda result: self._draft_validator.validate_recovery_proposal(
+                request,
+                result,
+            ),
+            eligible_tools=(),
+            invocation=invocation,
+        )
+
+
+class GatewayRootCauseAnalysisCapability(_GatewayCapability):
+    module_id = "llm.capability.root_cause_analysis.gateway"
+    capability_id = "root_cause_analysis"
+
+    async def analyze_root_cause(
+        self,
+        request: RootCauseAnalysisRequest,
+        *,
+        invocation: CapabilityInvocationMetadata | None = None,
+    ) -> CapabilityTurnResult[RootCauseDraft]:
+        return await self._execute_model(
+            request,
+            RootCauseDraft,
+            lambda result: self._draft_validator.validate_root_cause(
+                request,
+                result,
+            ),
+            eligible_tools=(),
+            invocation=invocation,
+        )
+
+
 class GatewayActionProposalCapability(_GatewayCapability):
     module_id = "llm.capability.action_proposal.gateway"
     capability_id = "action_proposal"
@@ -405,6 +453,16 @@ def _generation_response_schema(
     schema = _mutable_json(
         GeneratedArtifactDraft.model_json_schema(mode="validation")
     )
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        raise CapabilityExecutionPolicyError(
+            "artifact_generation",
+            "generated artifact schema has no properties",
+        )
+    properties["media_type"] = {
+        "type": "string",
+        "const": request.media_type,
+    }
     content_schema: Any = None
     if request.output_schema is not None:
         content_schema = _mutable_json(request.output_schema)
@@ -449,12 +507,6 @@ def _generation_response_schema(
         schema["$defs"] = parent_definitions
     else:
         schema.pop("$defs", None)
-    properties = schema.get("properties")
-    if not isinstance(properties, dict):
-        raise CapabilityExecutionPolicyError(
-            "artifact_generation",
-            "generated artifact schema has no properties",
-        )
     properties["content"] = content_schema
     return cast(
         ImmutableJsonObject,

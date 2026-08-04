@@ -20,6 +20,8 @@ from adaptive_agent_runtime.llm import (
     LLMContextPackage,
     MemoryExtractionCapability,
     ReasoningCapability,
+    RecoveryProposalCapability,
+    RootCauseAnalysisCapability,
     SemanticCompressionCapability,
     TaskGraphProposalCapability,
 )
@@ -73,6 +75,8 @@ class ResearchCognitiveCapabilities:
     task_planner: TaskGraphProposalCapability | None = None
     action_planner: ActionProposalCapability | None = None
     mutation_planner: GraphMutationProposalCapability | None = None
+    recovery_planner: RecoveryProposalCapability | None = None
+    root_cause_analyzer: RootCauseAnalysisCapability | None = None
     reasoner: ReasoningCapability | None = None
     context_compressor: SemanticCompressionCapability | None = None
     memory_extractor: MemoryExtractionCapability | None = None

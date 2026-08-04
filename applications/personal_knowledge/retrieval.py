@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from threading import Lock
 from typing import Protocol, cast
 from uuid import UUID
 
@@ -69,6 +70,26 @@ class KnowledgeQuestionAnswerer(Protocol):
         question: str,
         hits: Sequence[KnowledgeSearchHit],
     ) -> KnowledgeAnswerDraft: ...
+
+
+class SwitchableKnowledgeQuestionAnswerer:
+    def __init__(self, delegate: KnowledgeQuestionAnswerer) -> None:
+        self._delegate = delegate
+        self._lock = Lock()
+
+    def use(self, delegate: KnowledgeQuestionAnswerer) -> None:
+        with self._lock:
+            self._delegate = delegate
+
+    async def answer(
+        self,
+        *,
+        question: str,
+        hits: Sequence[KnowledgeSearchHit],
+    ) -> KnowledgeAnswerDraft:
+        with self._lock:
+            delegate = self._delegate
+        return await delegate.answer(question=question, hits=hits)
 
 
 class DeterministicKnowledgeQuestionAnswerer:
@@ -215,4 +236,3 @@ class KnowledgeRetrievalService:
             answer=draft.answer,
             citations=citations,
         )
-

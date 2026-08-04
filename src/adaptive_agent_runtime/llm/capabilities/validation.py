@@ -19,6 +19,12 @@ from adaptive_agent_runtime.llm.capabilities.models import (
     MemoryExtractionRequest,
     ReasoningContext,
     ReasoningResult,
+    RecoveryActionDraftKind,
+    RecoveryDraft,
+    RecoveryProposalRequest,
+    RootCauseAnalysisRequest,
+    RootCauseConclusionDraft,
+    RootCauseDraft,
     TaskGraphDraft,
     TaskPlanningRequest,
 )
@@ -83,6 +89,79 @@ class CapabilityDraftValidator:
             )
         )
         self._raise_if_invalid("action_proposal", tuple(violations))
+        return result
+
+    def validate_recovery_proposal(
+        self,
+        request: RecoveryProposalRequest,
+        result: RecoveryDraft,
+    ) -> RecoveryDraft:
+        action = result.selected_action
+        violations: list[str] = []
+        if action.kind not in request.allowed_recovery_actions:
+            violations.append("recovery action is outside the Runtime allowlist")
+        if action.target_node_ref != request.failed_node_ref:
+            violations.append("recovery action targets a different node")
+
+        known_refs = {item.node_ref for item in request.graph_nodes}
+        available_strategies = set(request.available_strategies)
+        if action.kind is RecoveryActionDraftKind.REPLACE_STRATEGY:
+            if action.replacement_strategy_id not in available_strategies:
+                violations.append("replacement strategy is unavailable")
+        if action.kind is RecoveryActionDraftKind.ADD_RECOVERY_NODE:
+            assert action.recovery_node is not None
+            node = action.recovery_node
+            if node.node_key in known_refs:
+                violations.append("recovery node reference already exists")
+            if node.requested_strategy_id not in available_strategies:
+                violations.append("recovery node strategy is unavailable")
+            unknown = sorted(set(node.dependency_keys).difference(known_refs))
+            if unknown:
+                violations.append(
+                    "recovery node references unknown dependencies: "
+                    + ", ".join(unknown)
+                )
+        if action.kind is RecoveryActionDraftKind.REWIRE_DEPENDENCY:
+            references = {
+                action.dependent_node_ref,
+                action.old_dependency_ref,
+                action.new_dependency_ref,
+            }
+            unknown = sorted(str(item) for item in references.difference(known_refs))
+            if unknown:
+                violations.append(
+                    "dependency recovery references unknown nodes: "
+                    + ", ".join(unknown)
+                )
+        violations.extend(
+            _unknown_references(
+                result.evidence_reference_ids,
+                _evidence_ids(request.evidence),
+                "recovery proposal",
+            )
+        )
+        self._raise_if_invalid("recovery_proposal", tuple(violations))
+        return result
+
+    def validate_root_cause(
+        self,
+        request: RootCauseAnalysisRequest,
+        result: RootCauseDraft,
+    ) -> RootCauseDraft:
+        known = _evidence_ids(request.evidence_catalog)
+        violations = list(
+            _unknown_references(
+                result.evidence_reference_ids,
+                known,
+                "Root Cause assessment",
+            )
+        )
+        if (
+            result.conclusion is RootCauseConclusionDraft.SUPPORTED
+            and not result.evidence_reference_ids
+        ):
+            violations.append("supported Root Cause requires cited evidence")
+        self._raise_if_invalid("root_cause_analysis", tuple(violations))
         return result
 
     def validate_graph_mutation_proposal(

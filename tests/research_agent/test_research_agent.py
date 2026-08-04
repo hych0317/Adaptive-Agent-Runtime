@@ -1020,6 +1020,18 @@ class ResearchAgentFlowTests(unittest.IsolatedAsyncioTestCase):
             planning_governance.request.operation,
             "graph.initialize",
         )
+        self.assertEqual(
+            planning_governance.request.target.target_type,
+            "runtime_run_graph",
+        )
+        self.assertIn(
+            "decision_effect_fingerprint",
+            planning_governance.request.attributes,
+        )
+        self.assertNotEqual(
+            planning_governance.request.target.target_type,
+            "task_graph_draft",
+        )
         self.assertEqual(planning_governance.final.outcome, DecisionOutcome.ALLOW)
         self.assertIsNotNone(planning_governance.authorization)
         planning_invocation = planner.invocations[0]
@@ -1032,6 +1044,30 @@ class ResearchAgentFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             planning_invocation.trace_attributes["operation"],
             "graph.initialize.propose",
+        )
+        self.assertEqual(
+            planning_invocation.trace_attributes["planning_max_agent_calls"],
+            1,
+        )
+        self.assertEqual(
+            planning_invocation.trace_attributes["planning_max_retries"],
+            0,
+        )
+        decision_trace_kinds = {
+            entry.event.kind
+            for entry in result.runtime_trace
+            if entry.event.kind.startswith("decision.")
+        }
+        self.assertTrue(
+            {
+                "decision.requested",
+                "decision.context_projected",
+                "decision.proposed",
+                "decision.validation_passed",
+                "decision.governance_requested",
+                "decision.apply_started",
+                "decision.applied",
+            }.issubset(decision_trace_kinds)
         )
         self.assertEqual(len(reasoner.requests), 6)
         self.assertEqual(len(result.llm_reasoning), 6)
@@ -1324,6 +1360,7 @@ class ApplicationBoundaryTests(unittest.TestCase):
         public_roots = {
             "adaptive_agent_runtime",
             "adaptive_agent_runtime.context_memory",
+            "adaptive_agent_runtime.decisioning",
             "adaptive_agent_runtime.evaluation",
             "adaptive_agent_runtime.governance",
             "adaptive_agent_runtime.llm",

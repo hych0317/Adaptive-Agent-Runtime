@@ -14,6 +14,7 @@ from adaptive_agent_runtime.llm.capabilities.contracts import (
     GraphMutationProposalCapability,
     MemoryExtractionCapability,
     ReasoningCapability,
+    RootCauseAnalysisCapability,
     SemanticCompressionCapability,
     TaskGraphProposalCapability,
 )
@@ -29,6 +30,7 @@ _EXISTING_RUNTIME_PACKAGES = (
     "tool_ecosystem",
     "evaluation",
     "governance",
+    "decisioning",
 )
 
 
@@ -88,6 +90,7 @@ class LLMBoundaryTests(unittest.TestCase):
             TaskGraphProposalCapability,
             ArtifactGenerationCapability,
             EvidenceJudgeCapability,
+            RootCauseAnalysisCapability,
             GraphMutationProposalCapability,
             SemanticCompressionCapability,
             MemoryExtractionCapability,
@@ -119,6 +122,7 @@ class LLMBoundaryTests(unittest.TestCase):
             TaskGraphProposalCapability.propose,
             ArtifactGenerationCapability.generate,
             EvidenceJudgeCapability.assess,
+            RootCauseAnalysisCapability.analyze_root_cause,
             GraphMutationProposalCapability.propose_mutations,
             SemanticCompressionCapability.compress,
             MemoryExtractionCapability.extract,

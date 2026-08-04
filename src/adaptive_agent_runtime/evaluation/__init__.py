@@ -60,6 +60,33 @@ from adaptive_agent_runtime.evaluation.models import (
 from adaptive_agent_runtime.evaluation.optimization import (
     ConservativeOptimizationAgent,
 )
+from adaptive_agent_runtime.evaluation.root_cause import (
+    ROOT_CAUSE_DECISION_TYPE,
+    ROOT_CAUSE_RECORD_OPERATION,
+    DeterministicFindingSnapshot,
+    RootCauseAlternative,
+    RootCauseAssessment,
+    RootCauseAssessmentEffect,
+    RootCauseConclusion,
+    RootCauseDecisionPayload,
+    RootCauseDeterministicAlignment,
+    RootCauseEvidenceBinding,
+    RootCauseEvidenceStrength,
+    RootCauseExecutionPolicy,
+    RootCauseTrigger,
+    root_cause_failure_signature,
+    stable_root_cause_id,
+)
+from adaptive_agent_runtime.evaluation.root_cause_integration import (
+    RecoveryDiagnosticEvidence,
+    RecoveryEvidenceQuery,
+    RootCauseDecisionInput,
+    RootCauseInputAssembler,
+    RootCauseRecoveryEvidenceProvider,
+)
+from adaptive_agent_runtime.evaluation.root_cause_store import (
+    InMemoryRootCauseAssessmentStore,
+)
 from adaptive_agent_runtime.evaluation.outcome import (
     DeterministicOutcomeEvaluator,
     DeterministicOutputQualityEvaluator,
@@ -115,6 +142,25 @@ __all__ = [
     "OutputQualityEvaluator",
     "ProposalStatus",
     "RootCauseHypothesis",
+    "ROOT_CAUSE_DECISION_TYPE",
+    "ROOT_CAUSE_RECORD_OPERATION",
+    "DeterministicFindingSnapshot",
+    "InMemoryRootCauseAssessmentStore",
+    "RecoveryDiagnosticEvidence",
+    "RecoveryEvidenceQuery",
+    "RootCauseAlternative",
+    "RootCauseAssessment",
+    "RootCauseAssessmentEffect",
+    "RootCauseConclusion",
+    "RootCauseDecisionInput",
+    "RootCauseDecisionPayload",
+    "RootCauseDeterministicAlignment",
+    "RootCauseEvidenceBinding",
+    "RootCauseEvidenceStrength",
+    "RootCauseExecutionPolicy",
+    "RootCauseInputAssembler",
+    "RootCauseRecoveryEvidenceProvider",
+    "RootCauseTrigger",
     "RuntimeNativeTraceCollector",
     "RuntimeTraceAdapter",
     "ToolComponentEvaluator",
@@ -128,4 +174,6 @@ __all__ = [
     "TraceCoverage",
     "TraceOrdering",
     "TrajectoryEvaluator",
+    "root_cause_failure_signature",
+    "stable_root_cause_id",
 ]

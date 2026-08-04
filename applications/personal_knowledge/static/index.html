@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>砚台 · 个人知识库</title>
+  <link rel="icon" href="data:,">
   <style>
     :root {
       --paper: #f3efe4;
@@ -48,6 +49,8 @@
     nav button.active { color: var(--ink); background: var(--paper-deep); border-left-color: var(--red); }
     nav .count { font-size: 12px; font-variant-numeric: tabular-nums; }
     .aside-note { position: absolute; left: 30px; right: 26px; bottom: 30px; color: var(--ink-soft); font: 14px/1.6 var(--serif); }
+    .model-button { position: absolute; left: 22px; right: 22px; bottom: 116px; text-align: left; }
+    .model-button small { display: block; color: var(--ink-soft); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     main { padding: 52px clamp(28px, 6vw, 88px) 80px; max-width: 1400px; width: 100%; }
     .topline { display: flex; justify-content: space-between; gap: 24px; align-items: end; margin-bottom: 38px; }
     .eyebrow { color: var(--red); text-transform: uppercase; letter-spacing: .18em; font-size: 12px; font-weight: 700; }
@@ -111,6 +114,7 @@
       nav button { justify-content: center; gap: 8px; border-left: 0; border-bottom: 3px solid transparent; }
       nav button.active { border-bottom-color: var(--red); }
       .aside-note { display: none; }
+      .model-button { position: static; width: 100%; margin-top: 12px; }
       main { padding: 34px 18px 60px; }
       .topline { display: block; }
       .topline p { margin-top: 16px; }
@@ -128,6 +132,7 @@
         <button data-view="library">知识 <span class="count" id="entry-count">0</span></button>
         <button data-view="explore">检索 <span>⌕</span></button>
       </nav>
+      <button class="quiet model-button" id="model-settings"><span>◉ 模型设置</span><small id="model-label">离线模式</small></button>
       <p class="aside-note">原文是材料，<br>经你确认的思考才是知识。</p>
     </aside>
 
@@ -208,14 +213,26 @@
       <div class="list" id="subscription-list" style="margin-top:24px"></div>
     </form>
   </dialog>
+  <dialog id="model-dialog">
+    <div class="modal-head"><div><span class="eyebrow">Runtime inference</span><h3>模型设置</h3></div><button class="quiet" type="button" data-close>关闭</button></div>
+    <form id="model-form" class="modal-body">
+      <div class="field"><label for="llm-target">LLM Target</label><select id="llm-target"></select></div>
+      <div class="field"><label for="llm-model">模型</label><div class="row"><select id="llm-model"><option value="">请先读取模型</option></select><button class="quiet" type="button" id="discover-models">读取模型</button></div></div>
+      <div class="field" id="llm-key-field"><label for="llm-api-key">API Key（留空则使用环境变量或本地私密配置）</label><input id="llm-api-key" type="password" autocomplete="off" placeholder="不会返回到浏览器"></div>
+      <div class="item" id="llm-status"><p>正在读取 Runtime target 配置…</p></div>
+      <div style="margin-top:20px"><button class="primary" type="submit">测试并激活</button></div>
+    </form>
+  </dialog>
   <div class="toast" id="toast" role="status"></div>
 
   <script>
-    const state = { categories: [], entries: [], trash: [], reviews: [], subscriptions: [], preferences: [], activeReview: null };
+    const state = { categories: [], entries: [], trash: [], reviews: [], subscriptions: [], preferences: [], activeReview: null, llm: null, llmModels: {} };
     const $ = (selector) => document.querySelector(selector);
     const escapeText = (value='') => String(value);
     async function api(path, options={}) {
-      const response = await fetch(path, { headers: {'Content-Type':'application/json'}, ...options });
+      let response;
+      try { response = await fetch(path, { headers: {'Content-Type':'application/json'}, ...options }); }
+      catch (error) { throw new Error('无法连接个人知识库服务，请确认 8775 端口的进程仍在运行'); }
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || '请求失败');
       return data;
@@ -231,6 +248,11 @@
       return el;
     }
     async function refresh() { Object.assign(state, await api('/api/state')); render(); }
+    async function loadLLMSettings(){state.llm=await api('/api/llm/settings');renderLLM();}
+    function activeTarget(){return state.llm?.targets?.find(x=>x.name===$('#llm-target').value)}
+    function renderLLM(){const llm=state.llm;if(!llm)return;$('#model-label').textContent=llm.inference==='offline'?'离线模式':llm.inference;const select=$('#llm-target');const previous=select.value;select.replaceChildren();for(const target of llm.targets||[])select.add(new Option(`${target.name} · ${target.service}`,target.name));select.value=llm.activeTarget||previous||llm.defaultTarget||'';syncLLMTarget();}
+    function fillModelOptions(models,selected){const select=$('#llm-model'),values=[...new Set([selected,...models].filter(Boolean))];select.replaceChildren();if(!values.length)select.add(new Option('请先读取模型',''));for(const model of values)select.add(new Option(model,model));select.value=selected&&values.includes(selected)?selected:(values[0]||'');}
+    function syncLLMTarget(){const target=activeTarget();if(!target)return;fillModelOptions(state.llmModels[target.name]||[],target.model||'');$('#llm-key-field').hidden=!target.requiresApiKey;const status=target.credentialConfigured?`凭据：${target.credentialSource}`:'尚未配置凭据';$('#llm-status').innerHTML='';const p=document.createElement('p');p.textContent=`${target.service} · ${target.structuredOutput} · ${status}`;$('#llm-status').append(p);}
     function render() {
       $('#inbox-count').textContent=state.reviews.length; $('#entry-count').textContent=state.entries.length;
       $('#pending-stat').textContent=state.reviews.length; $('#category-stat').textContent=state.categories.length;
@@ -263,10 +285,13 @@
     $('#manage-subscriptions').onclick=()=>$('#subscription-dialog').showModal();
     $('#subscription-form').onsubmit=async e=>{e.preventDefault();try{await api('/api/subscriptions',{method:'POST',body:JSON.stringify({name:$('#subscription-name').value,kind:$('#subscription-kind').value,url:$('#subscription-url').value,interval_minutes:Number($('#subscription-interval').value)})});e.target.reset();await refresh();toast('订阅已保存；新内容只会进入待审区');}catch(err){toast(err.message)}};
     $('#poll-once').onclick=async()=>{try{const result=await api('/api/subscriptions/poll-once',{method:'POST',body:'{}'});await refresh();toast(`轮询完成：${result.filter(x=>x.changed).length} 个来源有变化`)}catch(err){toast(err.message)}};
+    $('#model-settings').onclick=async()=>{try{await loadLLMSettings();$('#model-dialog').showModal()}catch(err){toast(err.message)}};$('#llm-target').onchange=syncLLMTarget;
+    $('#discover-models').onclick=async()=>{const button=$('#discover-models'),target=$('#llm-target').value,current=$('#llm-model').value;button.disabled=true;try{const result=await api('/api/llm/models',{method:'POST',body:JSON.stringify({target,apiKey:$('#llm-api-key').value||null})});state.llmModels[target]=result.models||[];fillModelOptions(state.llmModels[target],state.llmModels[target].includes(current)?current:(result.currentModel||state.llmModels[target][0]||''));$('#llm-status').textContent=`${result.availability} · 找到 ${result.models?.length||0} 个模型${result.diagnostics?.length?' · '+result.diagnostics.join(', '):''}`;}catch(err){$('#llm-status').textContent=err.message}finally{button.disabled=false}};
+    $('#model-form').onsubmit=async e=>{e.preventDefault();const button=e.submitter;button.disabled=true;try{const result=await api('/api/llm/probe',{method:'POST',body:JSON.stringify({target:$('#llm-target').value,model:$('#llm-model').value||null,apiKey:$('#llm-api-key').value||null})});if(result.activated&&result.settings){state.llm=result.settings;renderLLM();$('#llm-api-key').value='';toast('连接正常，模型已自动激活')}$('#llm-status').textContent=`${result.availability} · ${result.model} · ${result.activated?'已激活':'未激活'}${result.diagnostics?.length?' · '+result.diagnostics.join(', '):''}`;}catch(err){$('#llm-status').textContent=err.message}finally{button.disabled=false}};
     $('#send-message').onclick=async()=>{const content=$('#review-message').value.trim();if(!content)return;const id=$('#review-id').value;try{await api(`/api/reviews/${id}/messages`,{method:'POST',body:JSON.stringify({content})});$('#review-dialog').close();await refresh();openReview(id);toast('Agent 已根据讨论更新提案');}catch(err){toast(err.message)}};
     $('#review-form').onsubmit=async e=>{e.preventDefault();if(!$('#review-category').value){toast('请先创建并选择分类');return;}const review=state.activeReview,p=latest(review),target=review.target_entry_id?state.entries.find(x=>x.entry_id===review.target_entry_id):null;const payload={proposal_id:$('#proposal-id').value,expected_review_revision:Number($('#review-revision').value),title:$('#review-title').value,category_id:$('#review-category').value,body:$('#review-body').value,tags:$('#review-tags').value.split(/[,，]/).map(x=>x.trim()).filter(Boolean),citations:p.citations,target_entry_id:target?.entry_id||null,expected_entry_revision:target?.revision??null};try{const result=await api(`/api/reviews/${review.review_id}/confirm`,{method:'POST',body:JSON.stringify(payload)});for(const suggestion of result.preference_suggestions||[]){if(confirm(`Agent 推断到偏好：${suggestion.value}\n\n是否允许写入 Runtime Memory？`)){await api('/api/preferences/confirm',{method:'POST',body:JSON.stringify(suggestion)})}}$('#review-dialog').close();await refresh();toast(target?'已生成新版本':'已按你编辑的版本入库');}catch(err){toast(err.message)}};
     $('#search-form').onsubmit=async e=>{e.preventDefault();const q=$('#search-query').value,archive=$('#include-archive').checked;const box=$('#search-results');box.innerHTML='<div class="empty">正在检索证据…</div>';$('#answer-box').replaceChildren();try{const hits=await api(`/api/search?q=${encodeURIComponent(q)}&archive=${archive}`);box.replaceChildren();if(!hits.length){box.innerHTML='<div class="empty">没有找到可支持回答的内容。</div>';return;}hits.forEach(hit=>{const el=makeItem(hit.title,hit.snippet);const scope=document.createElement('div');scope.className='scope';scope.style.marginTop='12px';scope.textContent=hit.scope==='knowledge'?'已确认知识':'来源存档';el.append(scope);box.append(el)});const answer=await api('/api/answer',{method:'POST',body:JSON.stringify({question:q,include_archive:archive})});if(answer){const node=document.createElement('div');node.className='answer';node.textContent=answer.answer;$('#answer-box').append(node)}}catch(err){box.innerHTML='';toast(err.message)}};
-    refresh().catch(err=>toast(err.message));
+    Promise.all([refresh(),loadLLMSettings()]).catch(err=>toast(err.message));
   </script>
 </body>
 </html>

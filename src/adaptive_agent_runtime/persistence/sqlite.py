@@ -11,7 +11,7 @@ from typing import Iterator
 from adaptive_agent_runtime.persistence.errors import PersistenceSchemaError
 
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runtime_schema (
@@ -135,6 +135,21 @@ CREATE TABLE IF NOT EXISTS optimization_application_history (
 CREATE TABLE IF NOT EXISTS replay_cases (
     case_id TEXT PRIMARY KEY,
     case_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS decision_checkpoints (
+    request_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    run_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    checkpoint_json TEXT NOT NULL,
+    PRIMARY KEY (request_id, revision)
+);
+CREATE INDEX IF NOT EXISTS idx_decision_checkpoints_run
+    ON decision_checkpoints (run_id);
+CREATE TABLE IF NOT EXISTS decision_checkpoint_current (
+    request_id TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL
 );
 """
 

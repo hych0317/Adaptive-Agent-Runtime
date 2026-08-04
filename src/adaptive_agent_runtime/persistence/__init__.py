@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TypeVar
+
+from pydantic import BaseModel
+
+from adaptive_agent_runtime.decisioning.models import DecisionCheckpoint
 
 from adaptive_agent_runtime.persistence.context_memory import (
     SQLiteContextArchive,
@@ -23,8 +28,16 @@ from adaptive_agent_runtime.persistence.governance import (
     SQLiteHumanReviewService,
 )
 from adaptive_agent_runtime.persistence.evolution import SQLiteEvolutionStore
+from adaptive_agent_runtime.persistence.decisioning import (
+    SQLiteDecisionCheckpointStore,
+)
 from adaptive_agent_runtime.persistence.orchestration import SQLiteTaskGraphStore
 from adaptive_agent_runtime.persistence.sqlite import SQLiteDatabase
+
+
+RequestCheckpointT = TypeVar("RequestCheckpointT", bound=BaseModel)
+ProposalCheckpointT = TypeVar("ProposalCheckpointT", bound=BaseModel)
+EffectCheckpointT = TypeVar("EffectCheckpointT", bound=BaseModel)
 
 
 class SQLitePersistence:
@@ -46,6 +59,24 @@ class SQLitePersistence:
         self.runtime_configuration_store = self.evolution_store
         self.replay_case_store = self.evolution_store
 
+    def create_decision_checkpoint_store(
+        self,
+        checkpoint_type: type[
+            DecisionCheckpoint[
+                RequestCheckpointT,
+                ProposalCheckpointT,
+                EffectCheckpointT,
+            ]
+        ],
+    ) -> SQLiteDecisionCheckpointStore[
+        RequestCheckpointT,
+        ProposalCheckpointT,
+        EffectCheckpointT,
+    ]:
+        """Create a typed store without introducing a global Draft registry."""
+
+        return SQLiteDecisionCheckpointStore(self.database, checkpoint_type)
+
     def close(self) -> None:
         self.database.close()
 
@@ -63,6 +94,7 @@ __all__ = [
     "SQLiteContextArchive",
     "SQLiteContextStore",
     "SQLiteDatabase",
+    "SQLiteDecisionCheckpointStore",
     "SQLiteEvolutionStore",
     "SQLiteMemoryStore",
     "SQLiteAuthorizationConsumptionStore",

@@ -18,6 +18,7 @@ from adaptive_agent_runtime.evaluation import (
     EvaluationReport,
     FailureAnalysis,
     OptimizationProposal,
+    RootCauseAssessment,
 )
 from adaptive_agent_runtime.governance import (
     AuthorizationUse,
@@ -113,6 +114,7 @@ class ResearchRunResult:
     llm_memory_candidates: tuple[MemoryCandidateDraft, ...]
     llm_context_packages: tuple[LLMContextPackage, ...]
     llm_tool_intents: tuple[ResearchToolIntentRecord, ...]
+    root_cause_assessments: tuple[RootCauseAssessment, ...]
     evaluation_history_runs: int
 
 

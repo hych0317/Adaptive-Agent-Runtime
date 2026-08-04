@@ -9,6 +9,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import traceback
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 from uuid import UUID
@@ -17,12 +18,14 @@ from pydantic import ValidationError
 from adaptive_agent_runtime.persistence import SQLitePersistence
 from adaptive_agent_runtime.llm.capabilities import ArtifactGenerationCapability
 from adaptive_agent_runtime.llm.capabilities import MemoryExtractionCapability
+from adaptive_agent_runtime.tool_ecosystem.errors import ToolIntegrationError
 
 from applications.personal_knowledge.cognition import (
     ChunkedKnowledgeSynthesizer,
     DeterministicKnowledgeSynthesizer,
     RuntimeKnowledgeSynthesizer,
     KnowledgeSynthesizer,
+    SwitchableKnowledgeSynthesizer,
 )
 from applications.personal_knowledge.errors import (
     KnowledgeConflictError,
@@ -35,6 +38,10 @@ from applications.personal_knowledge.models import (
     SourceSubscription,
     SubscriptionKind,
 )
+from applications.personal_knowledge.llm_runtime import (
+    PersonalKnowledgeLLMDeployment,
+    PersonalKnowledgeLLMManager,
+)
 from applications.personal_knowledge.persistence import SQLitePersonalKnowledgeStore
 from applications.personal_knowledge.preference_memory import (
     PreferenceMemoryService,
@@ -46,6 +53,7 @@ from applications.personal_knowledge.retrieval import (
     KnowledgeRetrievalService,
     KnowledgeQuestionAnswerer,
     RuntimeKnowledgeQuestionAnswerer,
+    SwitchableKnowledgeQuestionAnswerer,
 )
 from applications.personal_knowledge.service import (
     EditableKnowledgeConfirmation,
@@ -62,6 +70,7 @@ from applications.personal_knowledge.subscriptions import (
 
 
 _STATIC_ROOT = Path(__file__).with_name("static")
+_DEFAULT_LLM_CONFIG = Path(__file__).resolve().parents[2] / "config" / "llm.toml"
 
 
 def _jsonable(value: object) -> object:
@@ -89,6 +98,8 @@ class PersonalKnowledgeApplication:
         runtime_database_path: str | Path | None = None,
         generation_capability: ArtifactGenerationCapability | None = None,
         memory_extraction_capability: MemoryExtractionCapability | None = None,
+        llm_manager: PersonalKnowledgeLLMManager | None = None,
+        video_script_path: str | Path | None = None,
     ) -> None:
         self.store = SQLitePersonalKnowledgeStore(database_path)
         knowledge_path = Path(database_path)
@@ -101,6 +112,13 @@ class PersonalKnowledgeApplication:
         self.preferences = PreferenceMemoryService(
             self.runtime_persistence.memory_store
         )
+        self.llm_manager = llm_manager
+        self._llm_deployment: PersonalKnowledgeLLMDeployment | None = None
+        manager_deployment = llm_manager.load_active() if llm_manager else None
+        if manager_deployment is not None:
+            generation_capability = manager_deployment.generator
+            memory_extraction_capability = manager_deployment.memory_extractor
+            self._llm_deployment = manager_deployment
         self.preference_inference = (
             RuntimePreferenceInferenceService(memory_extraction_capability)
             if memory_extraction_capability is not None
@@ -114,17 +132,25 @@ class PersonalKnowledgeApplication:
         else:
             synthesizer = DeterministicKnowledgeSynthesizer()
             answerer = DeterministicKnowledgeQuestionAnswerer()
-        self.agent_mode = "runtime" if generation_capability is not None else "offline"
-        self.tool_stack = build_source_tool_stack()
+        self.synthesizer = SwitchableKnowledgeSynthesizer(synthesizer)
+        self.answerer = SwitchableKnowledgeQuestionAnswerer(answerer)
+        self.agent_mode = (
+            self._deployment_label(manager_deployment)
+            if manager_deployment is not None
+            else ("runtime" if generation_capability is not None else "offline")
+        )
+        self.tool_stack = build_source_tool_stack(
+            video_script_path=video_script_path,
+        )
         self.source_tools = SourceToolRunner(self.tool_stack)
         self.workflow = PersonalKnowledgeService(
             store=self.store,
             source_tools=self.source_tools,
-            synthesizer=ChunkedKnowledgeSynthesizer(synthesizer),
+            synthesizer=ChunkedKnowledgeSynthesizer(self.synthesizer),
         )
         self.retrieval = KnowledgeRetrievalService(
             store=self.store,
-            answerer=answerer,
+            answerer=self.answerer,
         )
         self.poller = SubscriptionPoller(
             store=self.store,
@@ -195,6 +221,105 @@ class PersonalKnowledgeApplication:
                 name=self._optional_text(payload.get("name")),
             )
         return await self.store.apply_category_change(change)
+
+    def llm_settings_view(self) -> dict[str, object]:
+        if self.llm_manager is None:
+            return {
+                "enabled": False,
+                "activeTarget": None,
+                "defaultTarget": None,
+                "targets": [],
+                "inference": self.agent_mode,
+            }
+        return {
+            "enabled": True,
+            **self.llm_manager.describe(),
+            "inference": self.agent_mode,
+        }
+
+    def configure_llm(
+        self,
+        target_name: str,
+        *,
+        api_key: str | None = None,
+        model_id: str | None = None,
+    ) -> dict[str, object]:
+        if self.llm_manager is None:
+            raise RuntimeError("LLM target settings are not configured")
+        deployment = self.llm_manager.activate(
+            target_name,
+            api_key=api_key,
+            model_id=model_id,
+        )
+        self._use_llm_deployment(deployment)
+        return self.llm_settings_view()
+
+    async def discover_llm_models(
+        self,
+        target_name: str,
+        *,
+        api_key: str | None = None,
+    ) -> dict[str, object]:
+        if self.llm_manager is None:
+            raise RuntimeError("LLM target settings are not configured")
+        return await self.llm_manager.discover_models(
+            target_name,
+            api_key=api_key,
+        )
+
+    async def probe_llm(
+        self,
+        *,
+        target_name: str | None = None,
+        api_key: str | None = None,
+        model_id: str | None = None,
+    ) -> dict[str, object]:
+        if self.llm_manager is None:
+            raise RuntimeError("LLM target settings are not configured")
+        if target_name is None:
+            result = await self.llm_manager.probe_active()
+            result["activated"] = False
+            result["inference"] = self.agent_mode
+            return result
+        result, _ = await self.llm_manager.probe_selection(
+            target_name,
+            api_key=api_key,
+            model_id=model_id,
+        )
+        activated = result["availability"] == "available"
+        if activated:
+            deployment = self.llm_manager.activate(
+                target_name,
+                api_key=api_key,
+                model_id=model_id,
+            )
+            self._use_llm_deployment(deployment)
+        result["activated"] = activated
+        result["inference"] = self.agent_mode
+        result["settings"] = self.llm_settings_view()
+        return result
+
+    def _use_llm_deployment(
+        self,
+        deployment: PersonalKnowledgeLLMDeployment,
+    ) -> None:
+        self._llm_deployment = deployment
+        self.synthesizer.use(RuntimeKnowledgeSynthesizer(deployment.generator))
+        self.answerer.use(RuntimeKnowledgeQuestionAnswerer(deployment.generator))
+        self.preference_inference = (
+            RuntimePreferenceInferenceService(deployment.memory_extractor)
+            if deployment.memory_extractor is not None
+            else None
+        )
+        self.agent_mode = self._deployment_label(deployment)
+
+    @staticmethod
+    def _deployment_label(
+        deployment: PersonalKnowledgeLLMDeployment | None,
+    ) -> str:
+        if deployment is None:
+            return "offline"
+        return f"{deployment.model_id} · {deployment.target_name}"
 
     async def create_subscription(self, payload: dict[str, Any]) -> object:
         subscription = SourceSubscription(
@@ -275,6 +400,9 @@ class _KnowledgeRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/state":
             self._run(self.app.state())
             return
+        if parsed.path == "/api/llm/settings":
+            self._run(self._completed(self.app.llm_settings_view()))
+            return
         if parsed.path == "/api/search":
             query = parse_qs(parsed.query)
             term = query.get("q", [""])[0]
@@ -340,6 +468,55 @@ class _KnowledgeRequestHandler(BaseHTTPRequestHandler):
                     )
                 )
                 return
+            if parsed.path == "/api/llm/settings":
+                target = payload.get("target")
+                api_key = payload.get("apiKey")
+                model = payload.get("model")
+                if not isinstance(target, str) or not target.strip():
+                    raise ValueError("target is required")
+                if api_key is not None and not isinstance(api_key, str):
+                    raise ValueError("apiKey must be a string")
+                if model is not None and not isinstance(model, str):
+                    raise ValueError("model must be a string")
+                result = self.app.configure_llm(
+                    target,
+                    api_key=(api_key or None),
+                    model_id=(model or None),
+                )
+                self._run(self._completed(result))
+                return
+            if parsed.path == "/api/llm/models":
+                target = payload.get("target")
+                api_key = payload.get("apiKey")
+                if not isinstance(target, str) or not target.strip():
+                    raise ValueError("target is required")
+                if api_key is not None and not isinstance(api_key, str):
+                    raise ValueError("apiKey must be a string")
+                self._run(
+                    self.app.discover_llm_models(
+                        target,
+                        api_key=(api_key or None),
+                    )
+                )
+                return
+            if parsed.path == "/api/llm/probe":
+                target = payload.get("target")
+                api_key = payload.get("apiKey")
+                model = payload.get("model")
+                if target is not None and not isinstance(target, str):
+                    raise ValueError("target must be a string")
+                if api_key is not None and not isinstance(api_key, str):
+                    raise ValueError("apiKey must be a string")
+                if model is not None and not isinstance(model, str):
+                    raise ValueError("model must be a string")
+                self._run(
+                    self.app.probe_llm(
+                        target_name=(target or None),
+                        api_key=(api_key or None),
+                        model_id=(model or None),
+                    )
+                )
+                return
             parts = tuple(item for item in parsed.path.split("/") if item)
             if len(parts) == 4 and parts[:2] == ("api", "reviews"):
                 review_id = UUID(parts[2])
@@ -394,6 +571,15 @@ class _KnowledgeRequestHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.NOT_FOUND, str(exc))
         except (KnowledgeConflictError, PersonalKnowledgeError) as exc:
             self._error(HTTPStatus.CONFLICT, str(exc))
+        except ToolIntegrationError as exc:
+            traceback.print_exc()
+            self._error(HTTPStatus.BAD_GATEWAY, str(exc))
+        except Exception as exc:
+            traceback.print_exc()
+            self._error(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                f"request failed: {exc.__class__.__name__}",
+            )
 
     def _read_json(self) -> dict[str, Any]:
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0]
@@ -439,6 +625,17 @@ class _KnowledgeRequestHandler(BaseHTTPRequestHandler):
             return
         except (KnowledgeConflictError, PersonalKnowledgeError) as exc:
             self._error(HTTPStatus.CONFLICT, str(exc))
+            return
+        except ToolIntegrationError as exc:
+            traceback.print_exc()
+            self._error(HTTPStatus.BAD_GATEWAY, str(exc))
+            return
+        except Exception as exc:
+            traceback.print_exc()
+            self._error(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                f"request failed: {exc.__class__.__name__}",
+            )
             return
         encoded = json.dumps(
             _jsonable(result),
@@ -487,7 +684,7 @@ def build_http_server(
     app: PersonalKnowledgeApplication,
     *,
     host: str = "127.0.0.1",
-    port: int = 8765,
+    port: int = 8775,
 ) -> PersonalKnowledgeHTTPServer:
     handler = type(
         "PersonalKnowledgeRequestHandler",
@@ -501,9 +698,19 @@ def serve(
     *,
     database_path: str | Path,
     host: str = "127.0.0.1",
-    port: int = 8765,
+    port: int = 8775,
+    llm_config: str | Path = _DEFAULT_LLM_CONFIG,
+    llm_target: str | None = None,
+    video_script: str | Path | None = None,
 ) -> None:
-    app = PersonalKnowledgeApplication(database_path)
+    app = PersonalKnowledgeApplication(
+        database_path,
+        llm_manager=PersonalKnowledgeLLMManager(
+            llm_config,
+            active_target=llm_target,
+        ),
+        video_script_path=video_script,
+    )
     server = build_http_server(app, host=host, port=port)
     try:
         app.scheduler.start()
@@ -521,7 +728,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the personal knowledge app")
     parser.add_argument("--database", default="data/knowledge.sqlite3")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=8775)
+    parser.add_argument("--llm-config", type=Path, default=_DEFAULT_LLM_CONFIG)
+    parser.add_argument("--llm-target")
+    parser.add_argument(
+        "--video-script",
+        type=Path,
+        help=(
+            "Hermes-compatible fetch_video_transcript.py; defaults to "
+            "PERSONAL_KNOWLEDGE_VIDEO_SCRIPT or a sibling Hermes repository"
+        ),
+    )
     parser.add_argument(
         "--poll-once",
         action="store_true",
@@ -536,7 +753,14 @@ def main() -> None:
         finally:
             app.close()
         return
-    serve(database_path=args.database, host=args.host, port=args.port)
+    serve(
+        database_path=args.database,
+        host=args.host,
+        port=args.port,
+        llm_config=args.llm_config,
+        llm_target=args.llm_target,
+        video_script=args.video_script,
+    )
 
 
 if __name__ == "__main__":
