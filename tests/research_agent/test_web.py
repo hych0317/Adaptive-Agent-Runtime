@@ -71,7 +71,10 @@ class ResearchWebViewTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Context & Memory", view["meta"]["fixtureNotice"])
         self.assertEqual(view["summary"]["nodes"], 8)
         self.assertEqual(view["summary"]["completedNodes"], 8)
-        self.assertEqual(len(view["runtimeTrace"]), 36)
+        self.assertEqual(
+            len(view["runtimeTrace"]),
+            len(result.runtime_trace),
+        )
         self.assertEqual(
             sum(1 for node in view["graph"]["nodes"] if node["dynamic"]),
             1,

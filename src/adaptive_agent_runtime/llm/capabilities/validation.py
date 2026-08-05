@@ -27,6 +27,8 @@ from adaptive_agent_runtime.llm.capabilities.models import (
     RootCauseDraft,
     TaskGraphDraft,
     TaskPlanningRequest,
+    ToolSelectionDraft,
+    ToolSelectionProposalRequest,
 )
 from adaptive_agent_runtime.llm.errors import CapabilityResultValidationError
 
@@ -89,6 +91,27 @@ class CapabilityDraftValidator:
             )
         )
         self._raise_if_invalid("action_proposal", tuple(violations))
+        return result
+
+    def validate_tool_selection(
+        self,
+        request: ToolSelectionProposalRequest,
+        result: ToolSelectionDraft,
+    ) -> ToolSelectionDraft:
+        candidates = {item.candidate_ref for item in request.candidates}
+        violations: list[str] = []
+        if result.selected_candidate_ref not in candidates:
+            violations.append(
+                "Tool selection chose a Provider outside the Runtime candidate set"
+            )
+        violations.extend(
+            _unknown_references(
+                result.evidence_reference_ids,
+                _evidence_ids(request.evidence),
+                "Tool selection proposal",
+            )
+        )
+        self._raise_if_invalid("tool_selection_proposal", tuple(violations))
         return result
 
     def validate_recovery_proposal(

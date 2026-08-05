@@ -41,7 +41,10 @@ class ResearchProgressTests(unittest.IsolatedAsyncioTestCase):
             kinds.count(ResearchProgressKind.GRAPH_DEPENDENCY_ADDED),
             1,
         )
-        self.assertEqual(kinds.count(ResearchProgressKind.TRACE_RECORDED), 36)
+        self.assertEqual(
+            kinds.count(ResearchProgressKind.TRACE_RECORDED),
+            len(result.runtime_trace),
+        )
         self.assertEqual(kinds.count(ResearchProgressKind.RUNTIME_COMPLETED), 1)
         self.assertEqual(
             {event.run_id for event in sink.events},

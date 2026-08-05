@@ -1008,6 +1008,12 @@ api_key = "fixture-secret"
             ("root_cause_analysis",),
         )
 
+    def test_tool_selection_is_a_distinct_negotiated_capability(self) -> None:
+        self.assertEqual(
+            managed_capability_ids((ResearchLLMCapability.TOOL_SELECTION,)),
+            ("tool_selection_proposal",),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

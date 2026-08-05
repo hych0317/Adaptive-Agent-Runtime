@@ -8,12 +8,10 @@ from typing import Mapping
 from uuid import UUID, uuid4
 
 from pydantic import JsonValue, ValidationError
-from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 
 from adaptive_agent_runtime import AgentState, Observation
 from adaptive_agent_runtime.context_memory import (
     ContextAssembly,
-    ContextCompressionResult,
     ContextLayer,
     ContextLifecycleAction,
     ContextLifecycleDecision,
@@ -56,9 +54,7 @@ from adaptive_agent_runtime.governance import (
     governance_fingerprint,
 )
 from adaptive_agent_runtime.llm import (
-    ActionProposalCapability,
     ActionProposalDraft,
-    ActionProposalRequest,
     AgentBackendError,
     AgentExecutionPolicy,
     AutonomousAgentBackend,
@@ -68,22 +64,16 @@ from adaptive_agent_runtime.llm import (
     BackendDelegatedAccess,
     ArtifactGenerationCapability,
     CapabilityInvocationMetadata,
-    CapabilityDraftValidator,
     CapabilityTurnKind,
-    CompressionRequest,
     EvidenceReference,
     GraphMutationProposalCapability,
     GraphMutationProposalDraft,
-    GraphMutationProposalRequest,
     GenerationRequest,
     InferenceCorrelation,
     LLMContextPackage,
-    PlanningActionCandidate,
     ReasoningCapability,
     ReasoningContext,
-    SemanticCompressionCapability,
     MemoryCandidateDraft,
-    ToolIntentDraft,
 )
 from adaptive_agent_runtime.orchestration import (
     DynamicTaskGraph,
@@ -104,10 +94,12 @@ from adaptive_agent_runtime.tool_ecosystem import (
     ToolEcosystemError,
     ToolIntegrationError,
     ToolInvocation,
-    ToolCorrelation,
+    ToolInvocationDecisionHandler,
+    ToolInvocationProposalDraft,
     ToolObservation,
-    ToolResultObservationAdapter,
     ToolSelector,
+    ToolResultObservationAdapter,
+    ToolSelectionDecisionHandler,
     ToolSelectionContext,
 )
 
@@ -120,7 +112,6 @@ from applications.research_agent.capabilities import (
 )
 from applications.research_agent.prompts import CHINESE_OUTPUT_INSTRUCTION
 from applications.research_agent.cognition import (
-    ResearchContextProjection,
     ResearchReportContextProjection,
 )
 from applications.research_agent.report import (
@@ -129,10 +120,6 @@ from applications.research_agent.report import (
     ResearchReport,
     ResearchToolIntentRecord,
 )
-from applications.research_agent.llm_tools import (
-    RESEARCH_INFORMATION_RETRIEVAL_TOOL,
-    RESEARCH_RETRIEVAL_SCOPES,
-)
 from applications.research_agent.tasks import (
     COMPANY_RESEARCH,
     COMPETITOR_ANALYSIS,
@@ -140,13 +127,9 @@ from applications.research_agent.tasks import (
     FINANCIAL_METRICS,
     INDUSTRY_ANALYSIS,
     NEWS_ANALYSIS,
-    RESEARCH_NODE_ROLES,
-    RESEARCH_STRATEGY_ID,
-    REVIEW_STRATEGY_ID,
     REPORT_GENERATION as REPORT_NODE,
     RISK_REVIEW,
     ResearchTaskDefinition,
-    build_research_mutations_from_draft,
 )
 
 
@@ -217,147 +200,6 @@ class ResearchWorkspace:
                     preferences.append(_json_dump(content["content"]))
             return tuple(preferences)
         return ()
-
-
-class LLMReadyTaskNodeSelector:
-    """Turn an LLM action draft into a governed ready-node selection."""
-
-    module_id = "research_agent.ready_node_selector.llm"
-
-    def __init__(
-        self,
-        *,
-        capability: ActionProposalCapability,
-        workspace: ResearchWorkspace,
-        authorize: Callable[[GovernanceRequest], GovernanceRecord],
-        operation_executor: GovernedOperationExecutor,
-    ) -> None:
-        self._capability = capability
-        self._workspace = workspace
-        self._authorize = authorize
-        self._operation_executor = operation_executor
-        self._validator = CapabilityDraftValidator()
-
-    async def select_node_id(
-        self,
-        ready_nodes: tuple[TaskNode, ...],
-        state: AgentState,
-    ) -> UUID:
-        if not ready_nodes:
-            raise RuntimeError("LLM action selection requires ready nodes")
-        if len(ready_nodes) == 1:
-            return ready_nodes[0].node_id
-        candidates = tuple(
-            PlanningActionCandidate(
-                node_key=self._workspace.role_for(node),
-                goal=node.goal,
-                expected_output=node.expected_output,
-                strategy_id=node.strategy_id,
-            )
-            for node in ready_nodes
-        )
-        evidence_id = f"runtime:ready:{state.run_id}:{state.step_count}"
-        request = ActionProposalRequest(
-            task=state.task.description,
-            candidates=candidates,
-            evidence=(
-                EvidenceReference(
-                    reference_id=evidence_id,
-                    kind="runtime.ready_set",
-                    summary="Runtime scheduler produced the candidate set.",
-                    reliability=1.0,
-                ),
-            ),
-        )
-        proposal_action_id = uuid4()
-        turn = await self._capability.propose_action(
-            request,
-            invocation=CapabilityInvocationMetadata(
-                correlation=InferenceCorrelation(
-                    run_id=state.run_id,
-                    task_id=state.task.task_id,
-                    action_id=proposal_action_id,
-                ),
-                trace_attributes={"operation": "node.select.propose"},
-            ),
-        )
-        if turn.kind is CapabilityTurnKind.TOOL_INTENT or turn.result is None:
-            raise RuntimeError("Action Planner returned no action proposal")
-        proposal = self._validator.validate_action_proposal(
-            request,
-            turn.result,
-        )
-        by_key = {
-            self._workspace.role_for(node): node for node in ready_nodes
-        }
-        selected = by_key.get(proposal.node_key)
-        if selected is None:
-            raise RuntimeError("Action Planner escaped the Runtime ready set")
-        governance_request = GovernanceRequest(
-            scope=GovernanceScope.ACTION,
-            operation="node.select",
-            target=GovernanceTarget(
-                target_type="task_node",
-                target_id=str(selected.node_id),
-            ),
-            risk=RiskLevel.LOW,
-            signals=ConfidenceSignals(
-                stated_confidence=0.9,
-                evidence=(
-                    GovernanceEvidence(
-                        evidence_id=evidence_id,
-                        kind="runtime.ready_set",
-                        source="graph_scheduler",
-                        reliability=1.0,
-                        summary=(
-                            "The proposed node belongs to the Runtime ready set."
-                        ),
-                    ),
-                ),
-                impact=ImpactAssessment(
-                    score=0.1,
-                    reversible=True,
-                    description=(
-                        "The proposal orders one already-ready node for this run."
-                    ),
-                ),
-                history=GovernanceHistory(successful_similar=5),
-            ),
-            correlation=GovernanceCorrelation(
-                run_id=state.run_id,
-                task_id=state.task.task_id,
-                node_id=selected.node_id,
-                action_id=proposal_action_id,
-            ),
-            attributes={
-                SUBJECT_FINGERPRINT_ATTRIBUTE: governance_fingerprint(proposal),
-                "candidate_node_keys": [
-                    candidate.node_key for candidate in candidates
-                ],
-                "selected_node_key": proposal.node_key,
-                "planner_capability_id": self._capability.capability_id,
-            },
-        )
-        record = self._authorize(governance_request)
-        self._workspace.action_proposals.append(proposal)
-        self._workspace.governance_records.append(record)
-        if record.authorization is None:
-            raise RuntimeError("Governance denied LLM Action Proposal")
-        async def select() -> UUID:
-            return selected.node_id
-
-        return await self._operation_executor.execute(
-            request=governance_request,
-            decision=record.final,
-            authorization=record.authorization,
-            target=BoundGovernedOperation(
-                module_id="research_agent.node_selection",
-                operation=governance_request.operation,
-                target=governance_request.target,
-                subject=proposal,
-                apply=select,
-            ),
-        )
 
 
 class ResearchCapabilityRequestProvider:
@@ -723,110 +565,6 @@ class ResearchRecoveryPlanApplier:
         )
 
 
-class DeterministicContextCompressor:
-    """Application compressor used to demonstrate the public lifecycle contract."""
-
-    module_id = "research_agent.context_compressor.deterministic"
-
-    async def compress(self, unit: ContextUnit) -> ContextCompressionResult:
-        return ContextCompressionResult(
-            content={
-                "summary": "Research evidence retained as a compact conclusion.",
-                "source_reference": unit.metadata.source_reference,
-            },
-            core_conclusions=(
-                "The evidence was consumed by the current research run.",
-            ),
-            estimated_tokens=min(unit.metadata.estimated_tokens, 12),
-        )
-
-
-class LLMContextCompressor:
-    """Translate a semantic Compression draft into Context lifecycle output."""
-
-    module_id = "research_agent.context_compressor.llm"
-
-    def __init__(
-        self,
-        capability: SemanticCompressionCapability,
-        context_projection: ResearchContextProjection,
-    ) -> None:
-        self._capability = capability
-        self._context_projection = context_projection
-        self._packages_by_run: dict[UUID, list[LLMContextPackage]] = {}
-
-    def take_packages(self, run_id: UUID) -> tuple[LLMContextPackage, ...]:
-        return tuple(self._packages_by_run.pop(run_id, ()))
-
-    async def compress(self, unit: ContextUnit) -> ContextCompressionResult:
-        original_tokens = unit.metadata.estimated_tokens
-        if original_tokens <= 1:
-            raise RuntimeError("Context Unit is too small for semantic compression")
-        target_tokens = max(1, original_tokens // 2)
-        layer_buckets = {
-            ContextLayer.WORKING: (unit,),
-            ContextLayer.TASK: (unit,),
-            ContextLayer.SEMANTIC: (unit,),
-        }
-        assembly = ContextAssembly(
-            requirement=ContextRequirement(
-                run_id=unit.metadata.run_id,
-                task_id=unit.metadata.task_id,
-                node_id=unit.metadata.node_id,
-                goal="Compress one policy-approved Runtime Context Unit.",
-                layers=(unit.metadata.layer,),
-                required_context_ids=(unit.context_id,),
-                max_units=1,
-                max_tokens=original_tokens,
-            ),
-            units=(unit,),
-            working_context=(
-                layer_buckets[ContextLayer.WORKING]
-                if unit.metadata.layer is ContextLayer.WORKING
-                else ()
-            ),
-            task_context=(
-                layer_buckets[ContextLayer.TASK]
-                if unit.metadata.layer is ContextLayer.TASK
-                else ()
-            ),
-            semantic_context=(
-                layer_buckets[ContextLayer.SEMANTIC]
-                if unit.metadata.layer is ContextLayer.SEMANTIC
-                else ()
-            ),
-            used_tokens=original_tokens,
-        )
-        package = self._context_projection.project(assembly)
-        self._packages_by_run.setdefault(unit.metadata.run_id, []).append(package)
-        turn = await self._capability.compress(
-            CompressionRequest(
-                source_reference_id=str(unit.context_id),
-                content=package.model_dump(mode="json"),
-                original_estimated_tokens=original_tokens,
-                target_max_tokens=target_tokens,
-            ),
-            invocation=CapabilityInvocationMetadata(
-                correlation=InferenceCorrelation(
-                    run_id=unit.metadata.run_id,
-                    task_id=unit.metadata.task_id,
-                    node_id=unit.metadata.node_id,
-                    action_id=uuid4(),
-                ),
-                trace_attributes={"operation": "context.compress"},
-            ),
-        )
-        if turn.kind is CapabilityTurnKind.TOOL_INTENT:
-            raise RuntimeError("Context Compressor returned ToolIntent to Runtime")
-        if turn.result is None:
-            raise RuntimeError("Context Compressor returned no draft")
-        return ContextCompressionResult(
-            content=turn.result.content,
-            core_conclusions=turn.result.core_conclusions,
-            estimated_tokens=turn.result.estimated_tokens,
-        )
-
-
 class GovernedContextLifecycleExecutor:
     """Application boundary that enforces every adaptive Context transition."""
 
@@ -988,100 +726,6 @@ class _ContextAwareStrategy:
         return tuple(units)
 
 
-class GovernedToolIntentExecutor:
-    """Validate and execute an LLM Tool proposal through Runtime authority."""
-
-    module_id = "research_agent.tool_intent_executor.governed"
-
-    def __init__(
-        self,
-        *,
-        resolver: CapabilityCandidateResolver,
-        selector: ToolSelector,
-        executor: ToolExecutor,
-        workspace: ResearchWorkspace,
-        timeout_seconds: float = 2.0,
-    ) -> None:
-        self._resolver = resolver
-        self._selector = selector
-        self._executor = executor
-        self._workspace = workspace
-        self._policy = ToolExecutionPolicy(timeout_seconds=timeout_seconds)
-        schema = RESEARCH_INFORMATION_RETRIEVAL_TOOL.model_dump(mode="json")[
-            "input_schema"
-        ]
-        self._validator = Draft202012Validator(schema)
-
-    async def execute(
-        self,
-        intent: ToolIntentDraft,
-        node: TaskNode,
-        state: AgentState,
-    ) -> ToolObservation:
-        if intent.capability_id != RESEARCH_INFORMATION_RETRIEVAL_TOOL.capability_id:
-            raise ToolIntegrationError(
-                f"ToolIntent capability '{intent.capability_id}' is not allowed"
-            )
-        arguments = intent.model_dump(mode="json")["arguments"]
-        errors = tuple(self._validator.iter_errors(arguments))
-        if errors:
-            raise ToolIntegrationError(
-                "ToolIntent arguments do not match the Runtime schema"
-            )
-        if arguments["company"] != self._workspace.definition.company:
-            raise ToolIntegrationError(
-                "ToolIntent cannot change the company task boundary"
-            )
-        scope = str(arguments["scope"])
-        if scope not in RESEARCH_RETRIEVAL_SCOPES:
-            raise ToolIntegrationError("ToolIntent retrieval scope is not allowed")
-        requirement = CapabilityRequirement(
-            capability_id=intent.capability_id,
-            required_provider_tags=(scope,),
-        )
-        candidates = self._resolver.candidates(requirement)
-        selection = self._selector.select(
-            requirement,
-            candidates,
-            ToolSelectionContext(tags=("llm_tool_intent", scope)),
-        )
-        if selection.requirement_id != requirement.requirement_id:
-            raise ToolIntegrationError(
-                "Tool selector returned a mismatched requirement"
-            )
-        if selection.capability_id != requirement.capability_id:
-            raise ToolIntegrationError("Tool selector changed the capability")
-        if selection.provider_id not in {
-            candidate.provider_id for candidate in candidates
-        }:
-            raise ToolIntegrationError(
-                "Tool selector escaped Runtime-filtered candidates"
-            )
-        invocation_id = uuid4()
-        invocation = ToolInvocation(
-            invocation_id=invocation_id,
-            requirement_id=requirement.requirement_id,
-            capability_id=requirement.capability_id,
-            provider_id=selection.provider_id,
-            arguments=arguments,
-            correlation=ToolCorrelation(
-                run_id=state.run_id,
-                task_id=state.task.task_id,
-                node_id=node.node_id,
-                action_id=invocation_id,
-            ),
-        )
-        observation = await self._executor.execute(invocation, self._policy)
-        self._workspace.llm_tool_intents.append(
-            ResearchToolIntentRecord(
-                node_id=node.node_id,
-                intent=intent,
-                observation=observation,
-            )
-        )
-        return observation
-
-
 class ResearchStrategy(_ContextAwareStrategy):
     module_id = "research_agent.strategy.research"
     strategy_id = "research"
@@ -1096,10 +740,7 @@ class ResearchStrategy(_ContextAwareStrategy):
         context_trace: ContextMemoryTraceAdapter,
         reasoner: ReasoningCapability | None = None,
         mutation_planner: GraphMutationProposalCapability | None = None,
-        mutation_context: ResearchContextProjection | None = None,
-        authorize_mutation: Callable[[GovernanceRequest], GovernanceRecord]
-        | None = None,
-        tool_intent_executor: GovernedToolIntentExecutor | None = None,
+        tool_invocation_handler: ToolInvocationDecisionHandler | None = None,
         max_reasoning_tool_intents: int = 0,
     ) -> None:
         super().__init__(
@@ -1111,10 +752,7 @@ class ResearchStrategy(_ContextAwareStrategy):
         self._tool_strategy = tool_strategy
         self._reasoner = reasoner
         self._mutation_planner = mutation_planner
-        self._mutation_context = mutation_context
-        self._authorize_mutation = authorize_mutation
-        self._draft_validator = CapabilityDraftValidator()
-        self._tool_intent_executor = tool_intent_executor
+        self._tool_invocation_handler = tool_invocation_handler
         self._max_reasoning_tool_intents = max_reasoning_tool_intents
 
     async def execute(
@@ -1192,10 +830,10 @@ class ResearchStrategy(_ContextAwareStrategy):
                         )
                     )
                     break
-                executor = self._tool_intent_executor
+                handler = self._tool_invocation_handler
                 intents = reasoning_turn.tool_intents
                 call_keys = {intent.call_key for intent in intents}
-                if executor is None:
+                if handler is None:
                     return NodeExecutionResult.failed(
                         error="Reasoner ToolIntent execution is not enabled"
                     )
@@ -1208,9 +846,25 @@ class ResearchStrategy(_ContextAwareStrategy):
                         error="Reasoner exceeded its ToolIntent budget"
                     )
                 intent_observation_start = len(self._workspace.tool_observations)
+                failed_observation: ToolObservation | None = None
                 try:
                     for intent in intents:
-                        observation = await executor.execute(intent, node, state)
+                        outcome = await handler.handle(
+                            proposal=ToolInvocationProposalDraft.model_validate(
+                                intent.model_dump(mode="python")
+                            ),
+                            producer_id=self._reasoner.capability_id,
+                            node=node,
+                            state=state,
+                        )
+                        observation = outcome.observation
+                        self._workspace.llm_tool_intents.append(
+                            ResearchToolIntentRecord(
+                                node_id=node.node_id,
+                                intent=intent,
+                                observation=observation,
+                            )
+                        )
                         reference_id = f"tool-intent:{intent.call_key}"
                         evidence.append(
                             EvidenceReference(
@@ -1228,6 +882,9 @@ class ResearchStrategy(_ContextAwareStrategy):
                                 "observation": observation.model_dump(mode="json"),
                             }
                         )
+                        if not observation.succeeded:
+                            failed_observation = observation
+                            break
                 except ToolEcosystemError as exc:
                     return NodeExecutionResult.failed(error=str(exc))
                 recorded_units += await self._record_tool_observations(
@@ -1235,6 +892,13 @@ class ResearchStrategy(_ContextAwareStrategy):
                     node,
                     state,
                 )
+                if failed_observation is not None:
+                    return NodeExecutionResult.failed(
+                        error=(
+                            failed_observation.error
+                            or "Reasoner Tool invocation failed"
+                        )
+                    )
                 used_call_keys.update(call_keys)
                 used_intents += len(intents)
         self._workspace.set_output(node, result.output)
@@ -1263,151 +927,11 @@ class ResearchStrategy(_ContextAwareStrategy):
         planner = self._mutation_planner
         if planner is None:
             return self._workspace.definition.discovery_mutations()
-        projection = self._mutation_context
-        authorize = self._authorize_mutation
-        if projection is None or authorize is None:
-            raise RuntimeError(
-                "Mutation Planner requires Context projection and Governance"
-            )
-        if not recorded_units:
-            raise RuntimeError("Mutation Planner has no accepted observation")
-        working = tuple(
-            unit
-            for unit in recorded_units
-            if unit.metadata.layer is ContextLayer.WORKING
-        )
-        task_units = tuple(
-            unit
-            for unit in recorded_units
-            if unit.metadata.layer is ContextLayer.TASK
-        )
-        semantic = tuple(
-            unit
-            for unit in recorded_units
-            if unit.metadata.layer is ContextLayer.SEMANTIC
-        )
-        used_tokens = sum(
-            unit.metadata.estimated_tokens for unit in recorded_units
-        )
-        ordered_units = (*working, *task_units, *semantic)
-        assembly = ContextAssembly(
-            requirement=ContextRequirement(
-                run_id=state.run_id,
-                task_id=state.task.task_id,
-                node_id=node.node_id,
-                goal="Propose bounded graph mutations from company evidence.",
-                max_units=len(recorded_units),
-                max_tokens=used_tokens,
-            ),
-            units=ordered_units,
-            working_context=working,
-            task_context=task_units,
-            semantic_context=semantic,
-            used_tokens=used_tokens,
-        )
-        package = projection.project(assembly)
-        if not package.blocks:
-            raise RuntimeError(
-                "Mutation Planner Context policy omitted all observations"
-            )
-        self._workspace.llm_context_packages.append(package)
-        evidence = tuple(
-            EvidenceReference(
-                reference_id=f"context:{block.context_id}",
-                kind="tool.observation",
-                summary="Policy-approved company research observation.",
-                reliability=1.0,
-            )
-            for block in package.blocks
-        )
-        existing_keys = tuple(
-            role for role in RESEARCH_NODE_ROLES if role != NEWS_ANALYSIS
-        )
-        request = GraphMutationProposalRequest(
-            task=state.task.description,
-            trigger_node_key=COMPANY_RESEARCH,
-            trigger_observation={
-                "context_package": package.model_dump(mode="json"),
-                "accepted_output_present": output is not None,
-            },
-            existing_node_keys=existing_keys,
-            allowed_new_node_keys=(NEWS_ANALYSIS,),
-            available_strategies=(
-                RESEARCH_STRATEGY_ID,
-                REVIEW_STRATEGY_ID,
-            ),
-            available_execution_capability_ids=(INFORMATION_RETRIEVAL,),
-            evidence=evidence,
-        )
-        proposal_action_id = uuid4()
-        turn = await planner.propose_mutations(
-            request,
-            invocation=CapabilityInvocationMetadata(
-                correlation=InferenceCorrelation(
-                    run_id=state.run_id,
-                    task_id=state.task.task_id,
-                    node_id=node.node_id,
-                    action_id=proposal_action_id,
-                ),
-                trace_attributes={"operation": "graph.mutate.propose"},
-            ),
-        )
-        if turn.kind is CapabilityTurnKind.TOOL_INTENT or turn.result is None:
-            raise RuntimeError("Mutation Planner returned no mutation proposal")
-        proposal = self._draft_validator.validate_graph_mutation_proposal(
-            request,
-            turn.result,
-        )
-        mutations = build_research_mutations_from_draft(
-            self._workspace.definition,
-            proposal,
-        )
-        governance_request = GovernanceRequest(
-            scope=GovernanceScope.STATE,
-            operation="graph.mutate",
-            target=GovernanceTarget(
-                target_type="task_graph",
-                target_id=str(state.run_id),
-            ),
-            risk=RiskLevel.MEDIUM,
-            signals=ConfidenceSignals(
-                stated_confidence=0.9,
-                evidence=tuple(
-                    GovernanceEvidence(
-                        evidence_id=item.reference_id,
-                        kind=item.kind,
-                        source="context_adapter",
-                        reliability=item.reliability or 1.0,
-                        summary=item.summary or "Accepted Runtime evidence.",
-                    )
-                    for item in evidence
-                ),
-                impact=ImpactAssessment(
-                    score=0.4,
-                    reversible=True,
-                    description=(
-                        "The proposal changes only this run's validated task graph."
-                    ),
-                ),
-                history=GovernanceHistory(successful_similar=5),
-            ),
-            correlation=GovernanceCorrelation(
-                run_id=state.run_id,
-                task_id=state.task.task_id,
-                node_id=node.node_id,
-                action_id=proposal_action_id,
-            ),
-            attributes={
-                "proposal": proposal.model_dump(mode="json"),
-                "planner_capability_id": planner.capability_id,
-            },
-        )
-        record = authorize(governance_request)
-        self._workspace.graph_mutation_proposals.append(proposal)
-        self._workspace.governance_records.append(record)
-        if record.authorization is None:
-            raise RuntimeError("Governance denied LLM Graph Mutation Proposal")
-        return mutations
+        # The Agent-backed path is handled after Observation consumption by
+        # GraphMutationDecisionHandler. Returning no metadata mutation prevents
+        # the proposal from bypassing unified validation, Governance, and Trace.
+        del node, state, output, recorded_units
+        return ()
 
 
 class DeterministicRiskAgent:
@@ -1797,7 +1321,8 @@ def build_tool_execution_strategy(
     workspace: ResearchWorkspace,
     executor: ToolExecutor,
     resolver: CapabilityCandidateResolver,
-    selector: ToolSelector,
+    selector: ToolSelector | None = None,
+    selection_handler: ToolSelectionDecisionHandler | None = None,
     timeout_seconds: float = 2.0,
 ) -> ToolExecutionStrategy:
     """Small typed seam kept here so Strategies reuse the Runtime adapter."""
@@ -1806,6 +1331,7 @@ def build_tool_execution_strategy(
         requests=ResearchCapabilityRequestProvider(workspace),
         resolver=resolver,
         selector=selector,
+        selection_handler=selection_handler,
         executor=executor,
         policy=ToolExecutionPolicy(timeout_seconds=timeout_seconds),
         strategy_id="research-tool-delegate",

@@ -28,6 +28,8 @@ from adaptive_agent_runtime.llm.capabilities.models import (
     RootCauseDraft,
     TaskGraphDraft,
     TaskPlanningRequest,
+    ToolSelectionDraft,
+    ToolSelectionProposalRequest,
 )
 
 
@@ -77,6 +79,16 @@ class RootCauseAnalysisCapability(CognitiveCapability, Protocol):
         *,
         invocation: CapabilityInvocationMetadata | None = None,
     ) -> CapabilityTurnResult[RootCauseDraft]: ...
+
+
+@runtime_checkable
+class ToolSelectionProposalCapability(CognitiveCapability, Protocol):
+    async def propose_tool_selection(
+        self,
+        request: ToolSelectionProposalRequest,
+        *,
+        invocation: CapabilityInvocationMetadata | None = None,
+    ) -> CapabilityTurnResult[ToolSelectionDraft]: ...
 
 
 @runtime_checkable

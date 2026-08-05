@@ -29,6 +29,14 @@ from adaptive_agent_runtime.context_memory.context_runtime import (
     InMemoryContextArchive,
     InMemoryContextStore,
 )
+from adaptive_agent_runtime.context_memory.compression_decision import (
+    CONTEXT_COMPRESSION_APPLY_OPERATION,
+    CONTEXT_COMPRESSION_DECISION_TYPE,
+    ContextCompressionDecisionPayload,
+    ContextCompressionEffect,
+    ContextCompressionExecutionPolicy,
+    stable_context_compression_id,
+)
 from adaptive_agent_runtime.context_memory.contracts import (
     ContextArchive,
     ContextAssemblyBuilder,
@@ -73,6 +81,18 @@ from adaptive_agent_runtime.context_memory.memory_models import (
     MemoryUnit,
     MemoryUpdateResult,
 )
+from adaptive_agent_runtime.context_memory.memory_decision import (
+    MEMORY_CANDIDATES_APPLY_OPERATION,
+    MEMORY_EXTRACTION_DECISION_TYPE,
+    ExistingMemoryBinding,
+    MemoryEvidenceBinding,
+    MemoryExtractionDecisionOutcome,
+    MemoryExtractionDecisionPayload,
+    MemoryExtractionEffect,
+    MemoryExtractionExecutionPolicy,
+    memory_decision_fingerprint,
+    stable_memory_extraction_id,
+)
 from adaptive_agent_runtime.context_memory.memory_runtime import (
     ConditionalMemoryRecall,
     EvidenceDrivenMemoryConsolidator,
@@ -88,6 +108,9 @@ __all__ = [
     "ContextAssemblyBuilder",
     "ContextBudgetExceededError",
     "ContextCompressionResult",
+    "ContextCompressionDecisionPayload",
+    "ContextCompressionEffect",
+    "ContextCompressionExecutionPolicy",
     "ContextCompressor",
     "ContextLayer",
     "ContextLifecycleAction",
@@ -126,6 +149,15 @@ __all__ = [
     "InMemoryContextStore",
     "InMemoryMemoryStore",
     "MemoryCandidate",
+    "MEMORY_CANDIDATES_APPLY_OPERATION",
+    "MEMORY_EXTRACTION_DECISION_TYPE",
+    "ExistingMemoryBinding",
+    "MemoryEvidenceBinding",
+    "MemoryExtractionDecisionOutcome",
+    "MemoryExtractionDecisionPayload",
+    "MemoryExtractionEffect",
+    "MemoryExtractionExecutionPolicy",
+    "memory_decision_fingerprint",
     "MemoryCondition",
     "MemoryConflict",
     "MemoryConsolidation",
@@ -144,4 +176,8 @@ __all__ = [
     "ObservationContextAdapter",
     "ResidencyPolicy",
     "TaskContextRequirementProvider",
+    "CONTEXT_COMPRESSION_APPLY_OPERATION",
+    "CONTEXT_COMPRESSION_DECISION_TYPE",
+    "stable_context_compression_id",
+    "stable_memory_extraction_id",
 ]

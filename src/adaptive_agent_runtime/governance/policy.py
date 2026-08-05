@@ -76,6 +76,17 @@ def default_governance_policy() -> GovernancePolicy:
                 priority=100,
             ),
             GovernanceRule(
+                rule_id="allow.low_risk.tool_selection",
+                description=(
+                    "Allow reversible binding to a Runtime-filtered Tool Provider."
+                ),
+                effect=RuleEffect.ALLOW,
+                scopes=(GovernanceScope.ACTION,),
+                operations=("tool.selection.bind",),
+                risk_levels=(RiskLevel.LOW,),
+                priority=100,
+            ),
+            GovernanceRule(
                 rule_id="allow.low_risk.node_select",
                 description=(
                     "Allow selection from a Runtime-validated ready-node set."

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from datetime import datetime, timezone
 from enum import StrEnum
 from tempfile import TemporaryDirectory
@@ -18,15 +17,13 @@ from adaptive_agent_runtime import (
 )
 from adaptive_agent_runtime.context_memory import (
     ConditionalMemoryRecall,
-    ContextAssembly,
     ContextAssembler,
-    ContextCompressor,
+    ContextCompressionExecutionPolicy,
     ContextLayer,
     ContextLifecycleManager,
     ContextLifecycleRuntime,
     ContextMemoryCoordinator,
     ContextMetadata,
-    ContextRequirement,
     ContextScheduler,
     ContextSource,
     ContextUnit,
@@ -41,6 +38,7 @@ from adaptive_agent_runtime.context_memory import (
     MemoryEvidence,
     MemoryEvolutionType,
     MemoryUpdateResult,
+    MemoryExtractionExecutionPolicy,
     ResidencyPolicy,
 )
 from adaptive_agent_runtime.evaluation import (
@@ -67,31 +65,22 @@ from adaptive_agent_runtime.evaluation import (
 )
 from adaptive_agent_runtime.governance import (
     BoundGovernedOperation,
-    ConfidenceSignals,
     DecisionOutcome,
     DeterministicConfidenceEvaluator,
     DeterministicRuleEvaluator,
     GovernanceAuthorizationIssuer,
-    GovernanceCorrelation,
-    GovernanceEvidence,
     GovernanceEvaluator,
     GovernanceHistory,
     GovernanceRequest,
-    GovernanceScope,
-    GovernanceTarget,
     GovernedOperationExecutor,
     HumanReviewDecision,
     InMemoryHumanReviewService,
     InMemoryAuthorizationConsumptionStore,
     MemoryGovernanceAdapter,
-    ImpactAssessment,
     OptimizationGovernanceAdapter,
     ReviewOutcome,
-    RiskLevel,
     RuntimeGovernanceEvaluator,
     StrictAuthorizationVerifier,
-    SUBJECT_FINGERPRINT_ATTRIBUTE,
-    governance_fingerprint,
     default_governance_policy,
 )
 from adaptive_agent_runtime.orchestration import (
@@ -102,6 +91,7 @@ from adaptive_agent_runtime.orchestration import (
     RecoveryExecutionPolicy,
     StrategyActionExecutor,
     TaskGraphStore,
+    GraphMutationExecutionPolicy,
 )
 from adaptive_agent_runtime.llm import (
     AutonomousAgentBackend,
@@ -111,19 +101,29 @@ from adaptive_agent_runtime.llm import (
     InferenceCorrelation,
     JudgeAssessmentDraft,
     JudgeRequest,
-    MemoryCandidateDraft,
-    MemoryExtractionRequest,
     TaskGraphDraft,
 )
-from adaptive_agent_runtime.tool_ecosystem import ToolExecutionStrategy
-
-from applications.research_agent.capabilities import (
-    CALCULATION,
-    DOCUMENT_ANALYSIS,
-    INFORMATION_RETRIEVAL,
-    build_research_tool_stack,
+from adaptive_agent_runtime.tool_ecosystem import (
+    ToolExecutionPolicy,
+    ToolExecutionStrategy,
+    ToolSelectionExecutionPolicy,
 )
+
+from applications.research_agent.capabilities import build_research_tool_stack
 from applications.research_agent.cognition import ResearchCognitiveCapabilities
+from applications.research_agent.context_compression import (
+    DeterministicCompressionProposalCapability,
+    ResearchContextCompressionDecisionHandler,
+)
+from applications.research_agent.graph_mutation import (
+    ResearchGraphMutationDecisionHandler,
+)
+from applications.research_agent.memory_extraction import (
+    ResearchMemoryExtractionDecisionHandler,
+)
+from applications.research_agent.ready_node_selection import (
+    LLMReadyTaskNodeSelector,
+)
 from applications.research_agent.report import (
     GovernanceRecord,
     ResearchReport,
@@ -142,13 +142,17 @@ from applications.research_agent.root_cause import (
     ResearchRootCauseDecisionHandler,
     ResearchRootCauseRecoveryBridge,
 )
+from applications.research_agent.tool_selection import (
+    ResearchToolSelectionDecisionHandler,
+)
+from applications.research_agent.tool_invocation import (
+    ResearchToolInvocationDecisionHandler,
+)
 from applications.research_agent.prompts import CHINESE_OUTPUT_INSTRUCTION
 from applications.research_agent.strategies import (
-    DeterministicContextCompressor,
     DeterministicRiskAgent,
     GovernedRecordingToolExecutor,
     GovernedContextLifecycleExecutor,
-    GovernedToolIntentExecutor,
     ReportStrategy,
     ResearchStrategy,
     ResearchGraphMutationApplier,
@@ -157,8 +161,6 @@ from applications.research_agent.strategies import (
     ResearchWorkspace,
     ReviewStrategy,
     LLMRiskAgent,
-    LLMContextCompressor,
-    LLMReadyTaskNodeSelector,
     build_tool_execution_strategy,
 )
 from applications.research_agent.tasks import (
@@ -237,28 +239,6 @@ class ResearchAgent:
         )
         self._context_store = InMemoryContextStore()
         self._context_archive = InMemoryContextArchive()
-        compressor: ContextCompressor
-        self._llm_context_compressor: LLMContextCompressor | None = None
-        compression_capability = self._cognitive_capabilities.context_compressor
-        if compression_capability is None:
-            compressor = DeterministicContextCompressor()
-        else:
-            compression_context = self._cognitive_capabilities.compression_context
-            if compression_context is None:
-                raise ValueError(
-                    "LLM Context Compressor requires an egress projection"
-                )
-            llm_compressor = LLMContextCompressor(
-                compression_capability,
-                compression_context,
-            )
-            self._llm_context_compressor = llm_compressor
-            compressor = llm_compressor
-        self._context_lifecycle = ContextLifecycleManager(
-            store=self._context_store,
-            archive=self._context_archive,
-            compressor=compressor,
-        )
         self._memory_store = InMemoryMemoryStore()
         self._memory_consolidator = EvidenceDrivenMemoryConsolidator(
             self._memory_store
@@ -353,6 +333,30 @@ class ResearchAgent:
             ),
         )
         workspace = ResearchWorkspace(definition)
+        configured_compressor = self._cognitive_capabilities.context_compressor
+        context_lifecycle = ContextLifecycleManager(
+            store=self._context_store,
+            archive=self._context_archive,
+            compressor=ResearchContextCompressionDecisionHandler(
+                capability=(
+                    configured_compressor
+                    or DeterministicCompressionProposalCapability()
+                ),
+                store=self._context_store,
+                execution_policy=ContextCompressionExecutionPolicy(),
+                governance=self._governance,
+                reviews=self._reviews,
+                issuer=self._issuer,
+                operation_executor=self._operation_executor,
+                trace_sink=runtime_trace_writer,
+                workspace=workspace,
+                context_projection=(
+                    self._cognitive_capabilities.compression_context
+                    if configured_compressor is not None
+                    else None
+                ),
+            ),
+        )
         context_coordinator = ContextMemoryCoordinator(
             context_store=self._context_store,
             scheduler=ContextScheduler(),
@@ -372,7 +376,7 @@ class ResearchAgent:
                     max_compressed_units=1,
                 ),
                 executor=GovernedContextLifecycleExecutor(
-                    manager=self._context_lifecycle,
+                    manager=context_lifecycle,
                     authorize=lambda request: self._authorize_with_demo_review(
                         request,
                         scenario="context_lifecycle",
@@ -400,7 +404,7 @@ class ResearchAgent:
             ),
             residency_policy=ResidencyPolicy.PINNED,
         )
-        await self._context_lifecycle.add(goal_context)
+        await context_lifecycle.add(goal_context)
         workspace.context_units.append(goal_context)
         workspace.trace_batches.append(
             context_trace.context_unit(goal_context, kind="context.research_goal")
@@ -418,11 +422,29 @@ class ResearchAgent:
             operation_executor=self._operation_executor,
             workspace=workspace,
         )
+        tool_selection_handler = (
+            ResearchToolSelectionDecisionHandler(
+                capability=self._cognitive_capabilities.tool_selector,
+                resolver=self._tools.resolver,
+                execution_policy=ToolSelectionExecutionPolicy(),
+                governance=self._governance,
+                reviews=self._reviews,
+                issuer=self._issuer,
+                operation_executor=self._operation_executor,
+                trace_sink=runtime_trace_writer,
+                workspace=workspace,
+            )
+            if self._cognitive_capabilities.tool_selector is not None
+            else None
+        )
         tool_strategy: ToolExecutionStrategy = build_tool_execution_strategy(
             workspace=workspace,
             executor=governed_executor,
             resolver=self._tools.resolver,
-            selector=self._tools.selector,
+            selector=(
+                self._tools.selector if tool_selection_handler is None else None
+            ),
+            selection_handler=tool_selection_handler,
             timeout_seconds=(
                 300.0
                 if self._information_mode
@@ -433,33 +455,34 @@ class ResearchAgent:
         research_strategy = ResearchStrategy(
             tool_strategy=tool_strategy,
             workspace=workspace,
-            lifecycle=self._context_lifecycle,
+            lifecycle=context_lifecycle,
             coordinator=context_coordinator,
             context_trace=context_trace,
             reasoner=self._cognitive_capabilities.reasoner,
             mutation_planner=self._cognitive_capabilities.mutation_planner,
-            mutation_context=self._cognitive_capabilities.mutation_context,
-            authorize_mutation=(
-                (
-                    lambda request: self._authorize_with_demo_review(
-                        request,
-                        scenario="graph_mutation",
-                    )
-                )
-                if self._cognitive_capabilities.mutation_planner is not None
-                else None
-            ),
-            tool_intent_executor=(
-                GovernedToolIntentExecutor(
+            tool_invocation_handler=(
+                ResearchToolInvocationDecisionHandler(
                     resolver=self._tools.resolver,
-                    selector=self._tools.selector,
-                    executor=governed_executor,
+                    selector=(
+                        self._tools.selector
+                        if tool_selection_handler is None
+                        else None
+                    ),
+                    selection_handler=tool_selection_handler,
+                    executor=self._tools.executor,
+                    governance=self._governance,
+                    reviews=self._reviews,
+                    issuer=self._issuer,
+                    operation_executor=self._operation_executor,
+                    trace_sink=runtime_trace_writer,
                     workspace=workspace,
-                    timeout_seconds=(
-                        300.0
-                        if self._information_mode
-                        is ResearchInformationMode.LLM_RESEARCH
-                        else 2.0
+                    execution_policy=ToolExecutionPolicy(
+                        timeout_seconds=(
+                            300.0
+                            if self._information_mode
+                            is ResearchInformationMode.LLM_RESEARCH
+                            else 2.0
+                        )
                     ),
                 )
                 if self._cognitive_capabilities.reasoner_tool_intent_limit
@@ -472,7 +495,7 @@ class ResearchAgent:
         report_strategy = ReportStrategy(
             tool_strategy=tool_strategy,
             workspace=workspace,
-            lifecycle=self._context_lifecycle,
+            lifecycle=context_lifecycle,
             coordinator=context_coordinator,
             context_trace=context_trace,
             llm_generator=self._cognitive_capabilities.report_generator,
@@ -500,7 +523,7 @@ class ResearchAgent:
             review_strategy = ReviewStrategy(
                 isolated_executor=isolated_executor,
                 workspace=workspace,
-                lifecycle=self._context_lifecycle,
+                lifecycle=context_lifecycle,
                 coordinator=context_coordinator,
                 context_trace=context_trace,
             )
@@ -509,15 +532,33 @@ class ResearchAgent:
                 LLMReadyTaskNodeSelector(
                     capability=action_planner,
                     workspace=workspace,
+                    governance=self._governance,
+                    reviews=self._reviews,
+                    issuer=self._issuer,
                     operation_executor=self._operation_executor,
-                    authorize=lambda request: self._authorize_with_demo_review(
-                        request,
-                        scenario="action_proposal",
-                    ),
+                    trace_sink=runtime_trace_writer,
                 )
                 if action_planner is not None
                 else None
             )
+            mutation_decision_handler = None
+            if self._cognitive_capabilities.mutation_planner is not None:
+                mutation_context = self._cognitive_capabilities.mutation_context
+                if mutation_context is None:
+                    raise RuntimeError(
+                        "Graph Mutation Decision requires Context projection"
+                    )
+                mutation_decision_handler = ResearchGraphMutationDecisionHandler(
+                    capability=self._cognitive_capabilities.mutation_planner,
+                    context_projection=mutation_context,
+                    execution_policy=GraphMutationExecutionPolicy(),
+                    governance=self._governance,
+                    reviews=self._reviews,
+                    issuer=self._issuer,
+                    operation_executor=self._operation_executor,
+                    trace_sink=runtime_trace_writer,
+                    workspace=workspace,
+                )
             planner = DynamicTaskGraphPlanner(
                 definition.initial_graph,
                 graph_store=graph_store,
@@ -530,6 +571,7 @@ class ResearchAgent:
                     operation_executor=self._operation_executor,
                     workspace=workspace,
                 ),
+                mutation_decision_handler=mutation_decision_handler,
                 recovery_planner=(
                     None
                     if self._cognitive_capabilities.recovery_planner is not None
@@ -590,15 +632,30 @@ class ResearchAgent:
         final_state = runtime_result.final_state
         final_graph = planner.graph_for(run_id)
 
-        await self._extract_llm_memories(
-            workspace=workspace,
-            run_id=run_id,
-            task_id=agent_task.task_id,
-            context_trace=context_trace,
-        )
-        if self._llm_context_compressor is not None:
-            workspace.llm_context_packages.extend(
-                self._llm_context_compressor.take_packages(run_id)
+        memory_extractor = self._cognitive_capabilities.memory_extractor
+        if memory_extractor is not None:
+            extraction_context = self._cognitive_capabilities.extraction_context
+            if extraction_context is None:
+                raise RuntimeError(
+                    "Memory Extraction Decision requires Context projection"
+                )
+            await ResearchMemoryExtractionDecisionHandler(
+                capability=memory_extractor,
+                context_projection=extraction_context,
+                memory_store=self._memory_store,
+                consolidator=self._memory_consolidator,
+                execution_policy=MemoryExtractionExecutionPolicy(),
+                governance=self._governance,
+                reviews=self._reviews,
+                issuer=self._issuer,
+                operation_executor=self._operation_executor,
+                trace_sink=runtime_trace_writer,
+                workspace=workspace,
+            ).extract(
+                run_id=run_id,
+                task_id=agent_task.task_id,
+                state_revision=final_state.revision,
+                context_trace=context_trace,
             )
         runtime_entries = runtime_trace_sink.entries_for(run_id)
         tool_entries = tuple(
@@ -723,229 +780,6 @@ class ResearchAgent:
             llm_tool_intents=tuple(workspace.llm_tool_intents),
             root_cause_assessments=root_cause_assessments,
             evaluation_history_runs=history_runs,
-        )
-
-    async def _extract_llm_memories(
-        self,
-        *,
-        workspace: ResearchWorkspace,
-        run_id: UUID,
-        task_id: UUID,
-        context_trace: ContextMemoryTraceAdapter,
-    ) -> None:
-        extractor = self._cognitive_capabilities.memory_extractor
-        if extractor is None:
-            return
-        successful = tuple(
-            observation
-            for observation in workspace.tool_observations
-            if observation.succeeded
-        )
-        if not successful:
-            return
-        evidence = tuple(
-            EvidenceReference(
-                reference_id=f"tool:{item.invocation_id}",
-                kind="tool.observation",
-                summary=(
-                    f"Accepted output from capability '{item.capability_id}'."
-                ),
-            )
-            for item in successful
-        )
-        existing = await self._memory_store.list_all()
-        existing_by_reference = {
-            str(memory.memory_id): memory for memory in existing
-        }
-        projection = self._cognitive_capabilities.extraction_context
-        if projection is None:
-            raise RuntimeError(
-                "Memory Extraction requires a Context egress projection"
-            )
-        successful_ids = {
-            str(observation.invocation_id) for observation in successful
-        }
-        projected_units: list[ContextUnit] = []
-        seen_references: set[str] = set()
-        for unit in workspace.context_units:
-            if unit.metadata.source is not ContextSource.OBSERVATION:
-                continue
-            content = unit.content
-            if not isinstance(content, Mapping):
-                continue
-            metadata = content.get("metadata")
-            tool = metadata.get("tool") if isinstance(metadata, Mapping) else None
-            invocation_id = (
-                tool.get("invocation_id") if isinstance(tool, Mapping) else None
-            )
-            if not isinstance(invocation_id, str):
-                continue
-            if invocation_id not in successful_ids:
-                continue
-            reference = unit.metadata.source_reference or str(unit.context_id)
-            if reference in seen_references:
-                continue
-            seen_references.add(reference)
-            projected_units.append(unit)
-        for assembly in workspace.context_assemblies:
-            for unit in assembly.units:
-                if unit.metadata.source is not ContextSource.MEMORY_RECALL:
-                    continue
-                reference = unit.metadata.source_reference or str(unit.context_id)
-                if reference in seen_references:
-                    continue
-                seen_references.add(reference)
-                projected_units.append(unit)
-        if not projected_units:
-            raise RuntimeError("Memory Extraction has no Runtime Context evidence")
-        working = tuple(
-            unit
-            for unit in projected_units
-            if unit.metadata.layer is ContextLayer.WORKING
-        )
-        task_units = tuple(
-            unit
-            for unit in projected_units
-            if unit.metadata.layer is ContextLayer.TASK
-        )
-        semantic = tuple(
-            unit
-            for unit in projected_units
-            if unit.metadata.layer is ContextLayer.SEMANTIC
-        )
-        ordered_units = (*working, *task_units, *semantic)
-        context_tokens = sum(
-            unit.metadata.estimated_tokens for unit in ordered_units
-        )
-        extraction_assembly = ContextAssembly(
-            requirement=ContextRequirement(
-                run_id=run_id,
-                task_id=task_id,
-                goal=(
-                    "Extract evidence-bound Memory Candidates from approved "
-                    "Runtime Context."
-                ),
-                max_units=len(ordered_units),
-                max_tokens=context_tokens,
-            ),
-            units=ordered_units,
-            working_context=working,
-            task_context=task_units,
-            semantic_context=semantic,
-            used_tokens=context_tokens,
-        )
-        package = projection.project(extraction_assembly)
-        workspace.llm_context_packages.append(package)
-        observation_context_ids = tuple(
-            str(block.context_id)
-            for block in package.blocks
-            if block.source is ContextSource.OBSERVATION
-        )
-        memory_context_ids = tuple(
-            str(block.context_id)
-            for block in package.blocks
-            if block.source is ContextSource.MEMORY_RECALL
-        )
-        turn = await extractor.extract(
-            MemoryExtractionRequest(
-                observations={
-                    "context_package": package.model_dump(mode="json"),
-                    "observation_context_ids": list(observation_context_ids),
-                },
-                evidence_catalog=evidence,
-                existing_memories={
-                    "memory_context_ids": list(memory_context_ids),
-                    "memory_reference_ids": list(existing_by_reference),
-                },
-                existing_memory_reference_ids=tuple(existing_by_reference),
-            ),
-            invocation=CapabilityInvocationMetadata(
-                correlation=InferenceCorrelation(
-                    run_id=run_id,
-                    task_id=task_id,
-                    action_id=uuid4(),
-                ),
-                trace_attributes={"operation": "memory.extract"},
-            ),
-        )
-        if turn.kind is CapabilityTurnKind.TOOL_INTENT:
-            raise RuntimeError("Memory Extractor returned ToolIntent to Runtime")
-        if turn.result is None:
-            raise RuntimeError("Memory Extractor returned no candidates")
-        for draft in turn.result:
-            await self._apply_memory_draft(
-                draft=draft,
-                evidence_catalog={item.reference_id for item in evidence},
-                existing_by_reference=existing_by_reference,
-                workspace=workspace,
-                run_id=run_id,
-                task_id=task_id,
-                context_trace=context_trace,
-            )
-
-    async def _apply_memory_draft(
-        self,
-        *,
-        draft: MemoryCandidateDraft,
-        evidence_catalog: set[str],
-        existing_by_reference: Mapping[str, object],
-        workspace: ResearchWorkspace,
-        run_id: UUID,
-        task_id: UUID,
-        context_trace: ContextMemoryTraceAdapter,
-    ) -> None:
-        unknown_evidence = set(draft.evidence_reference_ids) - evidence_catalog
-        if unknown_evidence:
-            raise RuntimeError("Memory draft cites unknown evidence")
-        target_memory_id = None
-        if draft.target_memory_reference is not None:
-            target = existing_by_reference.get(draft.target_memory_reference)
-            if target is None:
-                raise RuntimeError("Memory draft targets unknown Memory")
-            target_memory_id = UUID(draft.target_memory_reference)
-        candidate = MemoryCandidate(
-            memory_key=draft.memory_key,
-            content=draft.content,
-            condition=MemoryCondition(
-                facts=draft.condition.facts,
-                required_tags=draft.condition.required_tags,
-                description=draft.condition.description,
-            ),
-            evidence=tuple(
-                MemoryEvidence(
-                    source_reference=reference_id,
-                    note="LLM-extracted candidate cites an accepted Tool observation.",
-                    weight=draft.confidence,
-                )
-                for reference_id in draft.evidence_reference_ids
-            ),
-            confidence=draft.confidence,
-            evolution=MemoryEvolutionType(draft.evolution.value),
-            target_memory_id=target_memory_id,
-        )
-        workspace.memory_candidate_drafts.append(draft)
-        governance_request = MemoryGovernanceAdapter().to_request(
-            candidate,
-            run_id=run_id,
-            task_id=task_id,
-            history=GovernanceHistory(successful_similar=5),
-        )
-        governance_record = self._authorize_with_demo_review(
-            governance_request,
-            scenario="llm_memory",
-        )
-        workspace.governance_records.append(governance_record)
-        if governance_record.authorization is None:
-            raise RuntimeError("Governance denied LLM Memory Candidate")
-        update = await self._apply_governed_memory(candidate, governance_record)
-        workspace.trace_batches.append(
-            context_trace.memory_update(
-                update,
-                correlation=EvaluationCorrelation(
-                    run_id=run_id,
-                    task_id=task_id,
-                ),
-            )
         )
 
     async def _build_task_definition(

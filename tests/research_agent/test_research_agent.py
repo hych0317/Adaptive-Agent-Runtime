@@ -89,7 +89,6 @@ from applications.research_agent.report import ReportSection, ResearchReport
 from applications.research_agent.web import build_research_view
 from applications.research_agent.tasks import (
     NEWS_ANALYSIS,
-    RISK_REVIEW,
     build_research_mutations_from_draft,
 )
 
@@ -1179,6 +1178,48 @@ class ResearchAgentFlowTests(unittest.IsolatedAsyncioTestCase):
             mutation_invocation.trace_attributes["operation"],
             "graph.mutate.propose",
         )
+        consolidated_records = (*action_governance, mutation_governance)
+        lifecycle_prefix = (
+            "decision.requested",
+            "decision.context_projected",
+            "decision.proposed",
+            "decision.validation_passed",
+            "decision.governance_requested",
+        )
+        for record in consolidated_records:
+            attributes = record.request.attributes
+            self.assertIn("decision_request_id", attributes)
+            self.assertIn("decision_effect_fingerprint", attributes)
+            request_id = attributes["decision_request_id"]
+            observed = tuple(
+                entry.event.kind
+                for entry in result.runtime_trace
+                if entry.event.kind.startswith("decision.")
+                and entry.event.payload["correlation"]["request_id"]
+                == request_id
+            )
+            review_kinds = (
+                ("decision.review_required",)
+                if record.review is not None
+                else ()
+            )
+            self.assertEqual(
+                observed,
+                (
+                    *lifecycle_prefix,
+                    *review_kinds,
+                    "decision.authorized",
+                    "decision.apply_started",
+                    "decision.applied",
+                ),
+            )
+        self.assertFalse(
+            any(
+                record.scenario == "graph_mutation_apply"
+                for record in result.governance_records
+            ),
+            "Agent mutation must apply the same governed batch, not a second path",
+        )
 
     async def test_reasoner_tool_intent_returns_through_runtime_tool_governance(
         self,
@@ -1201,16 +1242,53 @@ class ResearchAgentFlowTests(unittest.IsolatedAsyncioTestCase):
             item.reference_id for item in reasoner.requests[1].evidence
         }
         self.assertIn("tool-intent:retrieve-industry-once", followup_evidence)
-        tool_governance = tuple(
+        invocation_governance = tuple(
             item
             for item in result.governance_records
-            if item.scenario == "tool"
+            if item.scenario == "tool_invocation_decision"
             and item.request.correlation.action_id
             == record.observation.correlation.action_id
         )
-        self.assertEqual(len(tool_governance), 1)
-        self.assertEqual(tool_governance[0].final.outcome, DecisionOutcome.ALLOW)
-        self.assertIsNotNone(tool_governance[0].authorization)
+        self.assertEqual(len(invocation_governance), 1)
+        governance = invocation_governance[0]
+        self.assertEqual(governance.request.operation, "tool.call")
+        self.assertEqual(governance.final.outcome, DecisionOutcome.ALLOW)
+        self.assertIsNotNone(governance.authorization)
+        self.assertIn("decision_effect_fingerprint", governance.request.attributes)
+        decision_request_id = governance.request.attributes["decision_request_id"]
+        decision_trace = tuple(
+            entry
+            for entry in result.runtime_trace
+            if entry.event.kind.startswith("decision.")
+            and entry.event.payload["correlation"]["request_id"]
+            == decision_request_id
+        )
+        self.assertEqual(
+            tuple(entry.event.kind for entry in decision_trace),
+            (
+                "decision.requested",
+                "decision.context_projected",
+                "decision.proposed",
+                "decision.validation_passed",
+                "decision.governance_requested",
+                "decision.authorized",
+                "decision.apply_started",
+                "decision.applied",
+            ),
+        )
+        projected_context = decision_trace[1].event.payload["decision"]
+        self.assertEqual(projected_context["agent_scope"], "tool_invocation")
+        self.assertEqual(projected_context["included_source_count"], 1)
+        self.assertNotIn("provider_credentials", projected_context)
+        self.assertFalse(
+            any(
+                item.scenario == "tool"
+                and item.request.correlation.action_id
+                == record.observation.correlation.action_id
+                for item in result.governance_records
+            ),
+            "ToolIntent invocation must not use the legacy manual Tool path",
+        )
         self.assertIn(
             CHINESE_OUTPUT_INSTRUCTION,
             reasoner.requests[0].constraints,
@@ -1311,6 +1389,41 @@ class ResearchAgentFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(memory_governance.request.operation, "memory.write")
         self.assertEqual(memory_governance.final.outcome, DecisionOutcome.ALLOW)
         self.assertIsNotNone(memory_governance.authorization)
+        self.assertIn(
+            "decision_effect_fingerprint",
+            memory_governance.request.attributes,
+        )
+        memory_request_id = memory_governance.request.attributes[
+            "decision_request_id"
+        ]
+        self.assertEqual(
+            tuple(
+                entry.event.kind
+                for entry in result.runtime_trace
+                if entry.event.kind.startswith("decision.")
+                and entry.event.payload["correlation"]["request_id"]
+                == memory_request_id
+            ),
+            (
+                "decision.requested",
+                "decision.context_projected",
+                "decision.proposed",
+                "decision.validation_passed",
+                "decision.governance_requested",
+                "decision.review_required",
+                "decision.authorized",
+                "decision.apply_started",
+                "decision.applied",
+            ),
+        )
+        extracted_memory = next(
+            memory
+            for memory in result.memories
+            if memory.memory_key == "research.llm_extracted_signal"
+        )
+        self.assertTrue(
+            all(item.source_reference for item in extracted_memory.evidence)
+        )
 
     async def test_adaptive_changes_consume_authorization_at_apply_point(
         self,

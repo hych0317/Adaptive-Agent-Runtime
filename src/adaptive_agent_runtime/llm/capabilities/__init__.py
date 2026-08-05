@@ -12,6 +12,7 @@ from adaptive_agent_runtime.llm.capabilities.contracts import (
     RootCauseAnalysisCapability,
     SemanticCompressionCapability,
     TaskGraphProposalCapability,
+    ToolSelectionProposalCapability,
 )
 from adaptive_agent_runtime.llm.capabilities.managed import (
     CapabilityInferenceSettings,
@@ -25,6 +26,7 @@ from adaptive_agent_runtime.llm.capabilities.managed import (
     GatewayRootCauseAnalysisCapability,
     GatewaySemanticCompressionCapability,
     GatewayTaskGraphProposalCapability,
+    GatewayToolSelectionProposalCapability,
 )
 from adaptive_agent_runtime.llm.capabilities.models import (
     ActionProposalDraft,
@@ -68,6 +70,9 @@ from adaptive_agent_runtime.llm.capabilities.models import (
     TaskGraphDraft,
     TaskNodeDraft,
     TaskPlanningRequest,
+    ToolSelectionCandidate,
+    ToolSelectionDraft,
+    ToolSelectionProposalRequest,
 )
 from adaptive_agent_runtime.llm.capabilities.validation import (
     CapabilityDraftValidator,
@@ -104,6 +109,7 @@ __all__ = [
     "GatewayRecoveryProposalCapability",
     "GatewaySemanticCompressionCapability",
     "GatewayTaskGraphProposalCapability",
+    "GatewayToolSelectionProposalCapability",
     "JudgeAssessmentDraft",
     "JudgeFindingDraft",
     "JudgeRequest",
@@ -138,4 +144,8 @@ __all__ = [
     "TaskGraphProposalCapability",
     "TaskNodeDraft",
     "TaskPlanningRequest",
+    "ToolSelectionCandidate",
+    "ToolSelectionDraft",
+    "ToolSelectionProposalCapability",
+    "ToolSelectionProposalRequest",
 ]

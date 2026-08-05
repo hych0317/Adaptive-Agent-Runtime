@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from typing import Mapping, Protocol, runtime_checkable
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import JsonValue
 
@@ -29,6 +29,15 @@ from adaptive_agent_runtime.tool_ecosystem.models import (
     ToolCorrelation,
     ToolInvocation,
     ToolObservation,
+    ToolProviderMetadata,
+    ToolSelection,
+)
+from adaptive_agent_runtime.tool_ecosystem.invocation_decision import (
+    ToolInvocationDecisionOutcome,
+    ToolInvocationProposalDraft,
+)
+from adaptive_agent_runtime.tool_ecosystem.selection_decision import (
+    ToolSelectionDecisionOutcome,
 )
 
 
@@ -42,6 +51,35 @@ class TaskCapabilityRequestProvider(RuntimeModule, Protocol):
         node: TaskNode,
         state: AgentState,
     ) -> CapabilityRequest: ...
+
+
+@runtime_checkable
+class ToolSelectionDecisionHandler(RuntimeModule, Protocol):
+    """Async semantic-selection boundary; it has no Tool execution authority."""
+
+    async def handle(
+        self,
+        *,
+        request: CapabilityRequest,
+        candidates: tuple[ToolProviderMetadata, ...],
+        node: TaskNode,
+        state: AgentState,
+        invocation_id: UUID,
+    ) -> ToolSelectionDecisionOutcome: ...
+
+
+@runtime_checkable
+class ToolInvocationDecisionHandler(RuntimeModule, Protocol):
+    """Agent intent boundary whose governed Apply owns actual invocation."""
+
+    async def handle(
+        self,
+        *,
+        proposal: ToolInvocationProposalDraft,
+        producer_id: str,
+        node: TaskNode,
+        state: AgentState,
+    ) -> ToolInvocationDecisionOutcome: ...
 
 
 class MappedTaskCapabilityRequestProvider:
@@ -124,14 +162,20 @@ class ToolExecutionStrategy:
         *,
         requests: TaskCapabilityRequestProvider,
         resolver: CapabilityCandidateResolver,
-        selector: ToolSelector,
+        selector: ToolSelector | None = None,
+        selection_handler: ToolSelectionDecisionHandler | None = None,
         executor: ToolExecutor,
         policy: ToolExecutionPolicy,
         strategy_id: str = "tool",
     ) -> None:
+        if (selector is None) == (selection_handler is None):
+            raise ValueError(
+                "exactly one of selector or selection_handler must be configured"
+            )
         self._requests = requests
         self._resolver = resolver
         self._selector = selector
+        self._selection_handler = selection_handler
         self._executor = executor
         self._policy = policy
         self.strategy_id = strategy_id
@@ -141,14 +185,31 @@ class ToolExecutionStrategy:
         node: TaskNode,
         state: AgentState,
     ) -> NodeExecutionResult:
+        invocation_id = uuid4()
         try:
             request = self._requests.request_for(node, state)
             candidates = self._resolver.candidates(request.requirement)
-            selection = self._selector.select(
-                request.requirement,
-                candidates,
-                request.selection_context,
-            )
+            selection: ToolSelection
+            if self._selection_handler is None:
+                assert self._selector is not None
+                selection = self._selector.select(
+                    request.requirement,
+                    candidates,
+                    request.selection_context,
+                )
+            else:
+                outcome = await self._selection_handler.handle(
+                    request=request,
+                    candidates=candidates,
+                    node=node,
+                    state=state,
+                    invocation_id=invocation_id,
+                )
+                if outcome.effect.invocation_id != invocation_id:
+                    raise ToolSelectionError(
+                        "selection effect belongs to another Tool invocation"
+                    )
+                selection = outcome.selection
             if selection.requirement_id != request.requirement.requirement_id:
                 raise ToolSelectionError(
                     "selector returned a mismatched requirement_id"
@@ -164,6 +225,7 @@ class ToolExecutionStrategy:
                     "selector returned a provider outside Runtime candidates"
                 )
             invocation = ToolInvocation(
+                invocation_id=invocation_id,
                 requirement_id=request.requirement.requirement_id,
                 capability_id=request.requirement.capability_id,
                 provider_id=selection.provider_id,

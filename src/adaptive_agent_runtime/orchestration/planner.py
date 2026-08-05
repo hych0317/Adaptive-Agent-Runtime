@@ -42,6 +42,9 @@ from adaptive_agent_runtime.orchestration.recovery import (
 from adaptive_agent_runtime.orchestration.recovery_decision import (
     RecoveryDecisionHandler,
 )
+from adaptive_agent_runtime.orchestration.mutation_decision import (
+    GraphMutationDecisionHandler,
+)
 from adaptive_agent_runtime.orchestration.selection import (
     FirstReadyTaskNodeSelector,
 )
@@ -63,6 +66,7 @@ class DynamicTaskGraphPlanner:
         recovery_planner: FailureDrivenReplanner | None = None,
         recovery_applier: RecoveryPlanApplier | None = None,
         recovery_decision_handler: RecoveryDecisionHandler | None = None,
+        mutation_decision_handler: GraphMutationDecisionHandler | None = None,
     ) -> None:
         if any(
             node.status is not TaskNodeStatus.PENDING
@@ -85,6 +89,7 @@ class DynamicTaskGraphPlanner:
         self._recovery_planner = recovery_planner
         self._recovery_applier = recovery_applier
         self._recovery_decision_handler = recovery_decision_handler
+        self._mutation_decision_handler = mutation_decision_handler
         self._graphs: dict[UUID, DynamicTaskGraph] = {}
         self._in_flight: defaultdict[UUID, dict[UUID, UUID]] = defaultdict(dict)
         self._processed_actions: defaultdict[UUID, set[UUID]] = defaultdict(set)
@@ -285,6 +290,23 @@ class DynamicTaskGraphPlanner:
                             state=state,
                             source_node_id=node_id,
                         )
+                if self._mutation_decision_handler is not None:
+                    outcome = await self._mutation_decision_handler.handle(
+                        graph=updated,
+                        state=state,
+                        source_node_id=node_id,
+                        observation=observation,
+                    )
+                    if outcome is not None:
+                        if outcome.graph.graph_id != updated.graph_id:
+                            raise OrchestrationStateError(
+                                "Graph Mutation Decision replaced graph identity"
+                            )
+                        if outcome.graph.version <= updated.version:
+                            raise OrchestrationStateError(
+                                "Graph Mutation Decision did not advance graph version"
+                            )
+                        updated = outcome.graph
             except Exception as exc:
                 detail = str(exc) or exc.__class__.__name__
                 mutation_failure = Observation.failed(

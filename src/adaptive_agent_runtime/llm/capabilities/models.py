@@ -219,6 +219,63 @@ class ActionProposalDraft(LLMModel):
         return self
 
 
+class ToolSelectionCandidate(LLMModel):
+    """Safe Provider projection with no registry handle or credentials."""
+
+    candidate_ref: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    capability_id: str = Field(min_length=1)
+    tags: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_tags(self) -> ToolSelectionCandidate:
+        _ensure_unique_strings(self.tags, "Tool selection candidate tags")
+        return self
+
+
+class ToolSelectionProposalRequest(LLMModel):
+    """Isolated semantic input over a Runtime-filtered candidate set."""
+
+    task: str = Field(min_length=1)
+    node_goal: str = Field(min_length=1)
+    capability_id: str = Field(min_length=1)
+    preferred_tags: tuple[str, ...] = ()
+    context_tags: tuple[str, ...] = ()
+    candidates: tuple[ToolSelectionCandidate, ...] = Field(min_length=1)
+    evidence: tuple[EvidenceReference, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_request(self) -> ToolSelectionProposalRequest:
+        _ensure_unique_strings(self.preferred_tags, "preferred Tool tags")
+        _ensure_unique_strings(self.context_tags, "Tool selection context tags")
+        _ensure_unique_strings(
+            tuple(item.candidate_ref for item in self.candidates),
+            "Tool selection candidate references",
+        )
+        if any(item.capability_id != self.capability_id for item in self.candidates):
+            raise ValueError("Tool selection candidates must share the requested capability")
+        _ensure_unique_references(self.evidence)
+        return self
+
+
+class ToolSelectionDraft(LLMModel):
+    """A Provider preference proposal with no Tool invocation authority."""
+
+    selected_candidate_ref: str = Field(min_length=1)
+    rationale: str = Field(min_length=1)
+    evidence_reference_ids: tuple[str, ...] = ()
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_draft(self) -> ToolSelectionDraft:
+        _ensure_unique_strings(
+            self.evidence_reference_ids,
+            "Tool selection evidence references",
+        )
+        return self
+
+
 class GraphMutationOperationKind(StrEnum):
     ADD_NODE = "add_node"
     ADD_DEPENDENCY = "add_dependency"

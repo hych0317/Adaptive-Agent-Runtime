@@ -33,6 +33,7 @@ from adaptive_agent_runtime.llm import (
     GatewayRootCauseAnalysisCapability,
     GatewaySemanticCompressionCapability,
     GatewayTaskGraphProposalCapability,
+    GatewayToolSelectionProposalCapability,
     GenerationRequest,
     GraphMutationProposalCapability,
     GraphMutationProposalRequest,
@@ -67,6 +68,9 @@ from adaptive_agent_runtime.llm import (
     ToolIntentDraft,
     ToolIntentMode,
     ToolSpecification,
+    ToolSelectionCandidate,
+    ToolSelectionProposalCapability,
+    ToolSelectionProposalRequest,
 )
 
 
@@ -156,6 +160,51 @@ def gateway_with(
 
 
 class ManagedCapabilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tool_selection_completes_through_managed_gateway(self) -> None:
+        backend = CapabilityResponseBackend(
+            {
+                "tool_selection_proposal": {
+                    "selected_candidate_ref": "candidate:b",
+                    "rationale": "Provider B best matches the semantic request.",
+                    "evidence_reference_ids": [],
+                    "confidence": 0.9,
+                }
+            }
+        )
+        capability = GatewayToolSelectionProposalCapability(
+            gateway=gateway_with(backend),
+            draft_validator=CapabilityDraftValidator(),
+        )
+
+        turn = await capability.propose_tool_selection(
+            ToolSelectionProposalRequest(
+                task="Research Acme",
+                node_goal="Retrieve evidence",
+                capability_id="lookup",
+                candidates=(
+                    ToolSelectionCandidate(
+                        candidate_ref="candidate:a",
+                        name="Provider A",
+                        description="General source",
+                        capability_id="lookup",
+                    ),
+                    ToolSelectionCandidate(
+                        candidate_ref="candidate:b",
+                        name="Provider B",
+                        description="Specialized source",
+                        capability_id="lookup",
+                    ),
+                ),
+            )
+        )
+
+        self.assertEqual(turn.kind, CapabilityTurnKind.COMPLETED)
+        self.assertIsInstance(capability, ToolSelectionProposalCapability)
+        self.assertEqual(
+            turn.result.selected_candidate_ref if turn.result is not None else None,
+            "candidate:b",
+        )
+
     async def test_root_cause_analysis_completes_through_managed_gateway(
         self,
     ) -> None:

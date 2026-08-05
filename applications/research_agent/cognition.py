@@ -24,6 +24,7 @@ from adaptive_agent_runtime.llm import (
     RootCauseAnalysisCapability,
     SemanticCompressionCapability,
     TaskGraphProposalCapability,
+    ToolSelectionProposalCapability,
 )
 
 
@@ -77,6 +78,7 @@ class ResearchCognitiveCapabilities:
     mutation_planner: GraphMutationProposalCapability | None = None
     recovery_planner: RecoveryProposalCapability | None = None
     root_cause_analyzer: RootCauseAnalysisCapability | None = None
+    tool_selector: ToolSelectionProposalCapability | None = None
     reasoner: ReasoningCapability | None = None
     context_compressor: SemanticCompressionCapability | None = None
     memory_extractor: MemoryExtractionCapability | None = None

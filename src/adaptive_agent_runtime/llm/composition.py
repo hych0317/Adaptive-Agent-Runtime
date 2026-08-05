@@ -20,6 +20,7 @@ from adaptive_agent_runtime.llm.capabilities.managed import (
     GatewayRootCauseAnalysisCapability,
     GatewaySemanticCompressionCapability,
     GatewayTaskGraphProposalCapability,
+    GatewayToolSelectionProposalCapability,
 )
 from adaptive_agent_runtime.llm.capabilities.validation import (
     CapabilityDraftValidator,
@@ -52,6 +53,7 @@ class ManagedCognitiveCapabilitySet:
     mutation_planner: GatewayGraphMutationProposalCapability
     recovery_planner: GatewayRecoveryProposalCapability
     root_cause_analyzer: GatewayRootCauseAnalysisCapability
+    tool_selector: GatewayToolSelectionProposalCapability
     generator: GatewayArtifactGenerationCapability
     judge: GatewayEvidenceJudgeCapability
     compressor: GatewaySemanticCompressionCapability
@@ -103,6 +105,7 @@ def compose_managed_capabilities(
         "graph_mutation_proposal",
         "recovery_proposal",
         "root_cause_analysis",
+        "tool_selection_proposal",
     }
     unknown = set(configured) - known
     if unknown:
@@ -146,6 +149,11 @@ def compose_managed_capabilities(
             gateway=gateway,
             draft_validator=validator,
             settings=configured.get("root_cause_analysis"),
+        ),
+        tool_selector=GatewayToolSelectionProposalCapability(
+            gateway=gateway,
+            draft_validator=validator,
+            settings=configured.get("tool_selection_proposal"),
         ),
         judge=GatewayEvidenceJudgeCapability(
             gateway=gateway,

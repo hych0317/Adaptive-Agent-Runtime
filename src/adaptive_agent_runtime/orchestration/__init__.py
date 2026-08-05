@@ -29,6 +29,16 @@ from adaptive_agent_runtime.orchestration.models import (
     TaskNode,
     TaskNodeStatus,
 )
+from adaptive_agent_runtime.orchestration.mutation_decision import (
+    GRAPH_MUTATION_APPLY_OPERATION,
+    GRAPH_MUTATION_DECISION_TYPE,
+    GraphMutationDecisionHandler,
+    GraphMutationDecisionOutcome,
+    GraphMutationDecisionPayload,
+    GraphMutationEffect,
+    GraphMutationExecutionPolicy,
+    apply_graph_mutation_effect,
+)
 from adaptive_agent_runtime.orchestration.planner import DynamicTaskGraphPlanner
 from adaptive_agent_runtime.orchestration.planning import (
     GRAPH_INITIALIZE_OPERATION,
@@ -89,6 +99,17 @@ from adaptive_agent_runtime.orchestration.scheduler import GraphScheduler
 from adaptive_agent_runtime.orchestration.selection import (
     FirstReadyTaskNodeSelector,
 )
+from adaptive_agent_runtime.orchestration.selection_decision import (
+    READY_NODE_SELECT_OPERATION,
+    READY_NODE_SELECTION_DECISION_TYPE,
+    ReadyNodeCandidateBinding,
+    ReadyNodeSelectionDecisionPayload,
+    ReadyNodeSelectionEffect,
+    ReadyNodeSelectionExecutionPolicy,
+    ready_node_candidate_set_fingerprint,
+    ready_node_selection_fingerprint,
+    stable_ready_node_selection_id,
+)
 from adaptive_agent_runtime.orchestration.store import InMemoryTaskGraphStore
 
 __all__ = [
@@ -104,6 +125,13 @@ __all__ = [
     "FailureDrivenReplanner",
     "FailureKind",
     "GraphMutation",
+    "GRAPH_MUTATION_APPLY_OPERATION",
+    "GRAPH_MUTATION_DECISION_TYPE",
+    "GraphMutationDecisionHandler",
+    "GraphMutationDecisionOutcome",
+    "GraphMutationDecisionPayload",
+    "GraphMutationEffect",
+    "GraphMutationExecutionPolicy",
     "GraphMutationApplier",
     "GraphMutationType",
     "GraphInitializationApplier",
@@ -131,6 +159,12 @@ __all__ = [
     "PlanningStrategyDescriptor",
     "PlanningStrategyRisk",
     "ReadyTaskNodeSelector",
+    "READY_NODE_SELECT_OPERATION",
+    "READY_NODE_SELECTION_DECISION_TYPE",
+    "ReadyNodeCandidateBinding",
+    "ReadyNodeSelectionDecisionPayload",
+    "ReadyNodeSelectionEffect",
+    "ReadyNodeSelectionExecutionPolicy",
     "RecoveryAction",
     "RecoveryActionType",
     "RecoveryContext",
@@ -162,4 +196,8 @@ __all__ = [
     "apply_recovery_plan",
     "stable_recovery_id",
     "apply_recovery_decision_effect",
+    "apply_graph_mutation_effect",
+    "ready_node_candidate_set_fingerprint",
+    "ready_node_selection_fingerprint",
+    "stable_ready_node_selection_id",
 ]

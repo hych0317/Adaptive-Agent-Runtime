@@ -40,7 +40,21 @@ from adaptive_agent_runtime.tool_ecosystem.integration import (
     TOOL_OBSERVATION_METADATA_KEY,
     TaskCapabilityRequestProvider,
     ToolExecutionStrategy,
+    ToolInvocationDecisionHandler,
     ToolResultObservationAdapter,
+    ToolSelectionDecisionHandler,
+)
+from adaptive_agent_runtime.tool_ecosystem.invocation_decision import (
+    TOOL_INVOCATION_DECISION_TYPE,
+    TOOL_INVOCATION_INPUT_SOURCE_TYPE,
+    TOOL_INVOCATION_OPERATION,
+    ToolInvocationDecisionOutcome,
+    ToolInvocationDecisionPayload,
+    ToolInvocationEffect,
+    ToolInvocationProposalDraft,
+    stable_tool_invocation_decision_id,
+    tool_invocation_candidate_set_fingerprint,
+    tool_invocation_fingerprint,
 )
 from adaptive_agent_runtime.tool_ecosystem.models import (
     Capability,
@@ -65,6 +79,19 @@ from adaptive_agent_runtime.tool_ecosystem.models import (
 )
 from adaptive_agent_runtime.tool_ecosystem.registry import InMemoryToolRegistry
 from adaptive_agent_runtime.tool_ecosystem.selector import DeterministicToolSelector
+from adaptive_agent_runtime.tool_ecosystem.selection_decision import (
+    TOOL_SELECTION_BIND_OPERATION,
+    TOOL_SELECTION_DECISION_TYPE,
+    ToolCandidateBinding,
+    ToolSelectionDecisionOutcome,
+    ToolSelectionDecisionPayload,
+    ToolSelectionEffect,
+    ToolSelectionExecutionPolicy,
+    candidate_set_fingerprint,
+    eligible_tool_candidate_bindings,
+    stable_tool_selection_id,
+    tool_selection_fingerprint,
+)
 
 __all__ = [
     "Capability",
@@ -103,6 +130,11 @@ __all__ = [
     "ToolExecutor",
     "ToolIntegrationError",
     "ToolInvocation",
+    "ToolInvocationDecisionHandler",
+    "ToolInvocationDecisionOutcome",
+    "ToolInvocationDecisionPayload",
+    "ToolInvocationEffect",
+    "ToolInvocationProposalDraft",
     "ToolCorrelation",
     "ToolObservation",
     "ToolProvider",
@@ -111,6 +143,12 @@ __all__ = [
     "ToolRegistry",
     "ToolResultObservationAdapter",
     "ToolSelection",
+    "ToolCandidateBinding",
+    "ToolSelectionDecisionHandler",
+    "ToolSelectionDecisionOutcome",
+    "ToolSelectionDecisionPayload",
+    "ToolSelectionEffect",
+    "ToolSelectionExecutionPolicy",
     "ToolSelectionContext",
     "ToolSelectionError",
     "ToolSelector",
@@ -118,4 +156,16 @@ __all__ = [
     "ToolTraceEvent",
     "ToolTraceEventKind",
     "ToolTraceSink",
+    "TOOL_SELECTION_BIND_OPERATION",
+    "TOOL_SELECTION_DECISION_TYPE",
+    "TOOL_INVOCATION_DECISION_TYPE",
+    "TOOL_INVOCATION_INPUT_SOURCE_TYPE",
+    "TOOL_INVOCATION_OPERATION",
+    "candidate_set_fingerprint",
+    "eligible_tool_candidate_bindings",
+    "stable_tool_selection_id",
+    "stable_tool_invocation_decision_id",
+    "tool_invocation_candidate_set_fingerprint",
+    "tool_invocation_fingerprint",
+    "tool_selection_fingerprint",
 ]

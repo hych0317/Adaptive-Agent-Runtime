@@ -48,6 +48,7 @@ class ResearchLLMCapability(StrEnum):
     GENERATION = "generation"
     JUDGE = "judge"
     ROOT_CAUSE = "root_cause"
+    TOOL_SELECTION = "tool_selection"
     COMPRESSION = "compression"
     EXTRACTION = "extraction"
 
@@ -63,6 +64,7 @@ _MANAGED_CAPABILITY_IDS = {
     ResearchLLMCapability.GENERATION: ("artifact_generation",),
     ResearchLLMCapability.JUDGE: ("evidence_judge",),
     ResearchLLMCapability.ROOT_CAUSE: ("root_cause_analysis",),
+    ResearchLLMCapability.TOOL_SELECTION: ("tool_selection_proposal",),
     ResearchLLMCapability.COMPRESSION: ("semantic_compression",),
     ResearchLLMCapability.EXTRACTION: ("memory_extraction",),
 }
@@ -249,6 +251,7 @@ def build_research_llm_deployment(
             "recovery_proposal",
             "semantic_compression",
             "memory_extraction",
+            "tool_selection_proposal",
         )
     }
     if config.reasoner_tool_intent_limit:
@@ -363,6 +366,11 @@ def build_research_llm_deployment(
         root_cause_analyzer=(
             managed.root_cause_analyzer
             if ResearchLLMCapability.ROOT_CAUSE in enabled
+            else None
+        ),
+        tool_selector=(
+            managed.tool_selector
+            if ResearchLLMCapability.TOOL_SELECTION in enabled
             else None
         ),
         reasoner=(

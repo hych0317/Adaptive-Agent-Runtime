@@ -32,6 +32,8 @@ from adaptive_agent_runtime.llm.capabilities.models import (
     RootCauseDraft,
     TaskGraphDraft,
     TaskPlanningRequest,
+    ToolSelectionDraft,
+    ToolSelectionProposalRequest,
 )
 from adaptive_agent_runtime.llm.capabilities.validation import (
     CapabilityDraftValidator,
@@ -267,6 +269,28 @@ class GatewayRootCauseAnalysisCapability(_GatewayCapability):
             request,
             RootCauseDraft,
             lambda result: self._draft_validator.validate_root_cause(
+                request,
+                result,
+            ),
+            eligible_tools=(),
+            invocation=invocation,
+        )
+
+
+class GatewayToolSelectionProposalCapability(_GatewayCapability):
+    module_id = "llm.capability.tool_selection_proposal.gateway"
+    capability_id = "tool_selection_proposal"
+
+    async def propose_tool_selection(
+        self,
+        request: ToolSelectionProposalRequest,
+        *,
+        invocation: CapabilityInvocationMetadata | None = None,
+    ) -> CapabilityTurnResult[ToolSelectionDraft]:
+        return await self._execute_model(
+            request,
+            ToolSelectionDraft,
+            lambda result: self._draft_validator.validate_tool_selection(
                 request,
                 result,
             ),
