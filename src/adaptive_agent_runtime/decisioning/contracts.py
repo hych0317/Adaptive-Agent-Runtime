@@ -21,6 +21,7 @@ from adaptive_agent_runtime.decisioning.models import (
     DecisionBudgetUsage,
     DecisionCheckpoint,
     DecisionGovernanceReceipt,
+    DecisionReconciliation,
     DecisionProposal,
     DecisionRequest,
     DecisionTraceEvent,
@@ -115,6 +116,12 @@ class DecisionGovernancePort(
         receipt: DecisionGovernanceReceipt,
     ) -> DecisionGovernanceResolution[ApprovalCoT]: ...
 
+    def restore_approval(
+        self,
+        decision: ValidatedDecision[RequestT, ProposalT, EffectT],
+        receipt: DecisionGovernanceReceipt,
+    ) -> ApprovalCoT: ...
+
 
 @runtime_checkable
 class DecisionApplier(
@@ -126,6 +133,18 @@ class DecisionApplier(
         decision: ValidatedDecision[RequestT, ProposalT, EffectT],
         approval: ApprovalContraT,
     ) -> DecisionApplyReceipt: ...
+
+    async def resume_apply(
+        self,
+        decision: ValidatedDecision[RequestT, ProposalT, EffectT],
+        approval: ApprovalContraT,
+    ) -> DecisionApplyReceipt: ...
+
+    async def reconcile(
+        self,
+        decision: ValidatedDecision[RequestT, ProposalT, EffectT],
+        approval: ApprovalContraT,
+    ) -> DecisionReconciliation: ...
 
 
 @runtime_checkable

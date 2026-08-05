@@ -95,6 +95,8 @@ class DynamicTaskGraphPlanner:
         self._processed_actions: defaultdict[UUID, set[UUID]] = defaultdict(set)
         self._recovery_attempts: defaultdict[UUID, dict[UUID, int]] = defaultdict(dict)
         self._recovery_records: defaultdict[UUID, list[RecoveryRecord]] = defaultdict(list)
+        self._checkpoint_revisions: defaultdict[UUID, int] = defaultdict(int)
+        self._last_effect_fingerprints: dict[UUID, str | None] = {}
 
     async def plan(self, state: AgentState) -> PlanDecision:
         graph = await self._load_graph(state)
@@ -224,6 +226,8 @@ class DynamicTaskGraphPlanner:
         self._recovery_records[state.run_id] = list(
             checkpoint.recovery_records
         )
+        self._checkpoint_revisions[state.run_id] = checkpoint.checkpoint_revision
+        self._last_effect_fingerprints[state.run_id] = checkpoint.last_effect_fingerprint
         return checkpoint.graph
 
     async def _save_checkpoint(
@@ -233,6 +237,7 @@ class DynamicTaskGraphPlanner:
     ) -> None:
         if self._graph_store is None:
             return
+        next_revision = self._checkpoint_revisions[state.run_id] + 1
         checkpoint = TaskGraphCheckpoint(
             run_id=state.run_id,
             graph=graph,
@@ -257,8 +262,60 @@ class DynamicTaskGraphPlanner:
             ),
             recovery_records=tuple(self._recovery_records[state.run_id]),
             state_revision=state.revision,
+            checkpoint_revision=next_revision,
+            last_effect_fingerprint=self._last_effect_fingerprints.get(state.run_id),
         )
         await self._graph_store.save(checkpoint)
+        self._checkpoint_revisions[state.run_id] = next_revision
+
+    async def commit_graph_effect(
+        self,
+        *,
+        state: AgentState,
+        graph: DynamicTaskGraph,
+        effect_fingerprint: str,
+        recovery_record: RecoveryRecord | None = None,
+    ) -> DynamicTaskGraph:
+        """Commit and read back the exact governed Graph effect before APPLIED."""
+
+        if recovery_record is not None:
+            node_id = recovery_record.plan.analysis.node_id
+            self._recovery_attempts[state.run_id][node_id] = (
+                recovery_record.plan.attempt_number
+            )
+            if recovery_record not in self._recovery_records[state.run_id]:
+                self._recovery_records[state.run_id].append(recovery_record)
+        self._graphs[state.run_id] = graph
+        self._last_effect_fingerprints[state.run_id] = effect_fingerprint
+        await self._save_checkpoint(state, graph)
+        if self._graph_store is None:
+            return graph
+        committed = await self._graph_store.load(state.run_id)
+        if (
+            committed is None
+            or committed.graph != graph
+            or committed.last_effect_fingerprint != effect_fingerprint
+        ):
+            raise OrchestrationStateError("governed Graph commit failed read-back")
+        return committed.graph
+
+    async def load_graph_effect(
+        self,
+        *,
+        run_id: UUID,
+        effect_fingerprint: str,
+    ) -> DynamicTaskGraph | None:
+        if self._graph_store is None:
+            if self._last_effect_fingerprints.get(run_id) == effect_fingerprint:
+                return self._graphs.get(run_id)
+            return None
+        checkpoint = await self._graph_store.load(run_id)
+        if (
+            checkpoint is None
+            or checkpoint.last_effect_fingerprint != effect_fingerprint
+        ):
+            return None
+        return checkpoint.graph
 
     async def _consume_observation(
         self,
@@ -278,6 +335,8 @@ class DynamicTaskGraphPlanner:
             )
 
         updated = graph.resolve_node(node_id, observation)
+        del self._in_flight[state.run_id][observation.action_id]
+        self._processed_actions[state.run_id].add(observation.action_id)
         if observation.succeeded:
             try:
                 for mutation in self._mutations_from(observation, node_id):
@@ -296,6 +355,7 @@ class DynamicTaskGraphPlanner:
                         state=state,
                         source_node_id=node_id,
                         observation=observation,
+                        committer=self,
                     )
                     if outcome is not None:
                         if outcome.graph.graph_id != updated.graph_id:
@@ -318,8 +378,6 @@ class DynamicTaskGraphPlanner:
                 )
                 updated = graph.resolve_node(node_id, mutation_failure)
 
-        del self._in_flight[state.run_id][observation.action_id]
-        self._processed_actions[state.run_id].add(observation.action_id)
         self._graphs[state.run_id] = updated
         return updated, node_id if not observation.succeeded else None
 
@@ -371,7 +429,7 @@ class DynamicTaskGraphPlanner:
         )
         recovered = graph
         if handler is not None:
-            outcome = await handler.handle(context)
+            outcome = await handler.handle(context, committer=self)
             recovery_plan = outcome.effect.plan
             recovered = outcome.graph
         else:
@@ -404,18 +462,17 @@ class DynamicTaskGraphPlanner:
                 raise OrchestrationStateError(
                     "applied Recovery Plan did not advance graph version"
                 )
-        self._recovery_attempts[state.run_id][node_id] = (
-            recovery_plan.attempt_number
-        )
-        self._recovery_records[state.run_id].append(
-            RecoveryRecord(
+        recovery_record = RecoveryRecord(
                 plan=recovery_plan,
                 graph_version_before=before_version,
                 graph_version_after=recovered.version,
             )
-        )
+        if handler is None:
+            self._recovery_attempts[state.run_id][node_id] = recovery_plan.attempt_number
+            self._recovery_records[state.run_id].append(recovery_record)
         self._graphs[state.run_id] = recovered
-        await self._save_checkpoint(state, recovered)
+        if handler is None:
+            await self._save_checkpoint(state, recovered)
         return recovered
 
     @staticmethod

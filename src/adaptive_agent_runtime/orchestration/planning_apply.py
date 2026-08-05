@@ -10,6 +10,7 @@ from adaptive_agent_runtime.orchestration.checkpoint import TaskGraphCheckpoint
 from adaptive_agent_runtime.orchestration.contracts import TaskGraphStore
 from adaptive_agent_runtime.orchestration.errors import OrchestrationStateError
 from adaptive_agent_runtime.orchestration.planning import PlanningGraphEffect
+from adaptive_agent_runtime.decisioning import decision_fingerprint
 
 
 class GraphInitializationApplier:
@@ -21,6 +22,17 @@ class GraphInitializationApplier:
         self._store = store
 
     async def apply(self, effect: PlanningGraphEffect) -> JsonValue:
+        return await self.commit(
+            effect,
+            effect_fingerprint=decision_fingerprint(effect),
+        )
+
+    async def commit(
+        self,
+        effect: PlanningGraphEffect,
+        *,
+        effect_fingerprint: str,
+    ) -> JsonValue:
         if effect.graph.version != 0:
             raise OrchestrationStateError("initial planning effect must be graph v0")
         existing = await self._store.load(effect.run_id)
@@ -28,6 +40,7 @@ class GraphInitializationApplier:
             run_id=effect.run_id,
             graph=effect.graph,
             state_revision=0,
+            last_effect_fingerprint=effect_fingerprint,
         )
         if existing is not None and existing != checkpoint:
             raise OrchestrationStateError(
@@ -47,6 +60,20 @@ class GraphInitializationApplier:
             "node_count": len(effect.graph.nodes),
             "source_draft_fingerprint": effect.source_draft_fingerprint,
         }
+
+    async def load_effect(
+        self,
+        *,
+        run_id: UUID,
+        effect_fingerprint: str,
+    ) -> TaskGraphCheckpoint | None:
+        checkpoint = await self._store.load(run_id)
+        if (
+            checkpoint is None
+            or checkpoint.last_effect_fingerprint != effect_fingerprint
+        ):
+            return None
+        return checkpoint
 
 
 class RequiredPreparedTaskGraphStore:

@@ -93,6 +93,9 @@ class ContextUnit(ContextMemoryModel):
     revision: int = Field(default=0, ge=0)
     core_conclusions: tuple[str, ...] = ()
     recovery_reference: ContextArchiveReference | None = None
+    last_effect_fingerprint: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
 
     @model_validator(mode="after")
     def validate_lifecycle(self) -> ContextUnit:

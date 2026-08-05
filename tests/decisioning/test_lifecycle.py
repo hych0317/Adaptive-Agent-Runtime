@@ -4,12 +4,15 @@ import unittest
 
 from adaptive_agent_runtime.decisioning import (
     DecisionBasis,
+    DecisionApplyReceipt,
     DecisionBudget,
     DecisionCheckpoint,
     DecisionCheckpointStage,
     DecisionGovernanceOutcome,
     DecisionLifecycleCoordinator,
     DecisionResultStatus,
+    DecisionReconciliation,
+    DecisionReconciliationStatus,
     DecisionTraceKind,
     InMemoryDecisionCheckpointStore,
     PolicyAgentContextBuilder,
@@ -82,6 +85,60 @@ def make_coordinator(
 
 
 class DecisionLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_committed_apply_reconciles_without_agent_recall_or_reapply(
+        self,
+    ) -> None:
+        class CrashAfterCommitApplier(FakeApplier):
+            def __init__(self) -> None:
+                super().__init__()
+                self.committed = False
+                self.reconciliations = 0
+
+            async def apply(self, decision, approval):  # type: ignore[no-untyped-def]
+                del approval
+                self.calls += 1
+                self.committed = True
+                self.effect_fingerprint = decision.normalized_effect.effect_fingerprint
+                raise KeyboardInterrupt("simulated process loss after commit")
+
+            async def reconcile(self, decision, approval):  # type: ignore[no-untyped-def]
+                del approval
+                self.reconciliations += 1
+                self.assert_same = decision.normalized_effect.effect_fingerprint
+                return DecisionReconciliation(
+                    status=DecisionReconciliationStatus.COMMITTED,
+                    reason="authoritative state contains the effect",
+                    apply_receipt=DecisionApplyReceipt(
+                        effect_fingerprint=self.effect_fingerprint,
+                        committed_state_fingerprint=decision_fingerprint(
+                            {"value": decision.normalized_effect.payload.value}
+                        ),
+                        result={"value": decision.normalized_effect.payload.value},
+                    ),
+                )
+
+        applier = CrashAfterCommitApplier()
+        coordinator, agent, _, _, _, store, _ = make_coordinator(applier=applier)
+        request = make_request()
+
+        with self.assertRaises(KeyboardInterrupt):
+            await coordinator.run(
+                request, sources=make_sources(), policy=make_policy()
+            )
+        interrupted = await store.load(request.request_id)
+        assert interrupted is not None
+        self.assertEqual(interrupted.stage, DecisionCheckpointStage.APPLYING)
+
+        completed = await coordinator.run(
+            request, sources=make_sources(), policy=make_policy()
+        )
+
+        assert completed.result is not None
+        self.assertEqual(completed.result.status, DecisionResultStatus.APPLIED)
+        self.assertEqual(agent.calls, 1)
+        self.assertEqual(applier.calls, 1)
+        self.assertEqual(applier.reconciliations, 1)
+
     async def test_fake_agent_end_to_end_lifecycle_applies_and_traces(self) -> None:
         coordinator, agent, governance, applier, _, store, trace = make_coordinator()
         request = make_request()

@@ -151,6 +151,27 @@ class ApplyLoadIsStaleStore(ContextStore):
         return await self._delegate.list_for_run(run_id)
 
 
+class CrashOnceContextStore(InMemoryContextStore):
+    """Simulate process loss after Archive commit but before resident commit."""
+
+    module_id = "test.context_store.crash_once"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.crash_on_next_save = False
+
+    async def save(
+        self,
+        unit: ContextUnit,
+        *,
+        expected_revision: int | None,
+    ) -> None:
+        if self.crash_on_next_save:
+            self.crash_on_next_save = False
+            raise KeyboardInterrupt("simulated Context commit interruption")
+        await super().save(unit, expected_revision=expected_revision)
+
+
 def context_unit(
     run_id: UUID,
     *,
@@ -198,6 +219,7 @@ class ContextCompressionDecisionTests(unittest.IsolatedAsyncioTestCase):
         return ResearchContextCompressionDecisionHandler(
             capability=agent,
             store=store or self.store,
+            archive=self.archive,
             execution_policy=ContextCompressionExecutionPolicy(
                 timeout_seconds=2.0,
                 target_token_ratio=0.5,
@@ -381,6 +403,7 @@ class ContextCompressionDecisionTests(unittest.IsolatedAsyncioTestCase):
             compressor=ResearchContextCompressionDecisionHandler(
                 capability=ToolIntentCompressionAgent(),
                 store=self.store,
+                archive=self.archive,
                 execution_policy=ContextCompressionExecutionPolicy(
                     timeout_seconds=2.0
                 ),
@@ -437,6 +460,55 @@ class ContextCompressionDecisionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.revision, 0)
         self.assertEqual(state.status, RunStatus.RUNNING)
         self.assertEqual(await memory.list_all(), ())
+
+    async def test_resume_reuses_archive_after_interrupted_context_commit(
+        self,
+    ) -> None:
+        run_id = uuid4()
+        store = CrashOnceContextStore()
+        archive = InMemoryContextArchive()
+        original = context_unit(run_id)
+        agent = FakeCompressionAgent()
+        manager = ContextLifecycleManager(
+            store=store,
+            archive=archive,
+            compressor=ResearchContextCompressionDecisionHandler(
+                capability=agent,
+                store=store,
+                archive=archive,
+                execution_policy=ContextCompressionExecutionPolicy(
+                    timeout_seconds=2.0,
+                    target_token_ratio=0.5,
+                ),
+                governance=self.governance,
+                reviews=self.reviews,
+                issuer=GovernanceAuthorizationIssuer(),
+                operation_executor=self.operation_executor,
+                trace_sink=self.trace,
+                workspace=self.workspace,
+            ),
+        )
+        await manager.add(original)
+        store.crash_on_next_save = True
+
+        with self.assertRaisesRegex(
+            KeyboardInterrupt,
+            "simulated Context commit interruption",
+        ):
+            await manager.compress(original.context_id)
+
+        self.assertEqual(await store.load(original.context_id), original)
+        self.assertEqual(archive.record_count(), 1)
+
+        compressed = await manager.compress(original.context_id)
+
+        self.assertEqual(len(agent.requests), 1)
+        self.assertEqual(archive.record_count(), 1)
+        self.assertEqual(
+            compressed.lifecycle_state,
+            ContextLifecycleState.COMPRESSED,
+        )
+        self.assertIsNotNone(compressed.last_effect_fingerprint)
 
 
 if __name__ == "__main__":

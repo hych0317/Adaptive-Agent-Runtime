@@ -13,6 +13,7 @@ from adaptive_agent_runtime.orchestration.models import (
     NodeExecutionResult,
     TaskNode,
 )
+from adaptive_agent_runtime.orchestration.recovery import RecoveryRecord
 
 
 @runtime_checkable
@@ -70,6 +71,27 @@ class TaskGraphStore(RuntimeModule, Protocol):
     async def save(self, checkpoint: TaskGraphCheckpoint) -> None: ...
 
     async def load(self, run_id: UUID) -> TaskGraphCheckpoint | None: ...
+
+
+@runtime_checkable
+class GraphDecisionCommitter(RuntimeModule, Protocol):
+    """Narrow authority used only by governed Graph Decision Apply."""
+
+    async def commit_graph_effect(
+        self,
+        *,
+        state: AgentState,
+        graph: DynamicTaskGraph,
+        effect_fingerprint: str,
+        recovery_record: RecoveryRecord | None = None,
+    ) -> DynamicTaskGraph: ...
+
+    async def load_graph_effect(
+        self,
+        *,
+        run_id: UUID,
+        effect_fingerprint: str,
+    ) -> DynamicTaskGraph | None: ...
 
 
 @runtime_checkable

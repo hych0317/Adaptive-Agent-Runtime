@@ -11,7 +11,7 @@ from typing import Iterator
 from adaptive_agent_runtime.persistence.errors import PersistenceSchemaError
 
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runtime_schema (
@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS task_graph_history (
     checkpoint_json TEXT NOT NULL,
     PRIMARY KEY (run_id, graph_version)
 );
+CREATE TABLE IF NOT EXISTS task_graph_checkpoint_journal (
+    run_id TEXT NOT NULL,
+    checkpoint_revision INTEGER NOT NULL,
+    graph_version INTEGER NOT NULL,
+    state_revision INTEGER NOT NULL,
+    checkpoint_json TEXT NOT NULL,
+    PRIMARY KEY (run_id, checkpoint_revision)
+);
 
 CREATE TABLE IF NOT EXISTS context_snapshots (
     context_id TEXT NOT NULL,
@@ -85,6 +93,10 @@ CREATE TABLE IF NOT EXISTS memory_applied_candidates (
     candidate_id TEXT PRIMARY KEY,
     memory_id TEXT NOT NULL,
     revision INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memory_applied_effects (
+    effect_fingerprint TEXT PRIMARY KEY,
+    result_json TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS governance_reviews (
@@ -150,6 +162,21 @@ CREATE INDEX IF NOT EXISTS idx_decision_checkpoints_run
 CREATE TABLE IF NOT EXISTS decision_checkpoint_current (
     request_id TEXT PRIMARY KEY,
     revision INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS application_run_manifests (
+    application_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    PRIMARY KEY (application_id, run_id)
+);
+CREATE TABLE IF NOT EXISTS workspace_artifacts (
+    run_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    artifact_type TEXT NOT NULL,
+    effect_fingerprint TEXT NOT NULL UNIQUE,
+    artifact_json TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    PRIMARY KEY (run_id, node_id, artifact_type)
 );
 """
 

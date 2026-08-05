@@ -38,22 +38,30 @@ class SQLiteTaskGraphStore:
                 (run_id,),
             ).fetchone()
             if current is not None:
-                current_version = int(current["graph_version"])
-                if version < current_version:
+                current_checkpoint = TaskGraphCheckpoint.model_validate_json(
+                    current["checkpoint_json"]
+                )
+                if checkpoint.checkpoint_revision < current_checkpoint.checkpoint_revision:
                     raise PersistenceConflictError(
                         "task graph checkpoint would move backwards"
                     )
-                if version == current_version:
+                if checkpoint.checkpoint_revision == current_checkpoint.checkpoint_revision:
                     if current["checkpoint_json"] == payload:
                         return
                     raise PersistenceConflictError(
-                        "task graph version was reused with different content"
+                        "task graph checkpoint revision was reused with different content"
                     )
             cursor.execute(
-                "INSERT INTO task_graph_history "
-                "(run_id, graph_version, state_revision, checkpoint_json) "
-                "VALUES (?, ?, ?, ?)",
-                (run_id, version, checkpoint.state_revision, payload),
+                "INSERT INTO task_graph_checkpoint_journal "
+                "(run_id, checkpoint_revision, graph_version, state_revision, checkpoint_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    checkpoint.checkpoint_revision,
+                    version,
+                    checkpoint.state_revision,
+                    payload,
+                ),
             )
             cursor.execute(
                 "INSERT INTO task_graph_checkpoints "
@@ -83,8 +91,8 @@ class SQLiteTaskGraphStore:
     ) -> tuple[TaskGraphCheckpoint, ...]:
         with self._database.reader() as cursor:
             rows = cursor.execute(
-                "SELECT checkpoint_json FROM task_graph_history "
-                "WHERE run_id = ? ORDER BY graph_version",
+                "SELECT checkpoint_json FROM task_graph_checkpoint_journal "
+                "WHERE run_id = ? ORDER BY checkpoint_revision",
                 (str(run_id),),
             ).fetchall()
         return tuple(

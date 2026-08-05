@@ -31,6 +31,10 @@ class TaskGraphCheckpoint(OrchestrationModel):
     recovery_attempts: tuple[tuple[UUID, int], ...] = ()
     recovery_records: tuple[RecoveryRecord, ...] = ()
     state_revision: int = Field(ge=0)
+    checkpoint_revision: int = Field(default=0, ge=0)
+    last_effect_fingerprint: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
 
     @model_validator(mode="after")
     def validate_cursor(self) -> TaskGraphCheckpoint:

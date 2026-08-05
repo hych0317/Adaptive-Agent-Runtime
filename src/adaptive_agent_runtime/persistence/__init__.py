@@ -33,6 +33,11 @@ from adaptive_agent_runtime.persistence.decisioning import (
 )
 from adaptive_agent_runtime.persistence.orchestration import SQLiteTaskGraphStore
 from adaptive_agent_runtime.persistence.sqlite import SQLiteDatabase
+from adaptive_agent_runtime.persistence.artifacts import (
+    SQLiteWorkspaceArtifactStore,
+    WorkspaceArtifactCommitReceipt,
+    WorkspaceArtifactCommitter,
+)
 
 
 RequestCheckpointT = TypeVar("RequestCheckpointT", bound=BaseModel)
@@ -58,6 +63,10 @@ class SQLitePersistence:
         self.evolution_store = SQLiteEvolutionStore(self.database)
         self.runtime_configuration_store = self.evolution_store
         self.replay_case_store = self.evolution_store
+        self.workspace_artifact_store = SQLiteWorkspaceArtifactStore(self.database)
+        self.workspace_artifact_committer = WorkspaceArtifactCommitter(
+            self.workspace_artifact_store
+        )
 
     def create_decision_checkpoint_store(
         self,
@@ -103,4 +112,7 @@ __all__ = [
     "SQLiteStateStore",
     "SQLiteTaskGraphStore",
     "SQLiteTraceSink",
+    "SQLiteWorkspaceArtifactStore",
+    "WorkspaceArtifactCommitReceipt",
+    "WorkspaceArtifactCommitter",
 ]

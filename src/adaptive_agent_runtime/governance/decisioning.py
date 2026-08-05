@@ -18,9 +18,12 @@ from adaptive_agent_runtime.decisioning.models import (
     DecisionApplyReceipt,
     DecisionGovernanceOutcome,
     DecisionGovernanceReceipt,
+    DecisionReconciliation,
+    DecisionReconciliationStatus,
     EffectPayloadT,
     ProposalPayloadT,
     RequestPayloadT,
+    NormalizedDecisionEffect,
     ValidatedDecision,
 )
 from adaptive_agent_runtime.governance.contracts import (
@@ -197,6 +200,15 @@ class RuntimeDecisionGovernanceAdapter(
             review_request_id=decision.review_request_id,
             reason=decision.reason,
             decided_at=decision.decided_at,
+            approval_snapshot=(
+                {
+                    "request": request.model_dump(mode="json"),
+                    "decision": decision.model_dump(mode="json"),
+                    "authorization": authorization.model_dump(mode="json"),
+                }
+                if authorization is not None
+                else None
+            ),
         )
         binding = (
             DecisionGovernanceBinding(
@@ -209,6 +221,35 @@ class RuntimeDecisionGovernanceAdapter(
         )
         return DecisionGovernanceResolution(receipt=receipt, approval=binding)
 
+    def restore_approval(
+        self,
+        decision: ValidatedDecision[
+            RequestPayloadT,
+            ProposalPayloadT,
+            EffectPayloadT,
+        ],
+        receipt: DecisionGovernanceReceipt,
+    ) -> DecisionGovernanceBinding:
+        snapshot = receipt.approval_snapshot
+        if snapshot is None:
+            raise DecisionInvariantError("Governance approval snapshot is missing")
+        request = GovernanceRequest.model_validate(snapshot.get("request"))
+        governance_decision = GovernanceDecision.model_validate(
+            snapshot.get("decision")
+        )
+        authorization = GovernanceAuthorization.model_validate(
+            snapshot.get("authorization")
+        )
+        expected = self._request_for(decision)
+        if request != expected:
+            raise DecisionInvariantError("restored Governance request is stale")
+        if (
+            governance_decision.decision_id != receipt.governance_decision_id
+            or authorization.authorization_id != receipt.authorization_id
+        ):
+            raise DecisionInvariantError("restored Governance binding identity mismatch")
+        return DecisionGovernanceBinding(request, governance_decision, authorization)
+
 
 class GovernedDecisionApplier(Generic[RequestPayloadT, ProposalPayloadT, EffectPayloadT]):
     """Apply exactly the normalized effect authorized by Governance."""
@@ -220,10 +261,18 @@ class GovernedDecisionApplier(Generic[RequestPayloadT, ProposalPayloadT, EffectP
         *,
         executor: GovernedOperationExecutor,
         apply_effect: Callable[[EffectPayloadT], Awaitable[JsonValue]],
+        apply_normalized_effect: Callable[
+            [NormalizedDecisionEffect[EffectPayloadT]], Awaitable[JsonValue]
+        ] | None = None,
+        reconcile_effect: Callable[
+            [NormalizedDecisionEffect[EffectPayloadT]], Awaitable[DecisionReconciliation]
+        ] | None = None,
         clock: Callable[[], datetime] = utc_now,
     ) -> None:
         self._executor = executor
         self._apply_effect = apply_effect
+        self._apply_normalized_effect = apply_normalized_effect
+        self._reconcile_effect = reconcile_effect
         self._clock = clock
 
     async def apply(
@@ -238,6 +287,8 @@ class GovernedDecisionApplier(Generic[RequestPayloadT, ProposalPayloadT, EffectP
         effect = decision.normalized_effect
 
         async def apply_bound_effect() -> JsonValue:
+            if self._apply_normalized_effect is not None:
+                return await self._apply_normalized_effect(effect)
             return await self._apply_effect(effect.payload)
 
         result = await self._executor.execute(
@@ -257,6 +308,72 @@ class GovernedDecisionApplier(Generic[RequestPayloadT, ProposalPayloadT, EffectP
         )
         return DecisionApplyReceipt(
             effect_fingerprint=effect.effect_fingerprint,
+            committed_state_fingerprint=governance_fingerprint(result),
             result=result,
             applied_at=self._clock(),
         )
+
+    async def resume_apply(
+        self,
+        decision: ValidatedDecision[
+            RequestPayloadT,
+            ProposalPayloadT,
+            EffectPayloadT,
+        ],
+        approval: DecisionGovernanceBinding,
+    ) -> DecisionApplyReceipt:
+        effect = decision.normalized_effect
+
+        async def apply_bound_effect() -> JsonValue:
+            if self._apply_normalized_effect is not None:
+                return await self._apply_normalized_effect(effect)
+            return await self._apply_effect(effect.payload)
+
+        result = await self._executor.resume_reserved(
+            request=approval.request,
+            decision=approval.decision,
+            authorization=approval.authorization,
+            target=BoundGovernedOperation(
+                module_id=self.module_id,
+                operation=effect.operation,
+                target=GovernanceTarget(
+                    target_type=effect.target.target_type,
+                    target_id=effect.target.target_id,
+                ),
+                subject=effect,
+                apply=apply_bound_effect,
+            ),
+        )
+        return DecisionApplyReceipt(
+            effect_fingerprint=effect.effect_fingerprint,
+            committed_state_fingerprint=governance_fingerprint(result),
+            result=result,
+            applied_at=self._clock(),
+        )
+
+    async def reconcile(
+        self,
+        decision: ValidatedDecision[
+            RequestPayloadT,
+            ProposalPayloadT,
+            EffectPayloadT,
+        ],
+        approval: DecisionGovernanceBinding,
+    ) -> DecisionReconciliation:
+        if self._reconcile_effect is None:
+            return DecisionReconciliation(
+                status=DecisionReconciliationStatus.UNKNOWN,
+                reason="the effect has no authoritative reconciliation reader",
+            )
+        reconciled = await self._reconcile_effect(decision.normalized_effect)
+        if (
+            reconciled.status is DecisionReconciliationStatus.COMMITTED
+            and reconciled.apply_receipt is not None
+        ):
+            await self._executor.reconcile_committed(
+                request=approval.request,
+                decision=approval.decision,
+                authorization=approval.authorization,
+                result=reconciled.apply_receipt.result,
+            )
+        return reconciled

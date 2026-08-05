@@ -10,6 +10,7 @@ from pydantic import Field, JsonValue, model_validator
 from adaptive_agent_runtime import AgentState, Observation, RuntimeModule
 from adaptive_agent_runtime.orchestration.graph import DynamicTaskGraph
 from adaptive_agent_runtime.orchestration.models import GraphMutation, OrchestrationModel
+from adaptive_agent_runtime.orchestration.contracts import GraphDecisionCommitter
 
 
 GRAPH_MUTATION_DECISION_TYPE = "orchestration.graph_mutation"
@@ -84,6 +85,7 @@ class GraphMutationDecisionHandler(RuntimeModule, Protocol):
         state: AgentState,
         source_node_id: UUID,
         observation: Observation,
+        committer: GraphDecisionCommitter,
     ) -> GraphMutationDecisionOutcome | None: ...
 
 

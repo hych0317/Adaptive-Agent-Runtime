@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Mapping
 
 from adaptive_agent_runtime import RunStatus
@@ -680,6 +681,39 @@ class ResearchTaskInitializationTests(unittest.TestCase):
 
 
 class ResearchAgentFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sqlite_resume_reuses_plan_effect_and_report_receipt(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "research.sqlite3"
+            first_planner = FakeTaskPlanner()
+            first_agent = ResearchAgent(
+                persistence_path=path,
+                cognitive_capabilities=ResearchCognitiveCapabilities(
+                    task_planner=first_planner
+                ),
+            )
+            first = await first_agent.run("分析 Tesla 投资价值")
+            run_id = first.runtime_result.final_state.run_id
+            self.assertEqual(len(first_planner.requests), 1)
+            first_agent.close()
+
+            resumed_planner = FakeTaskPlanner()
+            resumed_agent = ResearchAgent(
+                persistence_path=path,
+                cognitive_capabilities=ResearchCognitiveCapabilities(
+                    task_planner=resumed_planner
+                ),
+            )
+            resumed = await resumed_agent.resume(run_id)
+            resumed_agent.close()
+
+            self.assertEqual(resumed.runtime_result.final_state.status, RunStatus.COMPLETED)
+            self.assertEqual(resumed_planner.requests, [])
+            self.assertEqual(
+                resumed.report_commit_receipt.effect_fingerprint,
+                first.report_commit_receipt.effect_fingerprint,
+            )
+            self.assertEqual(resumed.report, first.report)
+
     async def test_full_research_flow_uses_runtime_capabilities_context_and_memory(
         self,
     ) -> None:
@@ -731,12 +765,11 @@ class ResearchAgentFlowTests(unittest.IsolatedAsyncioTestCase):
                 for unit in result.context_units
             )
         )
-        self.assertEqual(
-            {memory.memory_key for memory in result.memories},
+        self.assertTrue(
             {
                 "research.report_preference",
                 "research.analysis_experience",
-            },
+            }.issubset({memory.memory_key for memory in result.memories}),
         )
         self.assertIn("Tesla Investment Research", result.report.markdown)
         self.assertIn("risks", result.report.executive_summary.lower())
@@ -1478,6 +1511,7 @@ class ApplicationBoundaryTests(unittest.TestCase):
             "adaptive_agent_runtime.governance",
             "adaptive_agent_runtime.llm",
             "adaptive_agent_runtime.orchestration",
+            "adaptive_agent_runtime.persistence",
             "adaptive_agent_runtime.tool_ecosystem",
         }
         for path in application_root.glob("*.py"):

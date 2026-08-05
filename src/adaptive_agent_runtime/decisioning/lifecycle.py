@@ -39,6 +39,7 @@ from adaptive_agent_runtime.decisioning.errors import (
 )
 from adaptive_agent_runtime.decisioning.models import (
     AgentCallResult,
+    DecisionApplyReceipt,
     DecisionCheckpoint,
     DecisionCheckpointStage,
     DecisionGovernanceOutcome,
@@ -46,6 +47,7 @@ from adaptive_agent_runtime.decisioning.models import (
     DecisionRequest,
     DecisionResult,
     DecisionResultStatus,
+    DecisionReconciliationStatus,
     DecisionTraceEvent,
     DecisionTraceKind,
     DecisionValidationStatus,
@@ -131,9 +133,14 @@ class DecisionLifecycleCoordinator(
     ]:
         existing = await self._checkpoint_store.load(request.request_id)
         if existing is not None:
-            raise DecisionInvariantError(
-                "decision request already has a checkpoint; use resume_review"
+            comparable_request = request.model_copy(
+                update={"created_at": existing.request.created_at}
             )
+            if existing.request != comparable_request:
+                raise DecisionInvariantError(
+                    "decision request identity was reused with another snapshot"
+                )
+            return await self.resume(request.request_id)
         checkpoint = self._checkpoint_type(
             request_id=request.request_id,
             run_id=request.correlation.run_id,
@@ -341,10 +348,6 @@ class DecisionLifecycleCoordinator(
             raise DecisionResumeError("decision checkpoint does not exist")
         if checkpoint.stage is DecisionCheckpointStage.COMPLETED:
             return checkpoint
-        if checkpoint.stage is DecisionCheckpointStage.APPLYING:
-            raise DecisionResumeError(
-                "decision apply outcome is uncertain; authorization cannot be replayed"
-            )
         if checkpoint.stage is not DecisionCheckpointStage.REVIEW_PENDING:
             raise DecisionResumeError("decision is not waiting for Human Review")
         validated = checkpoint.validated_decision
@@ -370,6 +373,87 @@ class DecisionLifecycleCoordinator(
         ):
             return checkpoint
         return await self._handle_governance(checkpoint, resolution)
+
+    async def resume(
+        self,
+        request_id: UUID,
+    ) -> DecisionCheckpoint[
+        RequestPayloadT,
+        ProposalPayloadT,
+        EffectPayloadT,
+    ]:
+        """Resume without re-projecting context or invoking the producing Agent."""
+
+        checkpoint = await self._checkpoint_store.load(request_id)
+        if checkpoint is None:
+            raise DecisionResumeError("decision checkpoint does not exist")
+        if checkpoint.stage is DecisionCheckpointStage.COMPLETED:
+            return checkpoint
+        if checkpoint.stage is DecisionCheckpointStage.REVIEW_PENDING:
+            return await self.resume_review(request_id)
+        if checkpoint.stage in {
+            DecisionCheckpointStage.REQUESTED,
+            DecisionCheckpointStage.CONTEXT_PROJECTED,
+            DecisionCheckpointStage.PROPOSED,
+        }:
+            return await self._expire(
+                checkpoint,
+                "decision interrupted before a validated effect; Agent is not recalled",
+            )
+        validated = checkpoint.validated_decision
+        if validated is None:
+            raise DecisionResumeError("decision checkpoint has no authorized effect")
+        if checkpoint.stage is DecisionCheckpointStage.VALIDATED:
+            try:
+                resolution = await self._governance.evaluate(validated)
+            except Exception as exc:
+                return await self._fail(checkpoint, "Governance resume", exc)
+            return await self._handle_governance(checkpoint, resolution)
+        receipt = checkpoint.governance_receipt
+        if receipt is None:
+            raise DecisionResumeError("decision checkpoint has no Governance receipt")
+        if checkpoint.stage is DecisionCheckpointStage.AUTHORIZED:
+            approval = self._governance.restore_approval(validated, receipt)
+            return await self._apply(checkpoint, approval)
+        if checkpoint.stage is not DecisionCheckpointStage.APPLYING:
+            raise DecisionResumeError(
+                f"decision stage '{checkpoint.stage.value}' cannot safely resume"
+            )
+        approval = self._governance.restore_approval(validated, receipt)
+        try:
+            reconciliation = await self._applier.reconcile(validated, approval)
+        except Exception as exc:
+            return await self._fail(checkpoint, "Apply reconciliation", exc)
+        if reconciliation.status is DecisionReconciliationStatus.COMMITTED:
+            apply_receipt = reconciliation.apply_receipt
+            if apply_receipt is None:
+                raise DecisionInvariantError(
+                    "committed reconciliation has no Apply receipt"
+                )
+            return await self._complete_applied(checkpoint, apply_receipt)
+        if reconciliation.status is DecisionReconciliationStatus.EXPIRED:
+            return await self._expire(checkpoint, reconciliation.reason)
+        if reconciliation.status is DecisionReconciliationStatus.UNKNOWN:
+            return await self._complete(
+                checkpoint,
+                status=DecisionResultStatus.FAILED,
+                reason=("Apply reconciliation failed closed: " + reconciliation.reason),
+                trace_kind=DecisionTraceKind.FAILED,
+            )
+        try:
+            stale_or_expired = await self._is_stale_or_expired(checkpoint)
+        except Exception as exc:
+            return await self._fail(checkpoint, "Runtime freshness reconciliation", exc)
+        if stale_or_expired:
+            return await self._expire(
+                checkpoint,
+                "uncommitted decision became stale or expired during interruption",
+            )
+        try:
+            apply_receipt = await self._applier.resume_apply(validated, approval)
+        except Exception as exc:
+            return await self._fail(checkpoint, "Decision Apply resume", exc)
+        return await self._complete_applied(checkpoint, apply_receipt)
 
     async def _handle_governance(
         self,
@@ -487,6 +571,30 @@ class DecisionLifecycleCoordinator(
             apply_receipt.effect_fingerprint
             != validated.normalized_effect.effect_fingerprint
         ):
+            return await self._fail(
+                checkpoint,
+                "Decision apply",
+                DecisionInvariantError("Apply receipt belongs to another effect"),
+            )
+        return await self._complete_applied(checkpoint, apply_receipt)
+
+    async def _complete_applied(
+        self,
+        checkpoint: DecisionCheckpoint[
+            RequestPayloadT,
+            ProposalPayloadT,
+            EffectPayloadT,
+        ],
+        apply_receipt: DecisionApplyReceipt,
+    ) -> DecisionCheckpoint[
+        RequestPayloadT,
+        ProposalPayloadT,
+        EffectPayloadT,
+    ]:
+        validated = checkpoint.validated_decision
+        if validated is None:
+            raise DecisionInvariantError("Apply completion has no validated effect")
+        if apply_receipt.effect_fingerprint != validated.normalized_effect.effect_fingerprint:
             return await self._fail(
                 checkpoint,
                 "Decision apply",

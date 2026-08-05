@@ -145,6 +145,11 @@ class MemoryUpdateResult(ContextMemoryModel):
     candidate_id: UUID
 
 
+class MemoryBatchWrite(ContextMemoryModel):
+    memory: MemoryUnit
+    expected_revision: int | None = Field(default=None, ge=0)
+
+
 class MemoryRecallQuery(ContextMemoryModel):
     facts: ImmutableJsonObject = Field(default_factory=dict)
     tags: tuple[str, ...] = ()

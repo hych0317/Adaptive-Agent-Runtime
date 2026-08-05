@@ -22,6 +22,9 @@ from adaptive_agent_runtime.decisioning import (
     DecisionEvidenceReference,
     DecisionLifecycleCoordinator,
     DecisionRequest,
+    DecisionApplyReceipt,
+    DecisionReconciliation,
+    DecisionReconciliationStatus,
     DecisionResultStatus,
     DecisionTarget,
     InMemoryDecisionCheckpointStore,
@@ -30,6 +33,7 @@ from adaptive_agent_runtime.decisioning import (
     ProjectionSources,
     RuntimeDecisionTraceWriter,
     RuntimeDecisionValidator,
+    NormalizedDecisionEffect,
     decision_fingerprint,
 )
 from adaptive_agent_runtime.governance import (
@@ -46,6 +50,7 @@ from adaptive_agent_runtime.governance import (
     ReviewOutcome,
     ReviewRequest,
     RuntimeDecisionGovernanceAdapter,
+    governance_fingerprint,
 )
 from adaptive_agent_runtime.llm import (
     RECOVERY_INPUT_SOURCE_TYPE,
@@ -67,6 +72,9 @@ from adaptive_agent_runtime.orchestration import (
     RecoveryDecisionOutcome,
     RecoveryDecisionPayload,
     RecoveryExecutionPolicy,
+    RecoveryRecord,
+    GraphDecisionCommitter,
+    InMemoryGraphDecisionCommitter,
     RecoveryNodeBinding,
     apply_recovery_decision_effect,
     stable_recovery_id,
@@ -187,7 +195,13 @@ class ResearchRecoveryDecisionHandler(RecoveryDecisionHandler):
             ]()
         )
 
-    async def handle(self, context: RecoveryContext) -> RecoveryDecisionOutcome:
+    async def handle(
+        self,
+        context: RecoveryContext,
+        *,
+        committer: GraphDecisionCommitter | None = None,
+    ) -> RecoveryDecisionOutcome:
+        committer = committer or InMemoryGraphDecisionCommitter()
         request_id = stable_recovery_id(
             "recovery-decision-request",
             context.graph.graph_id,
@@ -368,6 +382,67 @@ class ResearchRecoveryDecisionHandler(RecoveryDecisionHandler):
                 "effect_type": effect.effect.effect_type,
             }
 
+        async def apply_normalized_effect(
+            normalized: NormalizedDecisionEffect[RecoveryDecisionEffect],
+        ) -> JsonValue:
+            nonlocal applied_graph
+            effect = normalized.payload
+            candidate = apply_recovery_decision_effect(context.graph, effect)
+            record = RecoveryRecord(
+                plan=effect.plan,
+                graph_version_before=context.graph.version,
+                graph_version_after=candidate.version,
+            )
+            applied_graph = await committer.commit_graph_effect(
+                state=context.state,
+                graph=candidate,
+                effect_fingerprint=normalized.effect_fingerprint,
+                recovery_record=record,
+            )
+            if isinstance(effect.effect, AddRecoveryNodeEffect):
+                self._workspace.register_recovery_node(
+                    effect.effect.recovery_node,
+                    context.failed_node,
+                )
+            return {
+                "graph_id": str(applied_graph.graph_id),
+                "graph_version": applied_graph.version,
+                "effect_type": effect.effect.effect_type,
+            }
+
+        async def reconcile_effect(
+            normalized: NormalizedDecisionEffect[RecoveryDecisionEffect],
+        ) -> DecisionReconciliation:
+            committed = await committer.load_graph_effect(
+                run_id=context.state.run_id,
+                effect_fingerprint=normalized.effect_fingerprint,
+            )
+            if committed is None:
+                return DecisionReconciliation(
+                    status=DecisionReconciliationStatus.NOT_COMMITTED,
+                    reason="Recovery Graph effect is absent from authoritative storage",
+                )
+            effect = normalized.payload
+            if committed.graph_id != effect.graph_id or committed.version != effect.graph_version_after:
+                return DecisionReconciliation(
+                    status=DecisionReconciliationStatus.UNKNOWN,
+                    reason="Recovery Graph read-back conflicts with the authorized effect",
+                )
+            result: JsonValue = {
+                "graph_id": str(committed.graph_id),
+                "graph_version": committed.version,
+                "effect_type": effect.effect.effect_type,
+            }
+            return DecisionReconciliation(
+                status=DecisionReconciliationStatus.COMMITTED,
+                reason="Recovery Graph effect was committed and read back",
+                apply_receipt=DecisionApplyReceipt(
+                    effect_fingerprint=normalized.effect_fingerprint,
+                    committed_state_fingerprint=governance_fingerprint(result),
+                    result=result,
+                ),
+            )
+
         coordinator = DecisionLifecycleCoordinator[
             RecoveryDecisionPayload,
             RecoveryDraft,
@@ -393,6 +468,8 @@ class ResearchRecoveryDecisionHandler(RecoveryDecisionHandler):
             applier=GovernedDecisionApplier(
                 executor=self._operation_executor,
                 apply_effect=apply_effect,
+                apply_normalized_effect=apply_normalized_effect,
+                reconcile_effect=reconcile_effect,
             ),
             checkpoint_store=self._checkpoint_store,
             checkpoint_type=DecisionCheckpoint[
@@ -424,6 +501,19 @@ class ResearchRecoveryDecisionHandler(RecoveryDecisionHandler):
             )
             recording_evaluator.review = review
             checkpoint = await coordinator.resume_review(request.request_id)
+
+        if (
+            applied_graph is None
+            and checkpoint.result is not None
+            and checkpoint.result.status is DecisionResultStatus.APPLIED
+            and checkpoint.validated_decision is not None
+        ):
+            applied_graph = await committer.load_graph_effect(
+                run_id=context.state.run_id,
+                effect_fingerprint=(
+                    checkpoint.validated_decision.normalized_effect.effect_fingerprint
+                ),
+            )
 
         if (
             checkpoint.result is None

@@ -43,6 +43,7 @@ from adaptive_agent_runtime.tool_ecosystem import (
     ToolObservation,
     ToolTraceEntry,
 )
+from adaptive_agent_runtime.persistence import WorkspaceArtifactCommitReceipt
 
 
 class ReportSection(BaseModel):
@@ -94,6 +95,7 @@ class ResearchRunResult:
     runtime_result: RunResult
     task_graph: DynamicTaskGraph
     report: ResearchReport
+    report_commit_receipt: WorkspaceArtifactCommitReceipt
     evaluation: EvaluationReport
     failure_analysis: FailureAnalysis
     optimization_proposals: tuple[OptimizationProposal, ...]

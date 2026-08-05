@@ -22,6 +22,7 @@ from adaptive_agent_runtime.context_memory.context_runtime import (
     ContextAssembler,
     ContextLifecycleRuntime,
     ContextLifecycleManager,
+    ContextCompressionCommitter,
     ContextScheduler,
     DeterministicContextLifecyclePolicy,
     DeterministicContextPressureMonitor,
@@ -80,6 +81,7 @@ from adaptive_agent_runtime.context_memory.memory_models import (
     MemoryStatus,
     MemoryUnit,
     MemoryUpdateResult,
+    MemoryBatchWrite,
 )
 from adaptive_agent_runtime.context_memory.memory_decision import (
     MEMORY_CANDIDATES_APPLY_OPERATION,
@@ -117,6 +119,7 @@ __all__ = [
     "ContextLifecycleActionExecutor",
     "ContextLifecycleDecision",
     "ContextLifecycleManager",
+    "ContextCompressionCommitter",
     "ContextLifecycleManagement",
     "ContextLifecyclePlanning",
     "ContextLifecycleResult",
@@ -173,6 +176,7 @@ __all__ = [
     "MemorySnapshotConflictError",
     "MemoryUnit",
     "MemoryUpdateResult",
+    "MemoryBatchWrite",
     "ObservationContextAdapter",
     "ResidencyPolicy",
     "TaskContextRequirementProvider",

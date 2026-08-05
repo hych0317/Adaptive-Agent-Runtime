@@ -23,6 +23,8 @@ from adaptive_agent_runtime.decisioning import (
     DecisionProducer,
     DecisionProposal,
     DecisionRequest,
+    DecisionReconciliation,
+    DecisionReconciliationStatus,
     DecisionRiskLevel,
     DecisionTarget,
     DecisionTraceEvent,
@@ -276,6 +278,14 @@ class FakeGovernance:
         self.resumes += 1
         return self._resolution(self.resume_outcome, reviewed=True)
 
+    def restore_approval(
+        self,
+        decision: ValidatedDecision[object, object, object],
+        receipt: DecisionGovernanceReceipt,
+    ) -> str:
+        del decision, receipt
+        return "approved"
+
 
 class FakeApplier:
     module_id = "test.applier"
@@ -302,8 +312,37 @@ class FakeApplier:
         self.values.append(decision.normalized_effect.payload.value)
         return DecisionApplyReceipt(
             effect_fingerprint=decision.normalized_effect.effect_fingerprint,
+            committed_state_fingerprint=decision_fingerprint(
+                {"value": decision.normalized_effect.payload.value}
+            ),
             result={"value": decision.normalized_effect.payload.value},
             applied_at=NOW,
+        )
+
+    async def resume_apply(
+        self,
+        decision: ValidatedDecision[
+            FakeRequestPayload,
+            FakeProposalPayload,
+            FakeEffectPayload,
+        ],
+        approval: str,
+    ) -> DecisionApplyReceipt:
+        return await self.apply(decision, approval)
+
+    async def reconcile(
+        self,
+        decision: ValidatedDecision[
+            FakeRequestPayload,
+            FakeProposalPayload,
+            FakeEffectPayload,
+        ],
+        approval: str,
+    ) -> DecisionReconciliation:
+        del decision, approval
+        return DecisionReconciliation(
+            status=DecisionReconciliationStatus.NOT_COMMITTED,
+            reason="fake authoritative state has no commit",
         )
 
 

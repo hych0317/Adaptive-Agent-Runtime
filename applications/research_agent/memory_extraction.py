@@ -40,6 +40,9 @@ from adaptive_agent_runtime.decisioning import (
     DecisionEvidenceReference,
     DecisionLifecycleCoordinator,
     DecisionRequest,
+    DecisionApplyReceipt,
+    DecisionReconciliation,
+    DecisionReconciliationStatus,
     DecisionResultStatus,
     DecisionTarget,
     InMemoryDecisionCheckpointStore,
@@ -48,6 +51,7 @@ from adaptive_agent_runtime.decisioning import (
     ProjectionSources,
     RuntimeDecisionTraceWriter,
     RuntimeDecisionValidator,
+    NormalizedDecisionEffect,
     decision_fingerprint,
 )
 from adaptive_agent_runtime.evaluation import ContextMemoryTraceAdapter, EvaluationCorrelation
@@ -61,6 +65,7 @@ from adaptive_agent_runtime.governance import (
     HumanReviewService,
     ReviewOutcome,
     RuntimeDecisionGovernanceAdapter,
+    governance_fingerprint,
 )
 from adaptive_agent_runtime.llm import (
     MEMORY_EXTRACTION_EVIDENCE_SOURCE_TYPE,
@@ -394,6 +399,62 @@ class ResearchMemoryExtractionDecisionHandler:
                 "memory_ids": [str(item.memory.memory_id) for item in updates],
             }
 
+        async def apply_normalized_effect(
+            normalized: NormalizedDecisionEffect[MemoryExtractionEffect],
+        ) -> JsonValue:
+            batch = await self._consolidator.consolidate_batch(
+                normalized.payload.candidates,
+                effect_fingerprint=normalized.effect_fingerprint,
+            )
+            updates.clear()
+            updates.extend(batch)
+            return {
+                "candidate_ids": [
+                    str(item.candidate_id) for item in normalized.payload.candidates
+                ],
+                "memory_ids": [str(item.memory.memory_id) for item in batch],
+            }
+
+        async def reconcile_effect(
+            normalized: NormalizedDecisionEffect[MemoryExtractionEffect],
+        ) -> DecisionReconciliation:
+            committed = await self._memory_store.load_applied_effect(
+                normalized.effect_fingerprint
+            )
+            if committed is not None:
+                result: JsonValue = {
+                    "candidate_ids": [
+                        str(item.candidate_id)
+                        for item in normalized.payload.candidates
+                    ],
+                    "memory_ids": [str(item.memory_id) for item in committed],
+                }
+                return DecisionReconciliation(
+                    status=DecisionReconciliationStatus.COMMITTED,
+                    reason="Memory batch was committed atomically and read back",
+                    apply_receipt=DecisionApplyReceipt(
+                        effect_fingerprint=normalized.effect_fingerprint,
+                        committed_state_fingerprint=governance_fingerprint(result),
+                        result=result,
+                    ),
+                )
+            partial = tuple(
+                item
+                for candidate in normalized.payload.candidates
+                if (item := await self._memory_store.load_applied_candidate(
+                    candidate.candidate_id
+                )) is not None
+            )
+            if partial:
+                return DecisionReconciliation(
+                    status=DecisionReconciliationStatus.UNKNOWN,
+                    reason="candidate writes exist without an atomic Memory batch receipt",
+                )
+            return DecisionReconciliation(
+                status=DecisionReconciliationStatus.NOT_COMMITTED,
+                reason="no candidate from the Memory batch was committed",
+            )
+
         coordinator = DecisionLifecycleCoordinator[
             MemoryExtractionDecisionPayload,
             MemoryCandidateBatchDraft,
@@ -421,6 +482,8 @@ class ResearchMemoryExtractionDecisionHandler:
             applier=GovernedDecisionApplier(
                 executor=self._operation_executor,
                 apply_effect=apply_effect,
+                apply_normalized_effect=apply_normalized_effect,
+                reconcile_effect=reconcile_effect,
             ),
             checkpoint_store=self._checkpoint_store,
             checkpoint_type=DecisionCheckpoint[

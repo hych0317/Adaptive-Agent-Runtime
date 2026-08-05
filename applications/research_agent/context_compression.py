@@ -12,6 +12,8 @@ from adaptive_agent_runtime.context_memory import (
     CONTEXT_COMPRESSION_APPLY_OPERATION,
     CONTEXT_COMPRESSION_DECISION_TYPE,
     ContextAssembly,
+    ContextArchive,
+    ContextCompressionCommitter,
     ContextCompressionDecisionPayload,
     ContextCompressionEffect,
     ContextCompressionExecutionPolicy,
@@ -38,6 +40,9 @@ from adaptive_agent_runtime.decisioning import (
     DecisionEvidenceReference,
     DecisionLifecycleCoordinator,
     DecisionRequest,
+    DecisionApplyReceipt,
+    DecisionReconciliation,
+    DecisionReconciliationStatus,
     DecisionResultStatus,
     DecisionTarget,
     InMemoryDecisionCheckpointStore,
@@ -46,6 +51,7 @@ from adaptive_agent_runtime.decisioning import (
     ProjectionSources,
     RuntimeDecisionTraceWriter,
     RuntimeDecisionValidator,
+    NormalizedDecisionEffect,
     decision_fingerprint,
 )
 from adaptive_agent_runtime.governance import (
@@ -62,6 +68,7 @@ from adaptive_agent_runtime.governance import (
     ReviewOutcome,
     ReviewRequest,
     RuntimeDecisionGovernanceAdapter,
+    governance_fingerprint,
 )
 from adaptive_agent_runtime.llm import (
     CONTEXT_COMPRESSION_INPUT_SOURCE_TYPE,
@@ -249,6 +256,7 @@ class ResearchContextCompressionDecisionHandler:
         *,
         capability: SemanticCompressionCapability,
         store: ContextStore,
+        archive: ContextArchive,
         execution_policy: ContextCompressionExecutionPolicy,
         governance: GovernanceEvaluator,
         reviews: HumanReviewService,
@@ -266,6 +274,7 @@ class ResearchContextCompressionDecisionHandler:
     ) -> None:
         self._capability = capability
         self._store = store
+        self._committer = ContextCompressionCommitter(store=store, archive=archive)
         self._execution_policy = execution_policy
         self._governance = governance
         self._reviews = reviews
@@ -414,6 +423,76 @@ class ResearchContextCompressionDecisionHandler:
                 "estimated_tokens": effect.estimated_tokens,
             }
 
+        async def apply_normalized_effect(
+            normalized: NormalizedDecisionEffect[ContextCompressionEffect],
+        ) -> JsonValue:
+            effect = normalized.payload
+            await self._validate_current_effect(effect)
+            current = await self._store.load(effect.context_id)
+            if current is None:
+                raise ContextSnapshotConflictError("Context source disappeared")
+            committed = await self._committer.commit(
+                current,
+                effect,
+                effect_fingerprint=normalized.effect_fingerprint,
+            )
+            return {
+                "context_id": str(committed.context_id),
+                "source_revision": effect.source_revision,
+                "committed_revision": committed.revision,
+                "original_estimated_tokens": effect.original_estimated_tokens,
+                "estimated_tokens": committed.metadata.estimated_tokens,
+            }
+
+        async def reconcile_effect(
+            normalized: NormalizedDecisionEffect[ContextCompressionEffect],
+        ) -> DecisionReconciliation:
+            effect = normalized.payload
+            committed = await self._committer.load_effect(
+                effect.context_id,
+                normalized.effect_fingerprint,
+            )
+            if committed is not None:
+                if (
+                    committed.revision != effect.source_revision + 1
+                    or committed.metadata.estimated_tokens != effect.estimated_tokens
+                    or committed.content != effect.content
+                ):
+                    return DecisionReconciliation(
+                        status=DecisionReconciliationStatus.UNKNOWN,
+                        reason="Context read-back conflicts with the authorized compression",
+                    )
+                result: JsonValue = {
+                    "context_id": str(committed.context_id),
+                    "source_revision": effect.source_revision,
+                    "committed_revision": committed.revision,
+                    "original_estimated_tokens": effect.original_estimated_tokens,
+                    "estimated_tokens": committed.metadata.estimated_tokens,
+                }
+                return DecisionReconciliation(
+                    status=DecisionReconciliationStatus.COMMITTED,
+                    reason="compressed Context was committed and read back",
+                    apply_receipt=DecisionApplyReceipt(
+                        effect_fingerprint=normalized.effect_fingerprint,
+                        committed_state_fingerprint=governance_fingerprint(result),
+                        result=result,
+                    ),
+                )
+            current = await self._store.load(effect.context_id)
+            if (
+                current is not None
+                and current.revision == effect.source_revision
+                and decision_fingerprint(current) == effect.source_snapshot_fingerprint
+            ):
+                return DecisionReconciliation(
+                    status=DecisionReconciliationStatus.NOT_COMMITTED,
+                    reason="the authoritative Context remains at its source revision",
+                )
+            return DecisionReconciliation(
+                status=DecisionReconciliationStatus.UNKNOWN,
+                reason="Context state cannot prove commit or non-commit",
+            )
+
         coordinator = DecisionLifecycleCoordinator[
             ContextCompressionDecisionPayload,
             CompressedContextDraft,
@@ -441,6 +520,8 @@ class ResearchContextCompressionDecisionHandler:
             applier=GovernedDecisionApplier(
                 executor=self._operation_executor,
                 apply_effect=apply_effect,
+                apply_normalized_effect=apply_normalized_effect,
+                reconcile_effect=reconcile_effect,
             ),
             checkpoint_store=self._checkpoint_store,
             checkpoint_type=DecisionCheckpoint[
@@ -486,18 +567,17 @@ class ResearchContextCompressionDecisionHandler:
         governance_request = recording_evaluator.request
         preliminary = recording_evaluator.preliminary
         final = recording_evaluator.final
-        if governance_request is None or preliminary is None or final is None:
-            raise RuntimeError("Compression Governance record is incomplete")
-        self._workspace.governance_records.append(
-            GovernanceRecord(
-                scenario="context_compression_agent",
-                request=governance_request,
-                preliminary=preliminary,
-                final=final,
-                authorization=recording_issuer.authorization,
-                review=recording_evaluator.review,
+        if governance_request is not None and preliminary is not None and final is not None:
+            self._workspace.governance_records.append(
+                GovernanceRecord(
+                    scenario="context_compression_agent",
+                    request=governance_request,
+                    preliminary=preliminary,
+                    final=final,
+                    authorization=recording_issuer.authorization,
+                    review=recording_evaluator.review,
+                )
             )
-        )
         return checkpoint.validated_decision.normalized_effect.payload.to_result()
 
     def _project_agent_input(

@@ -46,7 +46,7 @@ from adaptive_agent_runtime.governance import (
     RecoveryGovernanceAdapter,
     HumanReviewDecision,
     ImpactAssessment,
-    InMemoryHumanReviewService,
+    HumanReviewService,
     ReviewOutcome,
     RiskLevel,
     SUBJECT_FINGERPRINT_ATTRIBUTE,
@@ -120,6 +120,9 @@ from applications.research_agent.report import (
     ResearchReport,
     ResearchToolIntentRecord,
 )
+from applications.research_agent.report_decision import ResearchReportDecisionHandler
+from adaptive_agent_runtime.persistence import WorkspaceArtifactCommitReceipt
+from adaptive_agent_runtime.decisioning import decision_fingerprint
 from applications.research_agent.tasks import (
     COMPANY_RESEARCH,
     COMPETITOR_ANALYSIS,
@@ -159,6 +162,7 @@ class ResearchWorkspace:
         self.action_proposals: list[ActionProposalDraft] = []
         self.graph_mutation_proposals: list[GraphMutationProposalDraft] = []
         self.fallback_node_ids: set[UUID] = set()
+        self.report_commit_receipts: dict[UUID, WorkspaceArtifactCommitReceipt] = {}
         self._roles_by_node = {
             node.node_id: role for role, node in definition.nodes.items()
         }
@@ -178,7 +182,34 @@ class ResearchWorkspace:
         self._roles_by_node[recovery_node.node_id] = self.role_for(failed_node)
 
     def set_output(self, node: TaskNode, output: JsonValue) -> None:
+        if self.role_for(node) == REPORT_NODE:
+            raise ValueError("final report output requires a governed commit receipt")
         self.outputs[node.node_id] = output
+
+    def accept_report_commit(
+        self,
+        node: TaskNode,
+        report: ResearchReport,
+        receipt: WorkspaceArtifactCommitReceipt,
+    ) -> None:
+        artifact = report.model_dump(mode="json")
+        if (
+            self.role_for(node) != REPORT_NODE
+            or receipt.node_id != node.node_id
+            or receipt.artifact_fingerprint != decision_fingerprint(artifact)
+        ):
+            raise ValueError("report commit receipt does not bind the artifact")
+        self.outputs[node.node_id] = artifact
+        self.report_commit_receipts[node.node_id] = receipt
+
+    def restore_report_commit(
+        self,
+        node: TaskNode,
+        artifact: JsonValue,
+        receipt: WorkspaceArtifactCommitReceipt,
+    ) -> None:
+        report = ResearchReport.model_validate(artifact)
+        self.accept_report_commit(node, report, receipt)
 
     def context_for(self, node_id: UUID) -> ContextAssembly | None:
         for assembly in reversed(self.context_assemblies):
@@ -356,7 +387,7 @@ class GovernedRecordingToolExecutor:
         *,
         delegate: ToolExecutor,
         governance: GovernanceEvaluator,
-        reviews: InMemoryHumanReviewService,
+        reviews: HumanReviewService,
         issuer: GovernanceAuthorizationIssuer,
         operation_executor: GovernedOperationExecutor,
         workspace: ResearchWorkspace,
@@ -1206,6 +1237,7 @@ class ReportStrategy(_ContextAwareStrategy):
         context_trace: ContextMemoryTraceAdapter,
         llm_generator: ArtifactGenerationCapability | None = None,
         llm_context: ResearchReportContextProjection | None = None,
+        decision_handler: ResearchReportDecisionHandler,
     ) -> None:
         super().__init__(
             workspace=workspace,
@@ -1216,6 +1248,7 @@ class ReportStrategy(_ContextAwareStrategy):
         self._tool_strategy = tool_strategy
         self._llm_generator = llm_generator
         self._llm_context = llm_context
+        self._decision_handler = decision_handler
 
     async def execute(
         self,
@@ -1227,6 +1260,7 @@ class ReportStrategy(_ContextAwareStrategy):
         if llm_generator is not None:
             return await self._generate_with_llm(
                 node,
+                state,
                 llm_generator,
                 assembly,
             )
@@ -1234,12 +1268,39 @@ class ReportStrategy(_ContextAwareStrategy):
         result = await self._tool_strategy.execute(node, state)
         await self._record_tool_observations(start_index, node, state)
         if result.succeeded:
-            self._workspace.set_output(node, result.output)
+            await self._commit_report(node, state, result.output)
         return result
+
+    async def _commit_report(
+        self,
+        node: TaskNode,
+        state: AgentState,
+        output: JsonValue,
+    ) -> None:
+        report = ResearchReport.model_validate(output)
+        accepted, receipt, record = await self._decision_handler.commit(
+            run_id=state.run_id,
+            task_id=state.task.task_id,
+            node_id=node.node_id,
+            report=report,
+            provenance=tuple(
+                f"analysis:{role}"
+                for role in (
+                    FINANCIAL_METRICS,
+                    INDUSTRY_ANALYSIS,
+                    COMPETITOR_ANALYSIS,
+                    NEWS_ANALYSIS,
+                    RISK_REVIEW,
+                )
+            ),
+        )
+        self._workspace.accept_report_commit(node, accepted, receipt)
+        self._workspace.governance_records.append(record)
 
     async def _generate_with_llm(
         self,
         node: TaskNode,
+        state: AgentState,
         generator: ArtifactGenerationCapability,
         assembly: ContextAssembly,
     ) -> NodeExecutionResult:
@@ -1312,7 +1373,7 @@ class ReportStrategy(_ContextAwareStrategy):
                 error="Report Generator returned an invalid report"
             )
         output = report.model_dump(mode="json")
-        self._workspace.set_output(node, output)
+        await self._commit_report(node, state, output)
         return NodeExecutionResult.ok(output=output)
 
 

@@ -118,5 +118,14 @@ def default_governance_policy() -> GovernancePolicy:
                 risk_levels=(RiskLevel.LOW,),
                 priority=100,
             ),
+            GovernanceRule(
+                rule_id="allow.low_risk.report_commit",
+                description="Allow one reversible, provenance-bound report commit.",
+                effect=RuleEffect.ALLOW,
+                scopes=(GovernanceScope.STATE,),
+                operations=("workspace.report.commit",),
+                risk_levels=(RiskLevel.LOW,),
+                priority=100,
+            ),
         ),
     )

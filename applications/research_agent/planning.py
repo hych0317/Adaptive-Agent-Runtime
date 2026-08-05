@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
+from pydantic import JsonValue
 
 from adaptive_agent_runtime import AgentTask, TraceSink
 from adaptive_agent_runtime.decisioning import (
@@ -14,12 +15,16 @@ from adaptive_agent_runtime.decisioning import (
     DecisionBasis,
     DecisionBudget,
     DecisionCheckpoint,
+    DecisionCheckpointStore,
     DecisionCheckpointStage,
     DecisionConstraint,
     DecisionCorrelation,
     DecisionEvidenceReference,
     DecisionLifecycleCoordinator,
     DecisionRequest,
+    DecisionApplyReceipt,
+    DecisionReconciliation,
+    DecisionReconciliationStatus,
     DecisionResultStatus,
     DecisionTarget,
     InMemoryDecisionCheckpointStore,
@@ -28,6 +33,7 @@ from adaptive_agent_runtime.decisioning import (
     ProjectionSources,
     RuntimeDecisionTraceWriter,
     RuntimeDecisionValidator,
+    NormalizedDecisionEffect,
     decision_fingerprint,
 )
 from adaptive_agent_runtime.governance import (
@@ -45,6 +51,7 @@ from adaptive_agent_runtime.governance import (
     ReviewOutcome,
     ReviewRequest,
     RuntimeDecisionGovernanceAdapter,
+    governance_fingerprint,
 )
 from adaptive_agent_runtime.llm import (
     PLANNING_INPUT_SOURCE_TYPE,
@@ -150,6 +157,44 @@ class _RecordingAuthorizationIssuer:
         return authorization
 
 
+async def _reconcile_planning_effect(
+    applier: GraphInitializationApplier,
+    normalized: NormalizedDecisionEffect[PlanningGraphEffect],
+) -> DecisionReconciliation:
+    effect = normalized.payload
+    checkpoint = await applier.load_effect(
+        run_id=effect.run_id,
+        effect_fingerprint=normalized.effect_fingerprint,
+    )
+    if checkpoint is None:
+        return DecisionReconciliation(
+            status=DecisionReconciliationStatus.NOT_COMMITTED,
+            reason="initial Graph effect has no authoritative checkpoint",
+        )
+    if checkpoint.graph != effect.graph:
+        return DecisionReconciliation(
+            status=DecisionReconciliationStatus.UNKNOWN,
+            reason="initial Graph checkpoint conflicts with the authorized effect",
+        )
+    result: JsonValue = {
+        "run_id": str(effect.run_id),
+        "task_id": str(effect.task_id),
+        "graph_id": str(effect.graph.graph_id),
+        "graph_version": effect.graph.version,
+        "node_count": len(effect.graph.nodes),
+        "source_draft_fingerprint": effect.source_draft_fingerprint,
+    }
+    return DecisionReconciliation(
+        status=DecisionReconciliationStatus.COMMITTED,
+        reason="initial Graph effect was committed and read back",
+        apply_receipt=DecisionApplyReceipt(
+            effect_fingerprint=normalized.effect_fingerprint,
+            committed_state_fingerprint=governance_fingerprint(result),
+            result=result,
+        ),
+    )
+
+
 async def run_adaptive_planning(
     *,
     company: str,
@@ -163,6 +208,10 @@ async def run_adaptive_planning(
     issuer: GovernanceAuthorizationIssuer,
     operation_executor: GovernedOperationExecutor,
     trace_sink: TraceSink,
+    graph_store: TaskGraphStore,
+    checkpoint_store: DecisionCheckpointStore[
+        PlanningDecisionPayload, TaskGraphDraft, PlanningGraphEffect
+    ],
 ) -> ResearchAdaptivePlanningResult:
     """Run the one-call Phase 1-A lifecycle before the Core Event Loop."""
 
@@ -320,13 +369,7 @@ async def run_adaptive_planning(
         max_context_tokens=512,
     )
 
-    graph_store = InMemoryTaskGraphStore()
     graph_applier = GraphInitializationApplier(graph_store)
-    checkpoint_store = InMemoryDecisionCheckpointStore[
-        PlanningDecisionPayload,
-        TaskGraphDraft,
-        PlanningGraphEffect,
-    ]()
     recording_evaluator = _RecordingGovernanceEvaluator(governance)
     recording_issuer = _RecordingAuthorizationIssuer(issuer)
     governance_adapter = RuntimeDecisionGovernanceAdapter[
@@ -367,6 +410,13 @@ async def run_adaptive_planning(
         applier=GovernedDecisionApplier(
             executor=operation_executor,
             apply_effect=graph_applier.apply,
+            apply_normalized_effect=lambda normalized: graph_applier.commit(
+                normalized.payload,
+                effect_fingerprint=normalized.effect_fingerprint,
+            ),
+            reconcile_effect=lambda normalized: _reconcile_planning_effect(
+                graph_applier, normalized
+            ),
         ),
         checkpoint_store=checkpoint_store,
         checkpoint_type=DecisionCheckpoint[

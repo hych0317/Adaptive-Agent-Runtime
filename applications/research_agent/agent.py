@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import StrEnum
 from tempfile import TemporaryDirectory
+from pathlib import Path
 from uuid import UUID, uuid4
 
 from adaptive_agent_runtime import (
@@ -14,11 +15,16 @@ from adaptive_agent_runtime import (
     InMemoryTraceSink,
     RunResult,
     TraceSink,
+    RuntimeEvent,
+    TraceEntry,
 )
+from adaptive_agent_runtime.persistence import SQLitePersistence
 from adaptive_agent_runtime.context_memory import (
     ConditionalMemoryRecall,
     ContextAssembler,
     ContextCompressionExecutionPolicy,
+    ContextCompressionDecisionPayload,
+    ContextCompressionEffect,
     ContextLayer,
     ContextLifecycleManager,
     ContextLifecycleRuntime,
@@ -39,6 +45,8 @@ from adaptive_agent_runtime.context_memory import (
     MemoryEvolutionType,
     MemoryUpdateResult,
     MemoryExtractionExecutionPolicy,
+    MemoryExtractionDecisionPayload,
+    MemoryExtractionEffect,
     ResidencyPolicy,
 )
 from adaptive_agent_runtime.evaluation import (
@@ -61,6 +69,8 @@ from adaptive_agent_runtime.evaluation import (
     RuntimeNativeTraceCollector,
     RecoveryTraceAdapter,
     RootCauseExecutionPolicy,
+    RootCauseDecisionPayload,
+    RootCauseAssessmentEffect,
     ToolComponentEvaluator,
 )
 from adaptive_agent_runtime.governance import (
@@ -88,10 +98,16 @@ from adaptive_agent_runtime.orchestration import (
     DynamicTaskGraphPlanner,
     IsolatedAgentExecutor,
     PlanningExecutionPolicy,
+    PlanningDecisionPayload,
+    PlanningGraphEffect,
     RecoveryExecutionPolicy,
     StrategyActionExecutor,
     TaskGraphStore,
     GraphMutationExecutionPolicy,
+    GraphMutationDecisionPayload,
+    GraphMutationEffect,
+    RecoveryDecisionPayload,
+    RecoveryDecisionEffect,
 )
 from adaptive_agent_runtime.llm import (
     AutonomousAgentBackend,
@@ -102,11 +118,27 @@ from adaptive_agent_runtime.llm import (
     JudgeAssessmentDraft,
     JudgeRequest,
     TaskGraphDraft,
+    CompressedContextDraft,
+    RecoveryDraft,
+    GraphMutationProposalDraft,
+    MemoryCandidateBatchDraft,
+    ToolSelectionDraft,
+    ActionProposalDraft,
+    RootCauseDraft,
 )
 from adaptive_agent_runtime.tool_ecosystem import (
     ToolExecutionPolicy,
     ToolExecutionStrategy,
     ToolSelectionExecutionPolicy,
+    ToolSelectionDecisionPayload,
+    ToolSelectionEffect,
+    ToolInvocationDecisionPayload,
+    ToolInvocationProposalDraft,
+    ToolInvocationEffect,
+)
+from adaptive_agent_runtime.orchestration import (
+    ReadyNodeSelectionDecisionPayload,
+    ReadyNodeSelectionEffect,
 )
 
 from applications.research_agent.capabilities import build_research_tool_stack
@@ -129,6 +161,13 @@ from applications.research_agent.report import (
     ResearchReport,
     ResearchRunResult,
 )
+from applications.research_agent.report_decision import (
+    ReportArtifactEffect,
+    ReportDecisionPayload,
+    ReportDraft,
+    ResearchReportDecisionHandler,
+)
+from adaptive_agent_runtime.decisioning import DecisionCheckpoint
 from applications.research_agent.progress import (
     ObservableTraceSink,
     ResearchProgressEvent,
@@ -137,6 +176,7 @@ from applications.research_agent.progress import (
     publish_progress,
 )
 from applications.research_agent.planning import run_adaptive_planning
+from applications.research_agent.persistence import SQLiteResearchRunManifestStore
 from applications.research_agent.recovery import ResearchRecoveryDecisionHandler
 from applications.research_agent.root_cause import (
     ResearchRootCauseDecisionHandler,
@@ -195,6 +235,21 @@ class ResearchInformationMode(StrEnum):
     LLM_RESEARCH = "llm_research"
 
 
+class _PersistentTraceMirror:
+    """Keep synchronous run-local reads while every event is durably recorded."""
+
+    module_id = "research_agent.trace.persistent_mirror"
+
+    def __init__(self, local: InMemoryTraceSink, durable: TraceSink) -> None:
+        self._local = local
+        self._durable = durable
+
+    async def record(self, event: RuntimeEvent) -> TraceEntry:
+        durable = await self._durable.record(event)
+        await self._local.record(event)
+        return durable
+
+
 class ResearchAgent:
     """Application facade demonstrating the full Adaptive Runtime stack."""
 
@@ -207,6 +262,7 @@ class ResearchAgent:
         information_mode: ResearchInformationMode = (
             ResearchInformationMode.FIXTURE_DEMO
         ),
+        persistence_path: str | Path = Path("data/research_runtime.sqlite3"),
     ) -> None:
         self._cognitive_capabilities = (
             cognitive_capabilities or ResearchCognitiveCapabilities()
@@ -237,13 +293,17 @@ class ResearchAgent:
                 else None
             )
         )
-        self._context_store = InMemoryContextStore()
-        self._context_archive = InMemoryContextArchive()
-        self._memory_store = InMemoryMemoryStore()
+        self._persistence = SQLitePersistence(persistence_path)
+        self._manifest_store = SQLiteResearchRunManifestStore(
+            self._persistence.database
+        )
+        self._context_store = self._persistence.context_store
+        self._context_archive = self._persistence.context_archive
+        self._memory_store = self._persistence.memory_store
         self._memory_consolidator = EvidenceDrivenMemoryConsolidator(
             self._memory_store
         )
-        self._reviews = InMemoryHumanReviewService()
+        self._reviews = self._persistence.human_review_service
         self._governance: GovernanceEvaluator = RuntimeGovernanceEvaluator(
             policy=default_governance_policy(),
             rule_evaluator=DeterministicRuleEvaluator(),
@@ -251,13 +311,12 @@ class ResearchAgent:
             review_service=self._reviews,
         )
         self._issuer = GovernanceAuthorizationIssuer()
-        self._authorization_store = InMemoryAuthorizationConsumptionStore()
+        self._authorization_store = self._persistence.authorization_store
         self._operation_executor = GovernedOperationExecutor(
             verifier=StrictAuthorizationVerifier(),
             consumption_store=self._authorization_store,
         )
         self._evaluation_history: list[EvaluationResult] = []
-        self._memory_seeded = False
         self._autonomous_risk_backend = autonomous_risk_backend
 
     async def run(
@@ -265,11 +324,29 @@ class ResearchAgent:
         task: str,
         *,
         progress_sink: ResearchProgressSink | None = None,
+        _resume_run_id: UUID | None = None,
     ) -> ResearchRunResult:
         """Execute one research run and evaluate it after Runtime completion."""
 
-        company = company_from_task(task)
-        run_id = uuid4()
+        resuming = _resume_run_id is not None
+        graph_store: TaskGraphStore | None
+        if resuming:
+            assert _resume_run_id is not None
+            restored_state = await self._persistence.state_store.load(_resume_run_id)
+            manifest = self._manifest_store.load(_resume_run_id)
+            if restored_state is None or manifest is None:
+                raise RuntimeError("Research run cannot resume without State and manifest")
+            task, restored_definition = manifest
+            agent_task = restored_state.task
+            company = restored_definition.company
+            run_id = _resume_run_id
+        else:
+            company = company_from_task(task)
+            run_id = uuid4()
+            agent_task = AgentTask(
+                description=task,
+                input={"company": company, "application": "research_agent"},
+            )
         await publish_progress(
             progress_sink,
             ResearchProgressEvent(
@@ -278,12 +355,14 @@ class ResearchAgent:
                 payload={"task": task, "company": company},
             ),
         )
-        agent_task = AgentTask(
-            description=task,
-            input={"company": company, "application": "research_agent"},
-        )
         runtime_trace_sink = InMemoryTraceSink()
-        runtime_trace_writer: TraceSink = runtime_trace_sink
+        if resuming:
+            for entry in await self._persistence.trace_sink.entries_for(run_id):
+                await runtime_trace_sink.record(entry.event)
+        runtime_trace_writer: TraceSink = _PersistentTraceMirror(
+            runtime_trace_sink,
+            self._persistence.trace_sink,
+        )
         if progress_sink is not None:
             runtime_trace_writer = ObservableTraceSink(
                 runtime_trace_sink,
@@ -300,6 +379,13 @@ class ResearchAgent:
                 operation_executor=self._operation_executor,
                 trace_sink=runtime_trace_writer,
                 assessment_store=root_cause_store,
+                checkpoint_store=self._persistence.create_decision_checkpoint_store(
+                    DecisionCheckpoint[
+                        RootCauseDecisionPayload,
+                        RootCauseDraft,
+                        RootCauseAssessmentEffect,
+                    ]
+                ),
             )
             if self._cognitive_capabilities.root_cause_analyzer is not None
             else None
@@ -313,15 +399,26 @@ class ResearchAgent:
             if root_cause_handler is not None
             else None
         )
-        definition, llm_task_graph_draft, planning_record, graph_store = (
-            await self._build_task_definition(
-                company=company,
-                task=task,
-                run_id=run_id,
-                agent_task=agent_task,
-                trace_sink=runtime_trace_writer,
+        if resuming:
+            definition = restored_definition
+            llm_task_graph_draft = None
+            planning_record = None
+            graph_store = self._persistence.task_graph_store
+        else:
+            definition, llm_task_graph_draft, planning_record, graph_store = (
+                await self._build_task_definition(
+                    company=company,
+                    task=task,
+                    run_id=run_id,
+                    agent_task=agent_task,
+                    trace_sink=runtime_trace_writer,
+                )
             )
-        )
+            self._manifest_store.save(
+                run_id=run_id,
+                task=task,
+                definition=definition,
+            )
         await publish_progress(
             progress_sink,
             ResearchProgressEvent(
@@ -333,6 +430,27 @@ class ResearchAgent:
             ),
         )
         workspace = ResearchWorkspace(definition)
+        if resuming:
+            graph_checkpoint = await self._persistence.task_graph_store.load(run_id)
+            if graph_checkpoint is None:
+                raise RuntimeError("Research run has no durable Graph checkpoint")
+            for node in graph_checkpoint.graph.nodes:
+                if node.observation is not None and node.observation.succeeded:
+                    if workspace.role_for(node) == REPORT_GENERATION:
+                        persisted_report = self._persistence.workspace_artifact_store.load(
+                            run_id=run_id,
+                            node_id=node.node_id,
+                            artifact_type="research_report",
+                        )
+                        if persisted_report is None:
+                            raise RuntimeError(
+                                "completed report node has no authoritative artifact receipt"
+                            )
+                        workspace.restore_report_commit(
+                            node, persisted_report[0], persisted_report[1]
+                        )
+                    else:
+                        workspace.set_output(node, node.observation.output)
         configured_compressor = self._cognitive_capabilities.context_compressor
         context_lifecycle = ContextLifecycleManager(
             store=self._context_store,
@@ -343,6 +461,7 @@ class ResearchAgent:
                     or DeterministicCompressionProposalCapability()
                 ),
                 store=self._context_store,
+                archive=self._context_archive,
                 execution_policy=ContextCompressionExecutionPolicy(),
                 governance=self._governance,
                 reviews=self._reviews,
@@ -354,6 +473,13 @@ class ResearchAgent:
                     self._cognitive_capabilities.compression_context
                     if configured_compressor is not None
                     else None
+                ),
+                checkpoint_store=self._persistence.create_decision_checkpoint_store(
+                    DecisionCheckpoint[
+                        ContextCompressionDecisionPayload,
+                        CompressedContextDraft,
+                        ContextCompressionEffect,
+                    ]
                 ),
             ),
         )
@@ -404,15 +530,20 @@ class ResearchAgent:
             ),
             residency_policy=ResidencyPolicy.PINNED,
         )
-        await context_lifecycle.add(goal_context)
-        workspace.context_units.append(goal_context)
-        workspace.trace_batches.append(
-            context_trace.context_unit(goal_context, kind="context.research_goal")
-        )
-        if not self._memory_seeded:
-            await self._seed_memories(goal_context, workspace, context_trace)
+        if resuming:
+            workspace.context_units.extend(
+                await self._context_store.list_for_run(run_id)
+            )
         else:
-            await self._reinforce_memory(goal_context, workspace, context_trace)
+            await context_lifecycle.add(goal_context)
+            workspace.context_units.append(goal_context)
+            workspace.trace_batches.append(
+                context_trace.context_unit(goal_context, kind="context.research_goal")
+            )
+            if not await self._memory_store.list_all():
+                await self._seed_memories(goal_context, workspace, context_trace)
+            else:
+                await self._reinforce_memory(goal_context, workspace, context_trace)
 
         governed_executor = GovernedRecordingToolExecutor(
             delegate=self._tools.executor,
@@ -433,6 +564,13 @@ class ResearchAgent:
                 operation_executor=self._operation_executor,
                 trace_sink=runtime_trace_writer,
                 workspace=workspace,
+                checkpoint_store=self._persistence.create_decision_checkpoint_store(
+                    DecisionCheckpoint[
+                        ToolSelectionDecisionPayload,
+                        ToolSelectionDraft,
+                        ToolSelectionEffect,
+                    ]
+                ),
             )
             if self._cognitive_capabilities.tool_selector is not None
             else None
@@ -476,6 +614,13 @@ class ResearchAgent:
                     operation_executor=self._operation_executor,
                     trace_sink=runtime_trace_writer,
                     workspace=workspace,
+                    checkpoint_store=self._persistence.create_decision_checkpoint_store(
+                        DecisionCheckpoint[
+                            ToolInvocationDecisionPayload,
+                            ToolInvocationProposalDraft,
+                            ToolInvocationEffect,
+                        ]
+                    ),
                     execution_policy=ToolExecutionPolicy(
                         timeout_seconds=(
                             300.0
@@ -500,6 +645,21 @@ class ResearchAgent:
             context_trace=context_trace,
             llm_generator=self._cognitive_capabilities.report_generator,
             llm_context=self._cognitive_capabilities.report_context,
+            decision_handler=ResearchReportDecisionHandler(
+                committer=self._persistence.workspace_artifact_committer,
+                governance=self._governance,
+                reviews=self._reviews,
+                issuer=self._issuer,
+                operation_executor=self._operation_executor,
+                trace_sink=runtime_trace_writer,
+                checkpoint_store=self._persistence.create_decision_checkpoint_store(
+                    DecisionCheckpoint[
+                        ReportDecisionPayload,
+                        ReportDraft,
+                        ReportArtifactEffect,
+                    ]
+                ),
+            ),
         )
         isolated_directory: TemporaryDirectory[str] | None = None
         try:
@@ -537,6 +697,13 @@ class ResearchAgent:
                     issuer=self._issuer,
                     operation_executor=self._operation_executor,
                     trace_sink=runtime_trace_writer,
+                    checkpoint_store=self._persistence.create_decision_checkpoint_store(
+                        DecisionCheckpoint[
+                            ReadyNodeSelectionDecisionPayload,
+                            ActionProposalDraft,
+                            ReadyNodeSelectionEffect,
+                        ]
+                    ),
                 )
                 if action_planner is not None
                 else None
@@ -558,6 +725,13 @@ class ResearchAgent:
                     operation_executor=self._operation_executor,
                     trace_sink=runtime_trace_writer,
                     workspace=workspace,
+                    checkpoint_store=self._persistence.create_decision_checkpoint_store(
+                        DecisionCheckpoint[
+                            GraphMutationDecisionPayload,
+                            GraphMutationProposalDraft,
+                            GraphMutationEffect,
+                        ]
+                    ),
                 )
             planner = DynamicTaskGraphPlanner(
                 definition.initial_graph,
@@ -611,6 +785,13 @@ class ResearchAgent:
                         diagnostic_evidence_provider=(
                             root_cause_recovery_bridge
                         ),
+                        checkpoint_store=self._persistence.create_decision_checkpoint_store(
+                            DecisionCheckpoint[
+                                RecoveryDecisionPayload,
+                                RecoveryDraft,
+                                RecoveryDecisionEffect,
+                            ]
+                        ),
                     )
                     if self._cognitive_capabilities.recovery_planner is not None
                     else None
@@ -621,19 +802,37 @@ class ResearchAgent:
                 executor=StrategyActionExecutor(
                     (research_strategy, review_strategy, report_strategy)
                 ),
-                state_store=InMemoryStateStore(),
+                state_store=self._persistence.state_store,
                 trace_sink=runtime_trace_writer,
                 max_steps=20,
             )
-            runtime_result = await runtime.run(agent_task, run_id=run_id)
+            runtime_result = (
+                await runtime.resume(run_id)
+                if resuming
+                else await runtime.run(agent_task, run_id=run_id)
+            )
         finally:
             if isolated_directory is not None:
                 isolated_directory.cleanup()
         final_state = runtime_result.final_state
-        final_graph = planner.graph_for(run_id)
+        resumed_graph_checkpoint = (
+            await self._persistence.task_graph_store.load(run_id)
+            if resuming
+            else None
+        )
+        final_graph = (
+            resumed_graph_checkpoint.graph
+            if resumed_graph_checkpoint is not None
+            else planner.graph_for(run_id)
+        )
+        recovery_records = (
+            resumed_graph_checkpoint.recovery_records
+            if resumed_graph_checkpoint is not None
+            else planner.recovery_records_for(run_id)
+        )
 
         memory_extractor = self._cognitive_capabilities.memory_extractor
-        if memory_extractor is not None:
+        if memory_extractor is not None and not resuming:
             extraction_context = self._cognitive_capabilities.extraction_context
             if extraction_context is None:
                 raise RuntimeError(
@@ -651,6 +850,13 @@ class ResearchAgent:
                 operation_executor=self._operation_executor,
                 trace_sink=runtime_trace_writer,
                 workspace=workspace,
+                checkpoint_store=self._persistence.create_decision_checkpoint_store(
+                    DecisionCheckpoint[
+                        MemoryExtractionDecisionPayload,
+                        MemoryCandidateBatchDraft,
+                        MemoryExtractionEffect,
+                    ]
+                ),
             ).extract(
                 run_id=run_id,
                 task_id=agent_task.task_id,
@@ -674,7 +880,7 @@ class ResearchAgent:
                 observed_at=final_state.updated_at,
             ),
             RecoveryTraceAdapter().adapt(
-                planner.recovery_records_for(run_id),
+                recovery_records,
                 run_id=run_id,
                 task_id=agent_task.task_id,
                 graph_id=final_graph.graph_id,
@@ -700,16 +906,20 @@ class ResearchAgent:
             subject,
             EvaluationCriteria(required_output_keys=("graph_id", "nodes")),
         )
-        if root_cause_handler is not None:
+        if root_cause_handler is not None and not resuming:
             await root_cause_handler.analyze_post_run(
                 evaluation,
                 subject.trace,
             )
         self._evaluation_history.extend(evaluation.results)
-        llm_judgement = await self._judge_evaluation(
-            evaluation,
-            workspace,
-            runtime_result,
+        llm_judgement = (
+            None
+            if resuming
+            else await self._judge_evaluation(
+                evaluation,
+                workspace,
+                runtime_result,
+            )
         )
         failure_analysis = DeterministicFailureAnalyzer().analyze(
             self._evaluation_history
@@ -736,6 +946,10 @@ class ResearchAgent:
                 + (final_state.error or final_state.status.value)
             )
         report = ResearchReport.model_validate(raw_report)
+        report_node_id = workspace.definition.node(REPORT_GENERATION).node_id
+        report_commit_receipt = workspace.report_commit_receipts.get(report_node_id)
+        if report_commit_receipt is None:
+            raise RuntimeError("Research report has no authoritative commit receipt")
         memories = await self._memory_store.list_all()
         history_runs = len(
             {result.run_id for result in self._evaluation_history}
@@ -756,6 +970,7 @@ class ResearchAgent:
             runtime_result=runtime_result,
             task_graph=final_graph,
             report=report,
+            report_commit_receipt=report_commit_receipt,
             evaluation=evaluation,
             failure_analysis=failure_analysis,
             optimization_proposals=proposals,
@@ -782,6 +997,25 @@ class ResearchAgent:
             evaluation_history_runs=history_runs,
         )
 
+    async def resume(
+        self,
+        run_id: UUID,
+        *,
+        progress_sink: ResearchProgressSink | None = None,
+    ) -> ResearchRunResult:
+        """Resume one durable run without re-running initial Planning."""
+
+        return await self.run(
+            "resume",
+            progress_sink=progress_sink,
+            _resume_run_id=run_id,
+        )
+
+    def close(self) -> None:
+        """Release the default SQLite composition explicitly."""
+
+        self._persistence.close()
+
     async def _build_task_definition(
         self,
         *,
@@ -798,7 +1032,12 @@ class ResearchAgent:
     ]:
         planner = self._cognitive_capabilities.task_planner
         if planner is None:
-            return build_research_task(company), None, None, None
+            return (
+                build_research_task(company),
+                None,
+                None,
+                self._persistence.task_graph_store,
+            )
         planning = await run_adaptive_planning(
             company=company,
             task=task,
@@ -811,6 +1050,14 @@ class ResearchAgent:
             issuer=self._issuer,
             operation_executor=self._operation_executor,
             trace_sink=trace_sink,
+            graph_store=self._persistence.task_graph_store,
+            checkpoint_store=self._persistence.create_decision_checkpoint_store(
+                DecisionCheckpoint[
+                    PlanningDecisionPayload,
+                    TaskGraphDraft,
+                    PlanningGraphEffect,
+                ]
+            ),
         )
         return (
             planning.definition,
@@ -978,7 +1225,6 @@ class ResearchAgent:
                     ),
                 )
             )
-        self._memory_seeded = True
 
     async def _reinforce_memory(
         self,

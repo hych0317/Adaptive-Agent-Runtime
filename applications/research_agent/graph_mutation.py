@@ -27,6 +27,9 @@ from adaptive_agent_runtime.decisioning import (
     DecisionEvidenceReference,
     DecisionLifecycleCoordinator,
     DecisionRequest,
+    DecisionApplyReceipt,
+    DecisionReconciliation,
+    DecisionReconciliationStatus,
     DecisionResultStatus,
     DecisionTarget,
     InMemoryDecisionCheckpointStore,
@@ -35,6 +38,7 @@ from adaptive_agent_runtime.decisioning import (
     ProjectionSources,
     RuntimeDecisionTraceWriter,
     RuntimeDecisionValidator,
+    NormalizedDecisionEffect,
     decision_fingerprint,
 )
 from adaptive_agent_runtime.governance import (
@@ -47,6 +51,7 @@ from adaptive_agent_runtime.governance import (
     HumanReviewService,
     ReviewOutcome,
     RuntimeDecisionGovernanceAdapter,
+    governance_fingerprint,
 )
 from adaptive_agent_runtime.llm import (
     GRAPH_MUTATION_EVIDENCE_SOURCE_TYPE,
@@ -67,6 +72,8 @@ from adaptive_agent_runtime.orchestration import (
     GraphMutationDecisionPayload,
     GraphMutationEffect,
     GraphMutationExecutionPolicy,
+    GraphDecisionCommitter,
+    InMemoryGraphDecisionCommitter,
     apply_graph_mutation_effect,
 )
 
@@ -147,7 +154,9 @@ class ResearchGraphMutationDecisionHandler:
         state: AgentState,
         source_node_id: UUID,
         observation: Observation,
+        committer: GraphDecisionCommitter | None = None,
     ) -> GraphMutationDecisionOutcome | None:
+        committer = committer or InMemoryGraphDecisionCommitter()
         source_node = graph.get_node(source_node_id)
         if self._workspace.role_for(source_node) != COMPANY_RESEARCH:
             return None
@@ -325,6 +334,56 @@ class ResearchGraphMutationDecisionHandler:
                 "mutation_ids": [str(item.mutation_id) for item in effect.mutations],
             }
 
+        async def apply_normalized_effect(
+            normalized: NormalizedDecisionEffect[GraphMutationEffect],
+        ) -> JsonValue:
+            nonlocal applied_graph
+            effect = normalized.payload
+            candidate = apply_graph_mutation_effect(graph, effect)
+            applied_graph = await committer.commit_graph_effect(
+                state=state,
+                graph=candidate,
+                effect_fingerprint=normalized.effect_fingerprint,
+            )
+            return {
+                "graph_id": str(applied_graph.graph_id),
+                "graph_version": applied_graph.version,
+                "mutation_ids": [str(item.mutation_id) for item in effect.mutations],
+            }
+
+        async def reconcile_effect(
+            normalized: NormalizedDecisionEffect[GraphMutationEffect],
+        ) -> DecisionReconciliation:
+            committed = await committer.load_graph_effect(
+                run_id=state.run_id,
+                effect_fingerprint=normalized.effect_fingerprint,
+            )
+            if committed is None:
+                return DecisionReconciliation(
+                    status=DecisionReconciliationStatus.NOT_COMMITTED,
+                    reason="Graph Mutation effect is absent from authoritative storage",
+                )
+            effect = normalized.payload
+            if committed.graph_id != effect.graph_id or committed.version != effect.graph_version_after:
+                return DecisionReconciliation(
+                    status=DecisionReconciliationStatus.UNKNOWN,
+                    reason="Graph Mutation read-back conflicts with the authorized effect",
+                )
+            result: JsonValue = {
+                "graph_id": str(committed.graph_id),
+                "graph_version": committed.version,
+                "mutation_ids": [str(item.mutation_id) for item in effect.mutations],
+            }
+            return DecisionReconciliation(
+                status=DecisionReconciliationStatus.COMMITTED,
+                reason="Graph Mutation effect was committed and read back",
+                apply_receipt=DecisionApplyReceipt(
+                    effect_fingerprint=normalized.effect_fingerprint,
+                    committed_state_fingerprint=governance_fingerprint(result),
+                    result=result,
+                ),
+            )
+
         coordinator = DecisionLifecycleCoordinator[
             GraphMutationDecisionPayload,
             GraphMutationProposalDraft,
@@ -359,6 +418,8 @@ class ResearchGraphMutationDecisionHandler:
             applier=GovernedDecisionApplier(
                 executor=self._operation_executor,
                 apply_effect=apply_effect,
+                apply_normalized_effect=apply_normalized_effect,
+                reconcile_effect=reconcile_effect,
             ),
             checkpoint_store=self._checkpoint_store,
             checkpoint_type=DecisionCheckpoint[
@@ -383,6 +444,18 @@ class ResearchGraphMutationDecisionHandler:
                 ),
             )
             checkpoint = await coordinator.resume_review(request.request_id)
+        if (
+            applied_graph is None
+            and checkpoint.result is not None
+            and checkpoint.result.status is DecisionResultStatus.APPLIED
+            and checkpoint.validated_decision is not None
+        ):
+            applied_graph = await committer.load_graph_effect(
+                run_id=state.run_id,
+                effect_fingerprint=(
+                    checkpoint.validated_decision.normalized_effect.effect_fingerprint
+                ),
+            )
         if (
             checkpoint.result is None
             or checkpoint.result.status is not DecisionResultStatus.APPLIED

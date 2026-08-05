@@ -9,6 +9,7 @@ from pydantic import Field, model_validator
 
 from adaptive_agent_runtime.core.contracts import RuntimeModule
 from adaptive_agent_runtime.orchestration.graph import DynamicTaskGraph
+from adaptive_agent_runtime.orchestration.contracts import GraphDecisionCommitter
 from adaptive_agent_runtime.orchestration.models import OrchestrationModel, TaskNode
 from adaptive_agent_runtime.orchestration.recovery import (
     RecoveryActionType,
@@ -185,7 +186,12 @@ class RecoveryDecisionOutcome(OrchestrationModel):
 class RecoveryDecisionHandler(RuntimeModule, Protocol):
     """Domain integration port; this is not a second Runtime."""
 
-    async def handle(self, context: RecoveryContext) -> RecoveryDecisionOutcome: ...
+    async def handle(
+        self,
+        context: RecoveryContext,
+        *,
+        committer: GraphDecisionCommitter,
+    ) -> RecoveryDecisionOutcome: ...
 
 
 def apply_recovery_decision_effect(

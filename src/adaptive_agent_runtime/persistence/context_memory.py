@@ -14,6 +14,7 @@ from adaptive_agent_runtime.context_memory import (
     ContextUnit,
     MemorySnapshotConflictError,
     MemoryUnit,
+    MemoryBatchWrite,
 )
 from adaptive_agent_runtime.context_memory.json_types import utc_now
 from adaptive_agent_runtime.persistence.sqlite import SQLiteDatabase
@@ -188,8 +189,30 @@ class SQLiteContextArchive:
     def __init__(self, database: SQLiteDatabase) -> None:
         self._database = database
 
-    async def archive(self, unit: ContextUnit) -> ContextArchiveReference:
-        reference = ContextArchiveReference(context_id=unit.context_id)
+    async def archive(
+        self,
+        unit: ContextUnit,
+        *,
+        reference: ContextArchiveReference | None = None,
+    ) -> ContextArchiveReference:
+        reference = reference or ContextArchiveReference(context_id=unit.context_id)
+        if reference.context_id != unit.context_id:
+            raise ContextRecoveryError("archive reference has a different Context identity")
+        with self._database.reader() as cursor:
+            existing_row = cursor.execute(
+                "SELECT context_id, snapshot_json FROM context_archives "
+                "WHERE archive_id = ?",
+                (str(reference.archive_id),),
+            ).fetchone()
+        if existing_row is not None:
+            archived = ContextUnit.model_validate_json(existing_row["snapshot_json"])
+            if UUID(existing_row["context_id"]) != unit.context_id:
+                raise ContextRecoveryError("archive id is bound to another Context")
+            return ContextArchiveReference(
+                archive_id=reference.archive_id,
+                context_id=unit.context_id,
+                archived_at=archived.metadata.updated_at,
+            )
         values = unit.model_dump(mode="python")
         values["lifecycle_state"] = ContextLifecycleState.ARCHIVED
         metadata = unit.metadata.model_dump(mode="python")
@@ -372,6 +395,101 @@ class SQLiteMemoryStore:
             MemoryUnit.model_validate_json(row["snapshot_json"])
             for row in rows
         )
+
+    async def save_batch(
+        self,
+        writes: tuple[MemoryBatchWrite, ...],
+        *,
+        effect_fingerprint: str,
+    ) -> tuple[MemoryUnit, ...]:
+        with self._database.transaction() as cursor:
+            prior = cursor.execute(
+                "SELECT result_json FROM memory_applied_effects "
+                "WHERE effect_fingerprint = ?",
+                (effect_fingerprint,),
+            ).fetchone()
+            if prior is not None:
+                raw = json.loads(prior["result_json"])
+                return tuple(MemoryUnit.model_validate(item) for item in raw)
+            committed: list[MemoryUnit] = []
+            for write in writes:
+                memory = write.memory
+                candidate_id = memory.last_candidate_id
+                if candidate_id is None:
+                    raise MemorySnapshotConflictError(
+                        "Memory batch write has no originating candidate"
+                    )
+                if cursor.execute(
+                    "SELECT 1 FROM memory_applied_candidates WHERE candidate_id = ?",
+                    (str(candidate_id),),
+                ).fetchone() is not None:
+                    raise MemorySnapshotConflictError(
+                        "Memory batch candidate was already applied"
+                    )
+                memory_id = str(memory.memory_id)
+                current = cursor.execute(
+                    "SELECT revision FROM memory_current WHERE memory_id = ?",
+                    (memory_id,),
+                ).fetchone()
+                if write.expected_revision is None:
+                    if current is not None:
+                        raise MemorySnapshotConflictError(
+                            "Memory batch create collides with current state"
+                        )
+                elif (
+                    current is None
+                    or int(current["revision"]) != write.expected_revision
+                    or memory.revision != write.expected_revision + 1
+                ):
+                    raise MemorySnapshotConflictError(
+                        "Memory batch write is based on a stale snapshot"
+                    )
+                cursor.execute(
+                    "INSERT INTO memory_snapshots "
+                    "(memory_id, revision, snapshot_json) VALUES (?, ?, ?)",
+                    (memory_id, memory.revision, _model_json(memory)),
+                )
+                cursor.execute(
+                    "INSERT INTO memory_current(memory_id, revision) VALUES (?, ?) "
+                    "ON CONFLICT(memory_id) DO UPDATE SET revision = excluded.revision",
+                    (memory_id, memory.revision),
+                )
+                cursor.execute(
+                    "INSERT INTO memory_applied_candidates "
+                    "(candidate_id, memory_id, revision) VALUES (?, ?, ?)",
+                    (str(candidate_id), memory_id, memory.revision),
+                )
+                committed.append(memory)
+            result = tuple(committed)
+            cursor.execute(
+                "INSERT INTO memory_applied_effects "
+                "(effect_fingerprint, result_json) VALUES (?, ?)",
+                (
+                    effect_fingerprint,
+                    json.dumps(
+                        [item.model_dump(mode="json") for item in result],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                ),
+            )
+        return result
+
+    async def load_applied_effect(
+        self,
+        effect_fingerprint: str,
+    ) -> tuple[MemoryUnit, ...] | None:
+        with self._database.reader() as cursor:
+            row = cursor.execute(
+                "SELECT result_json FROM memory_applied_effects "
+                "WHERE effect_fingerprint = ?",
+                (effect_fingerprint,),
+            ).fetchone()
+        if row is None:
+            return None
+        raw = json.loads(row["result_json"])
+        return tuple(MemoryUnit.model_validate(item) for item in raw)
 
     async def history_for(self, memory_id: UUID) -> tuple[MemoryUnit, ...]:
         with self._database.reader() as cursor:

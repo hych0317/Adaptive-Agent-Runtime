@@ -16,6 +16,7 @@ from adaptive_agent_runtime.decisioning import (
     DecisionBudget,
     DecisionCheckpoint,
     DecisionCheckpointStage,
+    DecisionCheckpointStore,
     DecisionConstraint,
     DecisionCorrelation,
     DecisionEvidenceReference,
@@ -98,6 +99,11 @@ class ResearchRootCauseDecisionHandler:
         operation_executor: GovernedOperationExecutor,
         trace_sink: TraceSink,
         assessment_store: InMemoryRootCauseAssessmentStore,
+        checkpoint_store: DecisionCheckpointStore[
+            RootCauseDecisionPayload,
+            RootCauseDraft,
+            RootCauseAssessmentEffect,
+        ] | None = None,
     ) -> None:
         self._capability = capability
         self._execution_policy = execution_policy
@@ -107,11 +113,7 @@ class ResearchRootCauseDecisionHandler:
         self._operation_executor = operation_executor
         self._trace_sink = trace_sink
         self._assessment_store = assessment_store
-        self._checkpoints = InMemoryDecisionCheckpointStore[
-            RootCauseDecisionPayload,
-            RootCauseDraft,
-            RootCauseAssessmentEffect,
-        ]()
+        self._checkpoints = checkpoint_store or InMemoryDecisionCheckpointStore()
         self._input_assembler = RootCauseInputAssembler()
 
     async def analyze_inline(

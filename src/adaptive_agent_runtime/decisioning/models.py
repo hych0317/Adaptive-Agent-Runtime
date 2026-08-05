@@ -125,6 +125,15 @@ class DecisionCheckpointStage(StrEnum):
     COMPLETED = "completed"
 
 
+class DecisionReconciliationStatus(StrEnum):
+    """Authoritative state observed while recovering an interrupted Apply."""
+
+    NOT_COMMITTED = "not_committed"
+    COMMITTED = "committed"
+    EXPIRED = "expired"
+    UNKNOWN = "unknown"
+
+
 class DecisionTraceKind(StrEnum):
     REQUESTED = "decision.requested"
     CONTEXT_PROJECTED = "decision.context_projected"
@@ -437,6 +446,7 @@ class DecisionGovernanceReceipt(DecisionModel):
     review_request_id: UUID | None = None
     reason: str = Field(min_length=1)
     decided_at: AwareDatetime
+    approval_snapshot: ImmutableJsonObject | None = None
 
     @model_validator(mode="after")
     def validate_receipt(self) -> DecisionGovernanceReceipt:
@@ -453,8 +463,30 @@ class DecisionGovernanceReceipt(DecisionModel):
 
 class DecisionApplyReceipt(DecisionModel):
     effect_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    committed_state_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     result: ImmutableJsonValue = None
     applied_at: AwareDatetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def validate_committed_state(self) -> DecisionApplyReceipt:
+        if self.committed_state_fingerprint != decision_fingerprint(self.result):
+            raise ValueError("Apply receipt does not match committed read-back result")
+        return self
+
+
+class DecisionReconciliation(DecisionModel):
+    status: DecisionReconciliationStatus
+    reason: str = Field(min_length=1)
+    apply_receipt: DecisionApplyReceipt | None = None
+
+    @model_validator(mode="after")
+    def validate_reconciliation(self) -> DecisionReconciliation:
+        if self.status is DecisionReconciliationStatus.COMMITTED:
+            if self.apply_receipt is None:
+                raise ValueError("committed reconciliation requires an Apply receipt")
+        elif self.apply_receipt is not None:
+            raise ValueError("only committed reconciliation can contain an Apply receipt")
+        return self
 
 
 class DecisionResult(DecisionModel):

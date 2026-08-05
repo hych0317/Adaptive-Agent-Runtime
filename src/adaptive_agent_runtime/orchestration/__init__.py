@@ -3,6 +3,7 @@
 from adaptive_agent_runtime.orchestration.contracts import (
     ExecutionStrategy,
     GraphMutationApplier,
+    GraphDecisionCommitter,
     IsolatedAgentExecutor,
     ReadyTaskNodeSelector,
     TaskGraphStore,
@@ -110,7 +111,10 @@ from adaptive_agent_runtime.orchestration.selection_decision import (
     ready_node_selection_fingerprint,
     stable_ready_node_selection_id,
 )
-from adaptive_agent_runtime.orchestration.store import InMemoryTaskGraphStore
+from adaptive_agent_runtime.orchestration.store import (
+    InMemoryTaskGraphStore,
+    InMemoryGraphDecisionCommitter,
+)
 
 __all__ = [
     "DynamicTaskGraph",
@@ -133,6 +137,7 @@ __all__ = [
     "GraphMutationEffect",
     "GraphMutationExecutionPolicy",
     "GraphMutationApplier",
+    "GraphDecisionCommitter",
     "GraphMutationType",
     "GraphInitializationApplier",
     "GraphValidationReceipt",
@@ -141,6 +146,7 @@ __all__ = [
     "IsolatedAgentExecutor",
     "InFlightTaskAction",
     "InMemoryTaskGraphStore",
+    "InMemoryGraphDecisionCommitter",
     "MockExecutionStrategy",
     "NodeExecutionResult",
     "OrchestrationError",

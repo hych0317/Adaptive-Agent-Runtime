@@ -246,3 +246,88 @@ class GovernedOperationExecutor:
             expected_revision=reserved.revision,
         )
         return result
+
+    async def resume_reserved(
+        self,
+        *,
+        request: GovernanceRequest,
+        decision: GovernanceDecision,
+        authorization: GovernanceAuthorization,
+        target: GovernedOperationTarget[T],
+    ) -> T:
+        """Resume only an already-reserved authorization after a proven no-commit."""
+
+        self._verifier.verify(request, decision, authorization, target)
+        reserved = await self._consumption_store.load(authorization.authorization_id)
+        if reserved is None or reserved.status is not AuthorizationUseStatus.RESERVED:
+            raise AuthorizationReplayError(
+                "only an existing reserved authorization can resume Apply"
+            )
+        try:
+            result = await target.apply()
+        except Exception as exc:
+            detail = str(exc) or exc.__class__.__name__
+            failed = reserved.model_copy(
+                update={
+                    "status": AuthorizationUseStatus.FAILED,
+                    "revision": reserved.revision + 1,
+                    "updated_at": self._clock(),
+                    "error": f"{exc.__class__.__name__}: {detail}",
+                }
+            )
+            await self._consumption_store.resolve(
+                failed, expected_revision=reserved.revision
+            )
+            raise GovernedOperationError(
+                f"governed operation '{target.operation}' failed: {detail}"
+            ) from exc
+        applied = reserved.model_copy(
+            update={
+                "status": AuthorizationUseStatus.APPLIED,
+                "revision": reserved.revision + 1,
+                "updated_at": self._clock(),
+                "result_fingerprint": governance_fingerprint(result),
+            }
+        )
+        await self._consumption_store.resolve(
+            applied, expected_revision=reserved.revision
+        )
+        return result
+
+    async def reconcile_committed(
+        self,
+        *,
+        request: GovernanceRequest,
+        decision: GovernanceDecision,
+        authorization: GovernanceAuthorization,
+        result: object,
+    ) -> None:
+        """Resolve a durable reservation only after domain read-back proved commit."""
+
+        expected = governance_fingerprint(result)
+        current = await self._consumption_store.load(authorization.authorization_id)
+        if current is None:
+            raise AuthorizationUseConflictError(
+                "committed reconciliation has no authorization reservation"
+            )
+        if current.status is AuthorizationUseStatus.APPLIED:
+            if current.result_fingerprint != expected:
+                raise AuthorizationUseConflictError(
+                    "authorization result conflicts with committed read-back"
+                )
+            return
+        if current.status is not AuthorizationUseStatus.RESERVED:
+            raise AuthorizationUseConflictError(
+                "failed authorization cannot reconcile as committed"
+            )
+        applied = current.model_copy(
+            update={
+                "status": AuthorizationUseStatus.APPLIED,
+                "revision": current.revision + 1,
+                "updated_at": self._clock(),
+                "result_fingerprint": expected,
+            }
+        )
+        await self._consumption_store.resolve(
+            applied, expected_revision=current.revision
+        )

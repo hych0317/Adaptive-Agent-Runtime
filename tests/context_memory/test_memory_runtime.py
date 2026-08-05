@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 from uuid import UUID, uuid4
+from adaptive_agent_runtime.decisioning import decision_fingerprint
 
 from adaptive_agent_runtime.context_memory import (
     ConditionalMemoryRecall,
@@ -281,6 +282,50 @@ class MemoryRuntimeTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(await self.store.load(self.initial.memory_id), before)
         self.assertEqual(self.store.history_for(self.initial.memory_id), history)
+
+    async def test_batch_is_all_or_none_and_idempotent_by_effect(self) -> None:
+        before = await self.store.list_all()
+        first = candidate(
+            evolution=MemoryEvolutionType.EXTEND,
+            content="new valid claim",
+            condition=self.condition,
+            note="batch-valid",
+        )
+        invalid = candidate(
+            evolution=MemoryEvolutionType.SUPPORT,
+            content="missing target",
+            condition=self.condition,
+            target=uuid4(),
+            note="batch-invalid",
+        )
+        failed_effect = decision_fingerprint((first, invalid))
+
+        with self.assertRaises(MemoryNotFoundError):
+            await self.consolidator.consolidate_batch(
+                (first, invalid), effect_fingerprint=failed_effect
+            )
+        self.assertEqual(await self.store.list_all(), before)
+        self.assertIsNone(await self.store.load_applied_effect(failed_effect))
+
+        second = candidate(
+            evolution=MemoryEvolutionType.EXTEND,
+            content="second valid claim",
+            condition=self.condition,
+            note="batch-second",
+        )
+        effect = decision_fingerprint((first, second))
+        committed = await self.consolidator.consolidate_batch(
+            (first, second), effect_fingerprint=effect
+        )
+        replay = await self.consolidator.consolidate_batch(
+            (first, second), effect_fingerprint=effect
+        )
+
+        self.assertEqual(replay, committed)
+        self.assertEqual(
+            await self.store.load_applied_effect(effect),
+            tuple(item.memory for item in committed),
+        )
 
 
 if __name__ == "__main__":

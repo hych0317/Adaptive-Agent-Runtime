@@ -5,7 +5,7 @@ from __future__ import annotations
 from asyncio import Lock
 from collections import defaultdict
 from typing import Any, Sequence
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from adaptive_agent_runtime.context_memory.context_models import (
     ContextArchiveReference,
@@ -21,6 +21,9 @@ from adaptive_agent_runtime.context_memory.context_models import (
     ContextSchedule,
     ContextUnit,
     ResidencyPolicy,
+)
+from adaptive_agent_runtime.context_memory.compression_decision import (
+    ContextCompressionEffect,
 )
 from adaptive_agent_runtime.context_memory.contracts import (
     ContextArchive,
@@ -137,8 +140,20 @@ class InMemoryContextArchive:
             tuple[ContextArchiveReference, ContextUnit],
         ] = {}
 
-    async def archive(self, unit: ContextUnit) -> ContextArchiveReference:
-        reference = ContextArchiveReference(context_id=unit.context_id)
+    async def archive(
+        self,
+        unit: ContextUnit,
+        *,
+        reference: ContextArchiveReference | None = None,
+    ) -> ContextArchiveReference:
+        reference = reference or ContextArchiveReference(context_id=unit.context_id)
+        if reference.context_id != unit.context_id:
+            raise ContextRecoveryError("archive reference has a different Context identity")
+        existing = self._records.get(reference.archive_id)
+        if existing is not None:
+            if existing[1].context_id != unit.context_id:
+                raise ContextRecoveryError("archive id is bound to another Context")
+            return existing[0]
         values = unit.model_dump(mode="python")
         values["lifecycle_state"] = ContextLifecycleState.ARCHIVED
         values["metadata"] = _evolve_metadata(unit.metadata)
@@ -207,6 +222,17 @@ class ContextLifecycleManager:
         self._ensure_evictable(unit)
 
         result = await self._compressor.compress(unit)
+        committed = await self._store.load(unit.context_id)
+        if (
+            committed is not None
+            and committed.revision == unit.revision + 1
+            and committed.lifecycle_state is ContextLifecycleState.COMPRESSED
+            and committed.content == result.content
+            and committed.core_conclusions == result.core_conclusions
+            and committed.metadata.estimated_tokens == result.estimated_tokens
+            and committed.recovery_reference is not None
+        ):
+            return committed
         recovery_reference = await self._archive.archive(unit)
         if recovery_reference.context_id != unit.context_id:
             await self._archive.discard(recovery_reference)
@@ -234,6 +260,7 @@ class ContextLifecycleManager:
             await self._archive.discard(recovery_reference)
             raise
         return compressed
+
 
     async def archive(self, context_id: UUID) -> ContextArchiveReference:
         async with self._lock:
@@ -439,6 +466,76 @@ class ContextLifecycleManager:
             raise ContextSnapshotConflictError(
                 "context lifecycle decision is based on a stale snapshot"
             )
+
+
+class ContextCompressionCommitter:
+    """Trusted Context commit boundary used by a governed compression Apply."""
+
+    module_id = "context.compression_committer"
+
+    def __init__(self, *, store: ContextStore, archive: ContextArchive) -> None:
+        self._store = store
+        self._archive = archive
+
+    async def commit(
+        self,
+        source: ContextUnit,
+        effect: ContextCompressionEffect,
+        *,
+        effect_fingerprint: str,
+    ) -> ContextUnit:
+        current = await self._store.load(source.context_id)
+        if current is not None and current.last_effect_fingerprint == effect_fingerprint:
+            return current
+        if current != source:
+            raise ContextSnapshotConflictError(
+                "compression commit source revision is no longer authoritative"
+            )
+        archive_reference = ContextArchiveReference(
+            archive_id=uuid5(source.context_id, effect_fingerprint),
+            context_id=source.context_id,
+        )
+        reference = await self._archive.archive(
+            source,
+            reference=archive_reference,
+        )
+        if reference.context_id != source.context_id:
+            await self._archive.discard(reference)
+            raise ContextRecoveryError("archive returned a different Context identity")
+        metadata = _evolve_metadata(
+            source.metadata,
+            estimated_tokens=effect.estimated_tokens,
+        )
+        compressed = _evolve_unit(
+            source,
+            content=effect.content,
+            metadata=metadata,
+            lifecycle_state=ContextLifecycleState.COMPRESSED,
+            core_conclusions=effect.core_conclusions,
+            recovery_reference=reference,
+            last_effect_fingerprint=effect_fingerprint,
+        )
+        try:
+            await self._store.save(compressed, expected_revision=source.revision)
+        except Exception:
+            await self._archive.discard(reference)
+            raise
+        readback = await self._store.load(source.context_id)
+        if readback != compressed:
+            raise ContextSnapshotConflictError(
+                "compression authoritative commit failed read-back"
+            )
+        return readback
+
+    async def load_effect(
+        self,
+        context_id: UUID,
+        effect_fingerprint: str,
+    ) -> ContextUnit | None:
+        unit = await self._store.load(context_id)
+        if unit is None or unit.last_effect_fingerprint != effect_fingerprint:
+            return None
+        return unit
 
 
 class DeterministicContextPressureMonitor:

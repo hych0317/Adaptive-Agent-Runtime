@@ -22,6 +22,7 @@ from adaptive_agent_runtime.context_memory.memory_models import (
     MemoryRecallQuery,
     MemoryUnit,
     MemoryUpdateResult,
+    MemoryBatchWrite,
 )
 
 
@@ -56,7 +57,12 @@ class ContextCompressor(RuntimeModule, Protocol):
 
 @runtime_checkable
 class ContextArchive(RuntimeModule, Protocol):
-    async def archive(self, unit: ContextUnit) -> ContextArchiveReference: ...
+    async def archive(
+        self,
+        unit: ContextUnit,
+        *,
+        reference: ContextArchiveReference | None = None,
+    ) -> ContextArchiveReference: ...
 
     async def discard(self, reference: ContextArchiveReference) -> None: ...
 
@@ -145,6 +151,18 @@ class MemoryStore(RuntimeModule, Protocol):
 
     async def list_all(self) -> tuple[MemoryUnit, ...]: ...
 
+    async def save_batch(
+        self,
+        writes: tuple[MemoryBatchWrite, ...],
+        *,
+        effect_fingerprint: str,
+    ) -> tuple[MemoryUnit, ...]: ...
+
+    async def load_applied_effect(
+        self,
+        effect_fingerprint: str,
+    ) -> tuple[MemoryUnit, ...] | None: ...
+
 
 @runtime_checkable
 class MemoryConsolidation(RuntimeModule, Protocol):
@@ -152,6 +170,13 @@ class MemoryConsolidation(RuntimeModule, Protocol):
         self,
         candidate: MemoryCandidate,
     ) -> MemoryUpdateResult: ...
+
+    async def consolidate_batch(
+        self,
+        candidates: tuple[MemoryCandidate, ...],
+        *,
+        effect_fingerprint: str,
+    ) -> tuple[MemoryUpdateResult, ...]: ...
 
 
 @runtime_checkable
