@@ -1,0 +1,283 @@
+"""Terminal Provider that exposes only the current trial BaseEnvironment port."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from datetime import datetime
+from typing import cast
+
+from adaptive_agent_runtime.tool_ecosystem import (
+    RetryStatus,
+    ToolAttempt,
+    ToolAttemptStatus,
+    ToolExecutionStatus,
+    ToolInvocation,
+    ToolObservation,
+    ToolProviderMetadata,
+    ToolProviderResult,
+)
+from adaptive_agent_runtime.tool_ecosystem.models import ImmutableJsonObject
+
+from applications.terminal_bench.contracts import (
+    TerminalEnvironment,
+    TerminalExecutionError,
+    TerminalTrialJournal,
+)
+from applications.terminal_bench.models import (
+    TERMINAL_COMMAND_CAPABILITY,
+    TERMINAL_COMMAND_PROVIDER,
+    TerminalCommandIntent,
+    TerminalExecResult,
+    TerminalExecutionPolicy,
+    TerminalExecutionState,
+    utc_now,
+)
+
+
+def terminal_provider_metadata(
+    policy: TerminalExecutionPolicy,
+) -> ToolProviderMetadata:
+    process_reference_schema = {
+        "type": ["object", "null"],
+        "properties": {
+            "reference_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "pid_file": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "log_path": {"type": "string", "minLength": 1, "maxLength": 4096},
+            "status_check_command": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": policy.max_command_characters,
+            },
+            "stop_command": {
+                "type": ["string", "null"],
+                "minLength": 1,
+                "maxLength": policy.max_command_characters,
+            },
+        },
+        "required": [
+            "reference_id",
+            "pid_file",
+            "log_path",
+            "status_check_command",
+            "stop_command",
+        ],
+        "additionalProperties": False,
+    }
+    schema = {
+        "type": "object",
+        "properties": {
+            "trial_id": {"type": "string", "minLength": 1},
+            "command": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": policy.max_command_characters,
+            },
+            "cwd": {
+                "type": ["string", "null"],
+                "minLength": 1,
+                "maxLength": 4096,
+            },
+            "env": {
+                "type": "object",
+                "maxProperties": policy.max_environment_variables,
+                "additionalProperties": {
+                    "type": "string",
+                    "maxLength": policy.max_environment_value_characters,
+                },
+            },
+            "timeout_sec": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": policy.max_timeout_sec,
+            },
+            "process_reference": process_reference_schema,
+        },
+        "required": [
+            "trial_id",
+            "command",
+            "cwd",
+            "env",
+            "timeout_sec",
+            "process_reference",
+        ],
+        "additionalProperties": False,
+    }
+    return ToolProviderMetadata(
+        provider_id=TERMINAL_COMMAND_PROVIDER,
+        name="Harbor trial command execution",
+        capability_id=TERMINAL_COMMAND_CAPABILITY,
+        description=(
+            "Execute one independent non-interactive command in the current "
+            "Harbor trial's main BaseEnvironment."
+        ),
+        input_schema=cast(ImmutableJsonObject, schema),
+        tags=("terminal", "harbor", "trial_scoped"),
+        selection_priority=100,
+    )
+
+
+class TerminalCommandProvider:
+    module_id = "terminal_bench.provider.harbor_environment"
+    provider_id = TERMINAL_COMMAND_PROVIDER
+
+    def __init__(
+        self,
+        *,
+        environment: TerminalEnvironment,
+        journal: TerminalTrialJournal,
+        policy: TerminalExecutionPolicy,
+    ) -> None:
+        self._environment = environment
+        self._journal = journal
+        self._policy = policy
+
+    async def invoke(self, invocation: ToolInvocation) -> ToolProviderResult:
+        try:
+            intent = TerminalCommandIntent.model_validate(
+                {
+                    **dict(invocation.arguments),
+                    "call_key": "runtime-bound",
+                }
+            )
+        except Exception as exc:
+            return ToolProviderResult.failed(
+                error=f"invalid terminal invocation: {exc}",
+                retryable=False,
+            )
+        if intent.trial_id != self._journal.trial_id:
+            return ToolProviderResult.failed(
+                error="terminal invocation escaped its trial scope",
+                retryable=False,
+            )
+        started_at = utc_now()
+        try:
+            result = await self._environment.exec(
+                intent.command,
+                cwd=intent.cwd,
+                env=dict(intent.env),
+                timeout_sec=intent.timeout_sec,
+            )
+            if not isinstance(result, TerminalExecResult):
+                raise TypeError("TerminalEnvironment must return TerminalExecResult")
+        except TerminalExecutionError as exc:
+            result = self._failure_result(
+                exc,
+                started_at=started_at,
+                state=(
+                    TerminalExecutionState.FAILED_TO_START
+                    if exc.command_started is False
+                    else TerminalExecutionState.IN_DOUBT
+                ),
+                timed_out=exc.timed_out,
+            )
+        except TimeoutError as exc:
+            result = self._failure_result(
+                exc,
+                started_at=started_at,
+                state=TerminalExecutionState.IN_DOUBT,
+                timed_out=True,
+            )
+        except Exception as exc:
+            result = self._failure_result(
+                exc,
+                started_at=started_at,
+                state=TerminalExecutionState.IN_DOUBT,
+                timed_out=False,
+            )
+        result = self._bounded_output(result)
+        self._journal.record_execution(invocation.invocation_id, result)
+        if result.execution_state is TerminalExecutionState.COMPLETED:
+            return ToolProviderResult.ok(output=result.model_dump(mode="json"))
+        return ToolProviderResult.failed(
+            error=(
+                f"terminal execution {result.execution_state.value}: "
+                f"{result.stderr or 'no final process status'}"
+            ),
+            retryable=False,
+        )
+
+    @staticmethod
+    def _failure_result(
+        exc: BaseException,
+        *,
+        started_at: datetime,
+        state: TerminalExecutionState,
+        timed_out: bool,
+    ) -> TerminalExecResult:
+        completed_at = utc_now()
+        detail = str(exc) or exc.__class__.__name__
+        return TerminalExecResult(
+            stderr=f"{exc.__class__.__name__}: {detail}",
+            started_at=started_at,
+            completed_at=completed_at,
+            duration_ms=max(
+                0,
+                int((completed_at - started_at).total_seconds() * 1000),
+            ),
+            execution_state=state,
+            timed_out=timed_out,
+            transport_failed=True,
+        )
+
+    def _bounded_output(self, result: TerminalExecResult) -> TerminalExecResult:
+        limit = self._policy.max_output_characters
+        stdout, stdout_truncated = _truncate(result.stdout, limit)
+        stderr, stderr_truncated = _truncate(result.stderr, limit)
+        return result.model_copy(
+            update={
+                "stdout": stdout,
+                "stderr": stderr,
+                "stdout_truncated": result.stdout_truncated or stdout_truncated,
+                "stderr_truncated": result.stderr_truncated or stderr_truncated,
+            }
+        )
+
+
+def terminal_tool_observation_from_result(
+    invocation: ToolInvocation,
+    result: TerminalExecResult,
+) -> ToolObservation:
+    """Reconstruct an authoritative Tool result without replaying the command."""
+
+    succeeded = result.execution_state is TerminalExecutionState.COMPLETED
+    attempt_status = (
+        ToolAttemptStatus.SUCCEEDED if succeeded else ToolAttemptStatus.FAILED
+    )
+    error = None if succeeded else (
+        f"terminal execution {result.execution_state.value}: "
+        f"{result.stderr or 'no final process status'}"
+    )
+    attempt = ToolAttempt(
+        attempt_number=1,
+        status=attempt_status,
+        started_at=result.started_at,
+        completed_at=result.completed_at,
+        output=result.model_dump(mode="json") if succeeded else None,
+        error=error,
+        retryable=False,
+    )
+    return ToolObservation(
+        invocation_id=invocation.invocation_id,
+        requirement_id=invocation.requirement_id,
+        capability_id=invocation.capability_id,
+        provider_id=invocation.provider_id,
+        status=(
+            ToolExecutionStatus.SUCCEEDED
+            if succeeded
+            else ToolExecutionStatus.FAILED
+        ),
+        retry_status=RetryStatus.NOT_RETRIED,
+        output=result.model_dump(mode="json") if succeeded else None,
+        error=error,
+        attempts=(attempt,),
+        correlation=invocation.correlation,
+        started_at=result.started_at,
+        completed_at=result.completed_at,
+    )
+
+
+def _truncate(value: str, limit: int) -> tuple[str, bool]:
+    if len(value) <= limit:
+        return value, False
+    half = max(1, limit // 2)
+    return value[:half] + "\n...[output truncated]...\n" + value[-half:], True

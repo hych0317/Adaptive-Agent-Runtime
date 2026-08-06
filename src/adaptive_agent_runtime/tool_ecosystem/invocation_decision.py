@@ -152,8 +152,19 @@ def _validate_arguments(
         validator = Draft202012Validator(schema)
     except SchemaError as exc:
         raise ValueError("Tool Provider input schema is invalid") from exc
-    if not validator.is_valid(dict(arguments)):
+    # Tool snapshots are deeply immutable and therefore contain nested
+    # MappingProxyType values. jsonschema's default object type checker only
+    # recognizes dict, so validate the serializer-thawed JSON representation.
+    if not validator.is_valid(_plain_json(arguments)):
         raise ValueError("Tool invocation arguments do not match Provider schema")
+
+
+def _plain_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _plain_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_json(item) for item in value]
+    return value
 
 
 def _validate_exact_constraints(
