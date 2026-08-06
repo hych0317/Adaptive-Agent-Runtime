@@ -39,7 +39,7 @@ from adaptive_agent_runtime.context_memory.memory_models import (
     MemoryRecallQuery,
     MemoryUnit,
 )
-from adaptive_agent_runtime.orchestration import TaskNode
+from adaptive_agent_runtime.orchestration.models import TaskNode
 
 
 _OBSERVATION_CONTEXT_NAMESPACE = uuid5(

@@ -110,7 +110,12 @@ class SQLiteDecisionFeedbackStore(DecisionFeedbackStore):
                 raise PersistenceConflictError("Feedback source Run is not persisted")
             state = AgentState.model_validate_json(state_row["snapshot_json"])
             if (
-                state.status not in {RunStatus.COMPLETED, RunStatus.FAILED}
+                state.status
+                not in {
+                    RunStatus.COMPLETED,
+                    RunStatus.FAILED,
+                    RunStatus.TERMINATED,
+                }
                 or state.task.task_id != effect.source_task_id
                 or state.revision != effect.runtime_observation.state_revision
                 or decision_fingerprint(state)

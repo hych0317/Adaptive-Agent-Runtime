@@ -200,6 +200,7 @@ class RuntimeTraceAdapter:
         terminal_kinds = {
             CoreEventKind.RUNTIME_COMPLETED.value,
             CoreEventKind.RUNTIME_FAILED.value,
+            CoreEventKind.RUNTIME_TERMINATED.value,
         }
         starts = tuple(
             entry for entry in entries if entry.event.kind == start_kind
@@ -327,6 +328,7 @@ class RuntimeTraceAdapter:
         if kind in {
             CoreEventKind.RUNTIME_COMPLETED.value,
             CoreEventKind.RUNTIME_FAILED.value,
+            CoreEventKind.RUNTIME_TERMINATED.value,
         }:
             return EvaluationComponent.RUNTIME, TraceCategory.FINAL_RESULT
         if correlation.graph_id is not None and kind == CoreEventKind.PLAN_CREATED.value:
@@ -788,6 +790,9 @@ class EvaluationInputAssembler:
     @staticmethod
     def _state_snapshot(state: AgentState) -> EvaluationStateSnapshot:
         dumped = state.model_dump(mode="json")
+        terminal_error = state.error
+        if terminal_error is None and state.termination is not None:
+            terminal_error = state.termination.evidence[0].message
         return EvaluationStateSnapshot(
             run_id=state.run_id,
             task_id=state.task.task_id,
@@ -796,19 +801,22 @@ class EvaluationInputAssembler:
             revision=state.revision,
             step_count=state.step_count,
             output=dumped["output"],
-            error=state.error,
+            error=terminal_error,
             captured_at=state.updated_at,
         )
 
     @staticmethod
     def _result_snapshot(state: AgentState) -> ExecutionResultSnapshot:
         dumped = state.model_dump(mode="json")
+        terminal_error = state.error
+        if terminal_error is None and state.termination is not None:
+            terminal_error = state.termination.evidence[0].message
         return ExecutionResultSnapshot(
             run_id=state.run_id,
             task_id=state.task.task_id,
             succeeded=state.status.value == ExecutionStatus.COMPLETED.value,
             output=dumped["output"],
-            error=state.error,
+            error=terminal_error,
             completed_at=state.updated_at,
         )
 

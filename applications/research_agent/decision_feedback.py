@@ -663,7 +663,11 @@ class ResearchDecisionFeedbackHandler:
         artifact: WorkspaceArtifactCommitReceipt,
         experience: ExperienceMetadata,
     ) -> None:
-        if state.status not in {RunStatus.COMPLETED, RunStatus.FAILED}:
+        if state.status not in {
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.TERMINATED,
+        }:
             raise ValueError("Decision Feedback requires a completed Run")
         if evaluation.run_id != state.run_id or evaluation.task_id != state.task.task_id:
             raise ValueError("Decision Feedback Evaluation identity is mismatched")

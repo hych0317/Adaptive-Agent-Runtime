@@ -9,16 +9,26 @@ from adaptive_agent_runtime import (
     AgentState,
     AgentTask,
     CoreEventKind,
+    FailureCriticality,
+    FailureDisposition,
+    FailureRecoveryStatus,
     InMemoryStateStore,
     InMemoryTraceSink,
     Observation,
+    ObservationControl,
     PlanDecision,
+    ProgressKind,
     RunStatus,
+    RunStopPolicy,
+    RunTerminationReason,
     RuntimeInfrastructureError,
     RuntimeInvariantError,
+    RuntimeResumeBlockedError,
+    RuntimeResumeError,
     RuntimeEvent,
     TraceEntry,
 )
+from adaptive_agent_runtime.core.budget import current_run_budget_ledger
 
 
 class FeedbackPlanner:
@@ -102,6 +112,60 @@ class FailedObservationExecutor:
         return Observation.failed(action.action_id, error="expected failure")
 
 
+class RepeatingPlanner:
+    module_id = "test.repeating_planner"
+
+    async def plan(self, state: AgentState) -> PlanDecision:
+        return PlanDecision.execute(
+            ActionRequest(
+                name="lookup",
+                arguments={
+                    "query": "same",
+                    # Volatile idempotency identity must not evade the guard.
+                    "call_key": f"attempt-{state.step_count + 1}",
+                },
+            )
+        )
+
+
+class NoProgressExecutor(CountingExecutor):
+    async def execute(
+        self,
+        action: ActionRequest,
+        state: AgentState,
+    ) -> Observation:
+        self.calls += 1
+        self.received_states.append(state)
+        return Observation.ok(
+            action.action_id,
+            output={"unchanged": True},
+            control=ObservationControl(progress_kind=ProgressKind.NO_PROGRESS),
+        )
+
+
+class CriticalFailureExecutor(CountingExecutor):
+    async def execute(
+        self,
+        action: ActionRequest,
+        state: AgentState,
+    ) -> Observation:
+        self.calls += 1
+        self.received_states.append(state)
+        return Observation.failed(
+            action.action_id,
+            error="critical provider is permanently unavailable",
+            control=ObservationControl(
+                progress_kind=ProgressKind.NO_PROGRESS,
+                failure=FailureDisposition(
+                    failure_code="tool.provider_unavailable",
+                    criticality=FailureCriticality.CRITICAL,
+                    retryable=False,
+                    recovery_status=FailureRecoveryStatus.UNAVAILABLE,
+                ),
+            ),
+        )
+
+
 class RecoveringPlanner:
     module_id = "test.recovering_planner"
 
@@ -119,6 +183,29 @@ class FailingTraceSink:
     async def record(self, event: RuntimeEvent) -> TraceEntry:
         del event
         raise OSError("trace unavailable")
+
+
+class ResumeBlockedPlanner:
+    module_id = "test.resume_blocked_planner"
+
+    async def plan(self, state: AgentState) -> PlanDecision:
+        del state
+        raise RuntimeResumeBlockedError("outcome is in doubt")
+
+
+class BudgetThenBlockedPlanner:
+    module_id = "test.budget_then_blocked_planner"
+
+    async def plan(self, state: AgentState) -> PlanDecision:
+        del state
+        ledger = current_run_budget_ledger()
+        assert ledger is not None
+        await ledger.record_usage(
+            total_tokens=3,
+            monetary_cost=None,
+            currency=None,
+        )
+        raise RuntimeResumeBlockedError("outcome is in doubt")
 
 
 class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
@@ -283,10 +370,108 @@ class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(executor.calls, 2)
         self.assertEqual(result.final_state.step_count, 2)
+        self.assertEqual(result.final_state.status, RunStatus.TERMINATED)
+        self.assertIsNone(result.final_state.error)
+        self.assertIsNotNone(result.final_state.termination)
+        assert result.final_state.termination is not None
+        self.assertEqual(
+            result.final_state.termination.primary_reason.value,
+            "max_action_steps",
+        )
+
+    async def test_third_identical_action_is_stopped_before_execution(self) -> None:
+        executor = CountingExecutor()
+        result = await AgentRuntime(
+            planner=RepeatingPlanner(),
+            executor=executor,
+            state_store=InMemoryStateStore(),
+            trace_sink=InMemoryTraceSink(),
+            stop_policy=RunStopPolicy(
+                max_action_steps=10,
+                repeated_invocation_limit=3,
+                max_no_progress_steps=None,
+                max_no_progress_seconds=None,
+            ),
+        ).run(AgentTask(description="detect an invocation loop"))
+
+        self.assertEqual(executor.calls, 2)
+        self.assertEqual(result.final_state.status, RunStatus.TERMINATED)
+        assert result.final_state.termination is not None
+        self.assertEqual(
+            result.final_state.termination.primary_reason,
+            RunTerminationReason.REPEATED_INVOCATION,
+        )
+
+    async def test_no_progress_steps_terminate_even_when_actions_differ(self) -> None:
+        executor = NoProgressExecutor()
+        result = await AgentRuntime(
+            planner=FeedbackPlanner(target_steps=10),
+            executor=executor,
+            state_store=InMemoryStateStore(),
+            trace_sink=InMemoryTraceSink(),
+            stop_policy=RunStopPolicy(
+                max_action_steps=10,
+                repeated_invocation_limit=None,
+                max_no_progress_steps=2,
+                max_no_progress_seconds=None,
+            ),
+        ).run(AgentTask(description="detect stagnation"))
+
+        self.assertEqual(executor.calls, 2)
+        self.assertEqual(result.final_state.status, RunStatus.TERMINATED)
+        assert result.final_state.termination is not None
+        self.assertEqual(
+            result.final_state.termination.primary_reason,
+            RunTerminationReason.NO_PROGRESS_STEPS,
+        )
+
+    async def test_critical_nonrecoverable_failure_is_structured_failure(self) -> None:
+        result = await AgentRuntime(
+            planner=FeedbackPlanner(target_steps=2),
+            executor=CriticalFailureExecutor(),
+            state_store=InMemoryStateStore(),
+            trace_sink=InMemoryTraceSink(),
+        ).run(AgentTask(description="critical Tool failure"))
+
         self.assertEqual(result.final_state.status, RunStatus.FAILED)
-        self.assertIsNotNone(result.final_state.error)
-        assert result.final_state.error is not None
-        self.assertIn("maximum action steps", result.final_state.error)
+        assert result.final_state.termination is not None
+        self.assertEqual(
+            result.final_state.termination.primary_reason,
+            RunTerminationReason.CRITICAL_TOOL_FAILURE,
+        )
+
+    async def test_tool_is_not_started_without_its_full_deadline(self) -> None:
+        class LongToolPlanner:
+            module_id = "test.long_tool_planner"
+
+            async def plan(self, state: AgentState) -> PlanDecision:
+                del state
+                return PlanDecision.execute(
+                    ActionRequest(name="long", timeout_seconds=5.0)
+                )
+
+        executor = CountingExecutor()
+        result = await AgentRuntime(
+            planner=LongToolPlanner(),
+            executor=executor,
+            state_store=InMemoryStateStore(),
+            trace_sink=InMemoryTraceSink(),
+            stop_policy=RunStopPolicy(
+                max_action_steps=2,
+                max_wall_clock_seconds=2.0,
+                cleanup_grace_seconds=1.0,
+                max_no_progress_steps=None,
+                max_no_progress_seconds=None,
+            ),
+        ).run(AgentTask(description="admit a long Tool"))
+
+        self.assertEqual(executor.calls, 0)
+        self.assertEqual(result.final_state.status, RunStatus.TERMINATED)
+        assert result.final_state.termination is not None
+        self.assertEqual(
+            result.final_state.termination.primary_reason,
+            RunTerminationReason.WALL_CLOCK_DEADLINE,
+        )
 
     async def test_trace_failure_is_not_reported_as_success(self) -> None:
         runtime = AgentRuntime(
@@ -318,6 +503,67 @@ class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await store.load(run_id), first.final_state)
         self.assertEqual(trace.entries_for(run_id), first_trace)
+
+    async def test_resume_rejects_a_different_stop_policy(self) -> None:
+        store = InMemoryStateStore()
+        run_id = uuid4()
+        first = AgentRuntime(
+            planner=ResumeBlockedPlanner(),
+            executor=CountingExecutor(),
+            state_store=store,
+            trace_sink=InMemoryTraceSink(),
+            stop_policy=RunStopPolicy(max_action_steps=4),
+        )
+        with self.assertRaises(RuntimeResumeBlockedError):
+            await first.run(
+                AgentTask(description="persist policy"),
+                run_id=run_id,
+            )
+
+        resumed = AgentRuntime(
+            planner=FeedbackPlanner(),
+            executor=CountingExecutor(),
+            state_store=store,
+            trace_sink=InMemoryTraceSink(),
+            stop_policy=RunStopPolicy(max_action_steps=5),
+        )
+        with self.assertRaises(RuntimeResumeError):
+            await resumed.resume(run_id)
+
+    async def test_resume_block_persists_usage_without_advancing_action(self) -> None:
+        store = InMemoryStateStore()
+        run_id = uuid4()
+        policy = RunStopPolicy(max_total_tokens=10)
+        blocked = AgentRuntime(
+            planner=BudgetThenBlockedPlanner(),
+            executor=CountingExecutor(),
+            state_store=store,
+            trace_sink=InMemoryTraceSink(),
+            stop_policy=policy,
+        )
+
+        with self.assertRaises(RuntimeResumeBlockedError):
+            await blocked.run(
+                AgentTask(description="account before blocking"),
+                run_id=run_id,
+            )
+
+        persisted = await store.load(run_id)
+        self.assertIsNotNone(persisted)
+        assert persisted is not None
+        self.assertEqual(persisted.status, RunStatus.RUNNING)
+        self.assertEqual(persisted.step_count, 0)
+        self.assertEqual(persisted.control.usage.total_tokens, 3)
+
+        resumed = await AgentRuntime(
+            planner=FeedbackPlanner(target_steps=0),
+            executor=CountingExecutor(),
+            state_store=store,
+            trace_sink=InMemoryTraceSink(),
+            stop_policy=policy,
+        ).resume(run_id)
+        self.assertEqual(resumed.final_state.status, RunStatus.COMPLETED)
+        self.assertEqual(resumed.final_state.control.usage.total_tokens, 3)
 
 
 if __name__ == "__main__":

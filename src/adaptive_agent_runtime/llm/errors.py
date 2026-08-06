@@ -327,6 +327,10 @@ class InferenceContractError(BackendProtocolError):
     """Raised when a Backend violates request/response identity."""
 
 
+class InferenceUsageAccountingError(InferenceContractError):
+    """Raised when a Backend omits usage it promised to report."""
+
+
 class FakeInferenceResponseNotFoundError(BackendProtocolError):
     def __init__(self, target_id: str, request_id: object) -> None:
         super().__init__(

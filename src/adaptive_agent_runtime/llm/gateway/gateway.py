@@ -6,6 +6,8 @@ from asyncio import timeout as async_timeout
 from collections.abc import Callable
 from time import monotonic
 
+from adaptive_agent_runtime.core.budget import current_run_budget_ledger
+from adaptive_agent_runtime.core.errors import RunUsageAccountingError
 from adaptive_agent_runtime.llm.adapters.contracts import (
     InferenceResponseValidator,
 )
@@ -17,6 +19,7 @@ from adaptive_agent_runtime.llm.errors import (
     InferenceContractError,
     InferenceExecutionBudgetError,
     InferenceResponseBudgetError,
+    InferenceUsageAccountingError,
     NoEligibleInferenceTargetError,
 )
 from adaptive_agent_runtime.llm.gateway.contracts import (
@@ -98,6 +101,74 @@ class ManagedInferenceGateway:
         return probe
 
     async def execute(
+        self,
+        request: InferenceRequest,
+        policy: InferenceGatewayPolicy,
+    ) -> NormalizedModelResponse:
+        """Execute and account one response against any context-bound Run."""
+
+        ledger = current_run_budget_ledger()
+        if ledger is None or request.correlation.run_id not in {
+            None,
+            ledger.run_id,
+        }:
+            return await self._execute_unaccounted(request, policy)
+        reservation = await ledger.reserve(
+            request.request_id,
+            requested_max_tokens=policy.budget.max_total_tokens,
+            requested_max_cost=policy.budget.max_response_cost,
+            currency=policy.budget.currency,
+        )
+        budget_updates: dict[str, object] = {}
+        if ledger.policy.max_total_tokens is not None:
+            budget_updates["max_total_tokens"] = reservation.reserved_tokens
+        if ledger.policy.max_monetary_cost is not None:
+            budget_updates.update(
+                {
+                    "max_response_cost": reservation.reserved_cost,
+                    "currency": ledger.policy.currency,
+                }
+            )
+        effective_policy = (
+            policy
+            if not budget_updates
+            else policy.model_copy(
+                update={
+                    "budget": policy.budget.model_copy(update=budget_updates)
+                }
+            )
+        )
+        try:
+            response = await self._execute_unaccounted(request, effective_policy)
+        except InferenceUsageAccountingError as exc:
+            await ledger.release(reservation)
+            raise RunUsageAccountingError(
+                "authoritative inference usage is missing for a budgeted Run"
+            ) from exc
+        except InferenceResponseBudgetError as exc:
+            if "usage is missing" in str(exc):
+                await ledger.release(reservation)
+                raise RunUsageAccountingError(
+                    "authoritative inference usage is missing for a budgeted Run"
+                ) from exc
+            await ledger.consume_reservation(reservation)
+            raise
+        except Exception:
+            await ledger.release(reservation)
+            raise
+        try:
+            await ledger.commit(
+                reservation,
+                total_tokens=response.usage.total_tokens,
+                monetary_cost=response.usage.monetary_cost,
+                currency=response.usage.currency,
+            )
+        except Exception:
+            await ledger.release(reservation)
+            raise
+        return response
+
+    async def _execute_unaccounted(
         self,
         request: InferenceRequest,
         policy: InferenceGatewayPolicy,

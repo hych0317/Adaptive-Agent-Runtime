@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from time import monotonic
 from typing import Any, Mapping
 from uuid import UUID
 
@@ -14,10 +15,20 @@ from adaptive_agent_runtime.core.contracts import (
     TraceSink,
 )
 from adaptive_agent_runtime.core.errors import (
+    RunBudgetExhaustedError,
+    RunUsageAccountingError,
     RuntimeInfrastructureError,
     RuntimeInvariantError,
     RuntimeResumeBlockedError,
     RuntimeResumeError,
+)
+from adaptive_agent_runtime.core.budget import (
+    RunBudgetLedger,
+    bind_run_budget_ledger,
+)
+from adaptive_agent_runtime.core.invocation import (
+    RunInvocationGuard,
+    bind_run_invocation_guard,
 )
 from adaptive_agent_runtime.core.models import (
     AgentState,
@@ -27,8 +38,12 @@ from adaptive_agent_runtime.core.models import (
     PlanDecision,
     PlanDecisionType,
     RunResult,
+    RunControlState,
     RunStatus,
+    RunStopPolicy,
+    RunTerminationReason,
     RuntimeEvent,
+    TerminationCheckPhase,
 )
 from adaptive_agent_runtime.core.state import (
     complete_state,
@@ -36,6 +51,12 @@ from adaptive_agent_runtime.core.state import (
     fail_state,
     record_observation,
     start_state,
+    terminate_state,
+    update_control_state,
+)
+from adaptive_agent_runtime.core.termination import (
+    RunTerminationController,
+    StopAssessment,
 )
 
 
@@ -51,15 +72,21 @@ class AgentRuntime:
         executor: ActionExecutor,
         state_store: StateStore,
         trace_sink: TraceSink,
-        max_steps: int = 16,
+        max_steps: int | None = None,
+        stop_policy: RunStopPolicy | None = None,
     ) -> None:
-        if max_steps < 1:
+        if max_steps is not None and max_steps < 1:
             raise ValueError("max_steps must be at least 1")
+        if stop_policy is None:
+            stop_policy = RunStopPolicy(max_action_steps=max_steps or 16)
+        elif max_steps is not None and max_steps != stop_policy.max_action_steps:
+            raise ValueError("max_steps conflicts with RunStopPolicy")
         self._planner = planner
         self._executor = executor
         self._state_store = state_store
         self._trace_sink = trace_sink
-        self._max_steps = max_steps
+        self._stop_policy = stop_policy
+        self._termination = RunTerminationController(stop_policy)
 
     async def run(
         self,
@@ -67,7 +94,11 @@ class AgentRuntime:
         *,
         run_id: UUID | None = None,
     ) -> RunResult:
-        state = create_state(task, run_id=run_id)
+        state = create_state(
+            task,
+            run_id=run_id,
+            stop_policy=self._stop_policy,
+        )
         if await self._load_state(state.run_id) is not None:
             raise RuntimeInvariantError(
                 f"run_id '{state.run_id}' already exists; "
@@ -92,13 +123,18 @@ class AgentRuntime:
         Terminal runs are returned unchanged. A pending run is started for the
         first time; a running run continues from its latest immutable snapshot.
         Planners may raise RuntimeResumeBlockedError when an external action is
-        in doubt. That signal deliberately leaves the persisted run untouched.
+        in doubt. That signal does not advance or replay an Action; elapsed time
+        and authoritative resource usage are still persisted.
         """
 
         state = await self._load_state(run_id)
         if state is None:
             raise RuntimeResumeError(f"run '{run_id}' does not exist")
-        if state.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
+        if state.status in {
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.TERMINATED,
+        }:
             return RunResult(final_state=state)
         if state.status is RunStatus.PENDING:
             state = start_state(state)
@@ -115,18 +151,173 @@ class AgentRuntime:
     async def _drive(self, state: AgentState) -> RunResult:
         """Run the unchanged Plan/Execute/Observe loop from one snapshot."""
 
+        try:
+            control = self._termination.reconcile_control(state)
+        except ValueError as exc:
+            raise RuntimeResumeError(
+                f"run '{state.run_id}' cannot use this stop policy: {exc}"
+            ) from exc
+        ledger = RunBudgetLedger(
+            run_id=state.run_id,
+            policy=self._stop_policy,
+            initial_usage=control.usage,
+        )
+        invocation_guard = RunInvocationGuard(
+            repeated_invocation_limit=self._stop_policy.repeated_invocation_limit,
+            initial_fingerprint=control.last_tool_invocation_fingerprint,
+            initial_count=control.consecutive_identical_tool_invocations,
+        )
+        with bind_run_budget_ledger(ledger):
+            with bind_run_invocation_guard(invocation_guard):
+                return await self._drive_bound(
+                    state,
+                    control,
+                    ledger,
+                    invocation_guard,
+                )
+
+    async def _drive_bound(
+        self,
+        state: AgentState,
+        control: RunControlState,
+        ledger: RunBudgetLedger,
+        invocation_guard: RunInvocationGuard,
+    ) -> RunResult:
+        """Drive one Run while its aggregate budget ledger is context-bound."""
+
         while True:
+            usage = await ledger.snapshot()
+            control = self._termination.with_usage(control, usage)
+            assessment = self._termination.before_planning(
+                control,
+                phase=TerminationCheckPhase.BEFORE_PLANNING,
+            )
+            if assessment is not None:
+                return await self._stop_run(state, control, assessment)
+
+            planning_started = monotonic()
             try:
                 decision = await self._planner.plan(state)
                 if not isinstance(decision, PlanDecision):
                     raise TypeError("planner must return PlanDecision")
             except RuntimeResumeBlockedError:
+                usage = await ledger.snapshot()
+                control = self._termination.after_planning(
+                    control,
+                    elapsed_seconds=monotonic() - planning_started,
+                    usage=usage,
+                )
+                guard_snapshot = await invocation_guard.snapshot()
+                control = control.model_copy(
+                    update={
+                        "last_tool_invocation_fingerprint": (
+                            guard_snapshot.fingerprint
+                        ),
+                        "consecutive_identical_tool_invocations": (
+                            guard_snapshot.consecutive_count
+                        ),
+                    }
+                )
+                assessment = self._termination.before_planning(
+                    control,
+                    phase=TerminationCheckPhase.AFTER_PLANNING,
+                )
+                if assessment is None and guard_snapshot.blocked:
+                    assessment = self._termination.explicit_stop(
+                        RunTerminationReason.REPEATED_INVOCATION,
+                        phase=TerminationCheckPhase.AFTER_PLANNING,
+                        control=control,
+                        message=(
+                            "consecutive identical Tool invocation limit reached"
+                        ),
+                    )
+                if assessment is not None:
+                    return await self._stop_run(state, control, assessment)
+                previous = state
+                state = update_control_state(state, control)
+                await self._save_state(state)
+                await self._emit_state_update(previous, state)
                 raise
             except Exception as exc:
+                usage = await ledger.snapshot()
+                control = self._termination.after_planning(
+                    control,
+                    elapsed_seconds=monotonic() - planning_started,
+                    usage=usage,
+                )
+                assessment = self._termination.before_planning(
+                    control,
+                    phase=TerminationCheckPhase.AFTER_PLANNING,
+                )
+                guard_snapshot = await invocation_guard.snapshot()
+                control = control.model_copy(
+                    update={
+                        "last_tool_invocation_fingerprint": (
+                            guard_snapshot.fingerprint
+                        ),
+                        "consecutive_identical_tool_invocations": (
+                            guard_snapshot.consecutive_count
+                        ),
+                    }
+                )
+                if assessment is None and guard_snapshot.blocked:
+                    assessment = self._termination.explicit_stop(
+                        RunTerminationReason.REPEATED_INVOCATION,
+                        phase=TerminationCheckPhase.AFTER_PLANNING,
+                        control=control,
+                        message=(
+                            "consecutive identical Tool invocation limit reached"
+                        ),
+                    )
+                if assessment is None and isinstance(
+                    exc,
+                    (RunBudgetExhaustedError, RunUsageAccountingError),
+                ):
+                    reason = (
+                        RunTerminationReason.USAGE_ACCOUNTING_UNAVAILABLE
+                        if isinstance(exc, RunUsageAccountingError)
+                        else (
+                            RunTerminationReason.TOKEN_BUDGET_EXHAUSTED
+                            if exc.resource == "tokens"
+                            else RunTerminationReason.COST_BUDGET_EXHAUSTED
+                        )
+                    )
+                    assessment = self._termination.explicit_stop(
+                        reason,
+                        phase=TerminationCheckPhase.AFTER_PLANNING,
+                        control=control,
+                        message=str(exc) or exc.__class__.__name__,
+                    )
+                if assessment is not None:
+                    return await self._stop_run(state, control, assessment)
                 return await self._fail_run(
                     state,
                     self._module_error("planner", self._planner.module_id, exc),
                     source=self._planner.module_id,
+                    control=control,
+                )
+
+            usage = await ledger.snapshot()
+            control = self._termination.after_planning(
+                control,
+                elapsed_seconds=monotonic() - planning_started,
+                usage=usage,
+            )
+            if (
+                decision.decision is PlanDecisionType.EXECUTE
+                and decision.action is not None
+                and decision.action.timeout_seconds is None
+            ):
+                decision = decision.model_copy(
+                    update={
+                        "action": decision.action.model_copy(
+                            update={
+                                "timeout_seconds": (
+                                    self._stop_policy.default_tool_timeout_seconds
+                                )
+                            }
+                        )
+                    }
                 )
 
             await self._emit(
@@ -136,9 +327,37 @@ class AgentRuntime:
                 payload={"plan": decision.model_dump(mode="json")},
             )
 
+            assessment = self._termination.before_planning(
+                control,
+                phase=TerminationCheckPhase.AFTER_PLANNING,
+            )
+            guard_snapshot = await invocation_guard.snapshot()
+            control = control.model_copy(
+                update={
+                    "last_tool_invocation_fingerprint": guard_snapshot.fingerprint,
+                    "consecutive_identical_tool_invocations": (
+                        guard_snapshot.consecutive_count
+                    ),
+                }
+            )
+            if assessment is None and guard_snapshot.blocked:
+                assessment = self._termination.explicit_stop(
+                    RunTerminationReason.REPEATED_INVOCATION,
+                    phase=TerminationCheckPhase.AFTER_PLANNING,
+                    control=control,
+                    message="consecutive identical Tool invocation limit reached",
+                )
+            if assessment is not None:
+                return await self._stop_run(
+                    state,
+                    control,
+                    assessment,
+                    last_plan=decision,
+                )
+
             if decision.decision is PlanDecisionType.COMPLETE:
                 previous = state
-                state = complete_state(state, decision)
+                state = complete_state(state, decision, control=control)
                 await self._save_state(state)
                 await self._emit_state_update(previous, state)
                 await self._emit(
@@ -156,11 +375,35 @@ class AgentRuntime:
                         "planner returned a fail decision without an error",
                         source=self._planner.module_id,
                     )
+                failure = decision.failure
+                if (
+                    failure is not None
+                    and failure.criticality.value == "critical"
+                    and not failure.retryable
+                    and failure.recovery_status.value in {"exhausted", "unavailable"}
+                ):
+                    assessment = self._termination.explicit_stop(
+                        (
+                            RunTerminationReason.RECOVERY_EXHAUSTED
+                            if failure.recovery_status.value == "exhausted"
+                            else RunTerminationReason.CRITICAL_TOOL_FAILURE
+                        ),
+                        phase=TerminationCheckPhase.AFTER_PLANNING,
+                        control=control,
+                        message=decision.error,
+                    )
+                    return await self._stop_run(
+                        state,
+                        control,
+                        assessment,
+                        last_plan=decision,
+                    )
                 return await self._fail_run(
                     state,
                     decision.error,
                     source=self._planner.module_id,
                     last_plan=decision,
+                    control=control,
                 )
 
             action = decision.action
@@ -169,13 +412,20 @@ class AgentRuntime:
                     state,
                     "planner returned an execute decision without an action",
                     source=self._planner.module_id,
+                    control=control,
                 )
 
-            if state.step_count >= self._max_steps:
-                return await self._fail_run(
+            control, assessment = self._termination.before_action(
+                state,
+                action,
+                control,
+            )
+            if assessment is not None:
+                return await self._stop_run(
                     state,
-                    f"maximum action steps reached ({self._max_steps})",
-                    source=self.module_id,
+                    control,
+                    assessment,
+                    last_plan=decision,
                 )
 
             await self._emit(
@@ -186,6 +436,7 @@ class AgentRuntime:
             )
 
             execution_error: str | None = None
+            action_started = monotonic()
             try:
                 observation = await self._executor.execute(action, state)
                 if not isinstance(observation, Observation):
@@ -212,8 +463,40 @@ class AgentRuntime:
                 payload={"observation": observation.model_dump(mode="json")},
             )
 
+            usage = await ledger.snapshot()
+            guard_snapshot = await invocation_guard.snapshot()
+            control = control.model_copy(
+                update={
+                    "last_tool_invocation_fingerprint": guard_snapshot.fingerprint,
+                    "consecutive_identical_tool_invocations": (
+                        guard_snapshot.consecutive_count
+                    ),
+                }
+            )
+            control, assessment = self._termination.after_action(
+                control,
+                action,
+                observation,
+                elapsed_seconds=monotonic() - action_started,
+                usage=usage,
+            )
+            if assessment is None and guard_snapshot.blocked:
+                assessment = self._termination.explicit_stop(
+                    RunTerminationReason.REPEATED_INVOCATION,
+                    phase=TerminationCheckPhase.AFTER_ACTION,
+                    control=control,
+                    message=(
+                        "consecutive identical Tool invocation limit reached"
+                    ),
+                )
+
             previous = state
-            state = record_observation(state, decision, observation)
+            state = record_observation(
+                state,
+                decision,
+                observation,
+                control=control,
+            )
             await self._save_state(state)
             await self._emit_state_update(previous, state)
 
@@ -222,7 +505,10 @@ class AgentRuntime:
                     state,
                     execution_error,
                     source=self._executor.module_id,
+                    control=control,
                 )
+            if assessment is not None:
+                return await self._stop_run(state, control, assessment)
 
     async def _fail_run(
         self,
@@ -231,16 +517,75 @@ class AgentRuntime:
         *,
         source: str,
         last_plan: PlanDecision | None = None,
+        control: RunControlState | None = None,
+        assessment: StopAssessment | None = None,
     ) -> RunResult:
         previous = state
-        state = fail_state(state, error, last_plan=last_plan)
+        state = fail_state(
+            state,
+            error,
+            last_plan=last_plan,
+            control=control,
+            termination=(assessment.termination if assessment is not None else None),
+        )
         await self._save_state(state)
         await self._emit_state_update(previous, state)
+        if assessment is not None:
+            await self._emit(
+                state,
+                CoreEventKind.STOP_TRIGGERED,
+                source=self.module_id,
+                payload={
+                    "termination": assessment.termination.model_dump(mode="json")
+                },
+            )
         await self._emit(
             state,
             CoreEventKind.RUNTIME_FAILED,
             source=source,
             payload={"error": error, "state": state.model_dump(mode="json")},
+        )
+        return RunResult(final_state=state)
+
+    async def _stop_run(
+        self,
+        state: AgentState,
+        control: RunControlState,
+        assessment: StopAssessment,
+        *,
+        last_plan: PlanDecision | None = None,
+    ) -> RunResult:
+        if assessment.terminal_status is RunStatus.FAILED:
+            return await self._fail_run(
+                state,
+                assessment.termination.evidence[0].message,
+                source=self.module_id,
+                last_plan=last_plan,
+                control=control,
+                assessment=assessment,
+            )
+        previous = state
+        state = terminate_state(
+            state,
+            assessment.termination,
+            control=control,
+            last_plan=last_plan,
+        )
+        await self._save_state(state)
+        await self._emit_state_update(previous, state)
+        await self._emit(
+            state,
+            CoreEventKind.STOP_TRIGGERED,
+            source=self.module_id,
+            payload={
+                "termination": assessment.termination.model_dump(mode="json")
+            },
+        )
+        await self._emit(
+            state,
+            CoreEventKind.RUNTIME_TERMINATED,
+            source=self.module_id,
+            payload={"state": state.model_dump(mode="json")},
         )
         return RunResult(final_state=state)
 

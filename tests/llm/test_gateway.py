@@ -5,6 +5,15 @@ import unittest
 from typing import Any
 from uuid import uuid4
 
+from adaptive_agent_runtime import (
+    RunBudgetExhaustedError,
+    RunStopPolicy,
+    RunUsageAccountingError,
+)
+from adaptive_agent_runtime.core.budget import (
+    RunBudgetLedger,
+    bind_run_budget_ledger,
+)
 from adaptive_agent_runtime.llm import (
     BackendAvailability,
     BackendKind,
@@ -481,6 +490,106 @@ class InferenceGatewayTests(unittest.IsolatedAsyncioTestCase):
             harness.trace.entries(request.request_id)[-1].event.kind,
             InferenceGatewayTraceEventKind.BUDGET_REJECTED,
         )
+
+    async def test_run_budget_accumulates_across_inference_requests(self) -> None:
+        harness = GatewayHarness()
+        run_id = uuid4()
+        requests = tuple(
+            InferenceRequest(
+                cognitive_capability_id="generation",
+                input=f"request-{index}",
+                correlation=InferenceCorrelation(run_id=run_id),
+            )
+            for index in range(3)
+        )
+        profile = target_profile(
+            "fake/run-metered",
+            reports_usage=True,
+            reports_cost=True,
+        )
+        harness.registry.register(
+            FakeInferenceBackend(
+                profile,
+                {
+                    requests[0].request_id: response(
+                        requests[0],
+                        profile,
+                        usage=InferenceUsage(
+                            input_tokens=2,
+                            output_tokens=2,
+                            total_tokens=4,
+                            monetary_cost=0.4,
+                            currency="USD",
+                        ),
+                    ),
+                    requests[1].request_id: response(
+                        requests[1],
+                        profile,
+                        usage=InferenceUsage(
+                            input_tokens=3,
+                            output_tokens=3,
+                            total_tokens=6,
+                            monetary_cost=0.6,
+                            currency="USD",
+                        ),
+                    ),
+                },
+            )
+        )
+        ledger = RunBudgetLedger(
+            run_id=run_id,
+            policy=RunStopPolicy(
+                max_total_tokens=10,
+                max_monetary_cost=1.0,
+                currency="USD",
+            ),
+        )
+
+        with bind_run_budget_ledger(ledger):
+            await harness.gateway.execute(requests[0], InferenceGatewayPolicy())
+            await harness.gateway.execute(requests[1], InferenceGatewayPolicy())
+            with self.assertRaises(RunBudgetExhaustedError) as captured:
+                await harness.gateway.execute(
+                    requests[2],
+                    InferenceGatewayPolicy(),
+                )
+
+        usage = await ledger.snapshot()
+        self.assertEqual(usage.total_tokens, 10)
+        self.assertAlmostEqual(usage.monetary_cost, 1.0)
+        self.assertEqual(captured.exception.resource, "tokens")
+
+    async def test_budgeted_run_fails_closed_when_usage_is_missing(self) -> None:
+        harness = GatewayHarness()
+        run_id = uuid4()
+        request = InferenceRequest(
+            cognitive_capability_id="generation",
+            input="missing usage",
+            correlation=InferenceCorrelation(run_id=run_id),
+        )
+        profile = target_profile(
+            "fake/missing-usage",
+            reports_usage=True,
+        )
+        harness.registry.register(
+            FakeInferenceBackend(
+                profile,
+                {request.request_id: response(request, profile)},
+            )
+        )
+        ledger = RunBudgetLedger(
+            run_id=run_id,
+            policy=RunStopPolicy(max_total_tokens=10),
+        )
+
+        with bind_run_budget_ledger(ledger):
+            with self.assertRaises(RunUsageAccountingError):
+                await harness.gateway.execute(
+                    request,
+                    InferenceGatewayPolicy(),
+                )
+
+        self.assertEqual((await ledger.snapshot()).total_tokens, 0)
 
     async def test_registry_rejects_duplicate_target(self) -> None:
         registry = InMemoryInferenceBackendRegistry()

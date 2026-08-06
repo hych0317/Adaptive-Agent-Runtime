@@ -116,6 +116,13 @@ class TerminalExecutionPolicy(TerminalModel):
     max_environment_value_characters: int = Field(default=4096, ge=1)
     max_total_tokens: int | None = Field(default=200_000, ge=1)
     max_cost_usd: float | None = Field(default=None, ge=0.0)
+    max_wall_clock_seconds: float | None = Field(default=None, gt=0.0)
+    max_active_execution_seconds: float | None = Field(default=None, gt=0.0)
+    external_job_deadline_seconds: float | None = Field(default=None, gt=0.0)
+    cleanup_grace_seconds: float = Field(default=10.0, ge=0.0)
+    repeated_invocation_limit: int | None = Field(default=3, ge=2)
+    max_no_progress_steps: int | None = Field(default=5, ge=1)
+    max_no_progress_seconds: float | None = Field(default=300.0, gt=0.0)
 
     @model_validator(mode="after")
     def validate_timeouts(self) -> TerminalExecutionPolicy:
@@ -155,6 +162,8 @@ class TerminalHistoryItem(TerminalModel):
 
 
 class TerminalTurnRequest(TerminalModel):
+    run_id: UUID
+    task_id: UUID
     instruction: str = Field(min_length=1)
     profile: str = AAR_TERMINAL_SEQUENTIAL_PROFILE
     session: TerminalSessionSnapshot

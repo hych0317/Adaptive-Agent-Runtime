@@ -143,6 +143,7 @@ class ExecutionStatus(StrEnum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    TERMINATED = "terminated"
 
 
 class EvaluationScope(StrEnum):
@@ -284,10 +285,16 @@ class EvaluationStateSnapshot(EvaluationModel):
 
     @model_validator(mode="after")
     def validate_state(self) -> EvaluationStateSnapshot:
-        if self.status is ExecutionStatus.FAILED and not self.error:
-            raise ValueError("failed state snapshot requires an error")
-        if self.status is not ExecutionStatus.FAILED and self.error is not None:
-            raise ValueError("only failed state snapshots can contain an error")
+        if self.status in {
+            ExecutionStatus.FAILED,
+            ExecutionStatus.TERMINATED,
+        } and not self.error:
+            raise ValueError("unsuccessful terminal state snapshot requires an error")
+        if self.status not in {
+            ExecutionStatus.FAILED,
+            ExecutionStatus.TERMINATED,
+        } and self.error is not None:
+            raise ValueError("only unsuccessful terminal snapshots contain an error")
         if self.status is not ExecutionStatus.COMPLETED and self.output is not None:
             raise ValueError("only completed state snapshots can contain output")
         return self
@@ -329,6 +336,7 @@ class EvaluationSubject(EvaluationModel):
         if self.state.status not in {
             ExecutionStatus.COMPLETED,
             ExecutionStatus.FAILED,
+            ExecutionStatus.TERMINATED,
         }:
             raise ValueError("an execution result requires a terminal state snapshot")
         state_succeeded = self.state.status is ExecutionStatus.COMPLETED

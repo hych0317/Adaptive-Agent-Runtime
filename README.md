@@ -51,6 +51,8 @@ Persistence 通过各模块已有的窄接口提供可选 SQLite 实现，持久
 
 模型接入由 provider-neutral LLM Gateway 提供，包括后端适配、结构化输出、路由、预算和响应校验。它属于运行基础设施，不改变 Runtime 对任务、工具和状态的最终控制权。
 
+Runtime Core 还提供 Run 级统一停止控制：最大动作轮数、聚合 Token/成本、分层时间预算、重复工具调用、状态停滞和关键工具不可恢复失败。墙钟期限默认不启用；长工具使用独立超时和开始前准入，避免被短全局超时误杀。完整语义见 [运行停止机制设计](docs/运行停止机制设计.md)。
+
 ## 核心技术设计
 
 ### 1. 运行时控制的提案流水线（Runtime-owned Proposal Pipeline）
@@ -133,7 +135,7 @@ runtime = AgentRuntime(
 
 ## 工程验证与实现边界
 
-- 349 个 `unittest` 用例覆盖 Core、Orchestration、Persistence/Resume、Context-Memory、Tool、Evaluation、Governance、Evolution/Replay、LLM 与 Research Agent。
+- 647 个 `unittest` 用例覆盖 Core、Orchestration、Persistence/Resume、Context-Memory、Tool、Evaluation、Governance、Evolution/Replay、LLM 与 Research Agent。
 - `mypy --strict` 检查 Runtime 包，数据契约以冻结的 Pydantic Model 和显式 Protocol 为主。
 - 当前版本仍使用顺序事件循环，不支持通用并行调度；Store 可选择内存或 SQLite，SQLite 路径支持跨进程 Run Resume。
 - 恢复只自动跨越已提交的 Observation。已经开始但没有结果的外部动作会标记为 in-doubt 并阻塞静默重放，需要人工或外部幂等证明解除。

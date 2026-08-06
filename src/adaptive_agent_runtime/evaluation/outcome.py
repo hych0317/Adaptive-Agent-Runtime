@@ -116,7 +116,9 @@ class DeterministicOutcomeEvaluator:
             fact for fact in terminal_facts if fact.kind == "runtime.completed"
         )
         failed_trace = tuple(
-            fact for fact in terminal_facts if fact.kind == "runtime.failed"
+            fact
+            for fact in terminal_facts
+            if fact.kind in {"runtime.failed", "runtime.terminated"}
         )
         evidence_conflict = (
             bool(completed_trace and failed_trace)

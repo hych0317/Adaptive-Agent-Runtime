@@ -10,7 +10,11 @@ from pydantic import JsonValue
 from adaptive_agent_runtime import (
     ActionRequest,
     AgentState,
+    FailureDisposition,
+    FailureRecoveryStatus,
     Observation,
+    ObservationControl,
+    ProgressKind,
 )
 from adaptive_agent_runtime.orchestration.contracts import ExecutionStrategy
 from adaptive_agent_runtime.orchestration.models import (
@@ -129,9 +133,37 @@ class StrategyActionExecutor:
                 action.action_id,
                 output=result.output,
                 metadata=metadata,
+                control=ObservationControl(
+                    progress_kind=ProgressKind.TASK_PROGRESS,
+                ),
             )
         return Observation.failed(
             action.action_id,
             error=result.error or "task node execution failed",
             metadata=metadata,
+            control=ObservationControl(
+                progress_kind=ProgressKind.NO_PROGRESS,
+                failure=FailureDisposition(
+                    failure_code="orchestration.node_execution_failed",
+                    criticality=node.criticality,
+                    retryable=_looks_retryable(result.error),
+                    recovery_status=FailureRecoveryStatus.AVAILABLE,
+                ),
+            ),
         )
+
+
+def _looks_retryable(error: str | None) -> bool:
+    normalized = (error or "").lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "timeout",
+            "timed out",
+            "temporar",
+            "rate limit",
+            "connection reset",
+            "strategy",
+            "unavailable",
+        )
+    )

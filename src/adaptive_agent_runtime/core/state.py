@@ -14,16 +14,27 @@ from adaptive_agent_runtime.core.models import (
     Observation,
     PlanDecision,
     PlanDecisionType,
+    RunControlState,
     RunStatus,
+    RunStopPolicy,
+    RunTermination,
     utc_now,
 )
+from adaptive_agent_runtime.core.termination import RunTerminationController
 
 
-def create_state(task: AgentTask, *, run_id: UUID | None = None) -> AgentState:
+def create_state(
+    task: AgentTask,
+    *,
+    run_id: UUID | None = None,
+    stop_policy: RunStopPolicy | None = None,
+) -> AgentState:
     now = utc_now()
+    policy = stop_policy or RunStopPolicy()
     return AgentState(
         run_id=run_id or uuid4(),
         task=task,
+        control=RunTerminationController(policy).initial_control(now),
         created_at=now,
         updated_at=now,
     )
@@ -52,6 +63,8 @@ def record_observation(
     state: AgentState,
     plan: PlanDecision,
     observation: Observation,
+    *,
+    control: RunControlState | None = None,
 ) -> AgentState:
     if state.status is not RunStatus.RUNNING:
         raise RuntimeInvariantError("observations require a running state")
@@ -64,10 +77,27 @@ def record_observation(
         step_count=state.step_count + 1,
         last_plan=plan,
         last_observation=observation,
+        control=control or state.control,
     )
 
 
-def complete_state(state: AgentState, plan: PlanDecision) -> AgentState:
+def update_control_state(
+    state: AgentState,
+    control: RunControlState,
+) -> AgentState:
+    """Persist accounting changes without advancing an Action step."""
+
+    if state.status is not RunStatus.RUNNING:
+        raise RuntimeInvariantError("control updates require a running state")
+    return _evolve(state, control=control)
+
+
+def complete_state(
+    state: AgentState,
+    plan: PlanDecision,
+    *,
+    control: RunControlState | None = None,
+) -> AgentState:
     if state.status is not RunStatus.RUNNING:
         raise RuntimeInvariantError("only a running state can complete")
     if plan.decision is not PlanDecisionType.COMPLETE:
@@ -79,6 +109,7 @@ def complete_state(state: AgentState, plan: PlanDecision) -> AgentState:
         # Re-enter validation through the serialized form rather than passing
         # the PlanDecision's internal immutable mapping proxy across models.
         output=plan.model_dump(mode="python")["output"],
+        control=control or state.control,
     )
 
 
@@ -87,10 +118,36 @@ def fail_state(
     error: str,
     *,
     last_plan: PlanDecision | None = None,
+    control: RunControlState | None = None,
+    termination: RunTermination | None = None,
 ) -> AgentState:
     if state.status is not RunStatus.RUNNING:
         raise RuntimeInvariantError("only a running state can fail")
-    changes: dict[str, Any] = {"status": RunStatus.FAILED, "error": error}
+    changes: dict[str, Any] = {
+        "status": RunStatus.FAILED,
+        "error": error,
+        "control": control or state.control,
+        "termination": termination,
+    }
+    if last_plan is not None:
+        changes["last_plan"] = last_plan
+    return _evolve(state, **changes)
+
+
+def terminate_state(
+    state: AgentState,
+    termination: RunTermination,
+    *,
+    control: RunControlState,
+    last_plan: PlanDecision | None = None,
+) -> AgentState:
+    if state.status is not RunStatus.RUNNING:
+        raise RuntimeInvariantError("only a running state can terminate")
+    changes: dict[str, Any] = {
+        "status": RunStatus.TERMINATED,
+        "control": control,
+        "termination": termination,
+    }
     if last_plan is not None:
         changes["last_plan"] = last_plan
     return _evolve(state, **changes)

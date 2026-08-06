@@ -28,6 +28,7 @@ class ResearchProgressKind(StrEnum):
     TRACE_RECORDED = "trace.recorded"
     RUNTIME_COMPLETED = "runtime.completed"
     RUNTIME_FAILED = "runtime.failed"
+    RUNTIME_TERMINATED = "runtime.terminated"
 
 
 class ResearchProgressEvent(BaseModel):
@@ -195,6 +196,17 @@ def progress_events_from_trace(entry: TraceEntry) -> tuple[ResearchProgressEvent
                 occurred_at=event.occurred_at,
                 trace_sequence=entry.sequence,
                 payload={"error": _json(payload.get("error"))},
+            )
+        )
+    elif event.kind == "runtime.terminated":
+        termination = _nested(payload, "state", "termination")
+        progress.append(
+            ResearchProgressEvent(
+                run_id=event.run_id,
+                kind=ResearchProgressKind.RUNTIME_TERMINATED,
+                occurred_at=event.occurred_at,
+                trace_sequence=entry.sequence,
+                payload={"termination": _json(termination)},
             )
         )
     return tuple(progress)

@@ -52,7 +52,10 @@ class DeterministicTrajectoryEvaluator:
         attempt_failures = self._facts(trace.facts, "tool.attempt_failed")
         timeouts = self._facts(trace.facts, "tool.attempt_timed_out")
         unavailable = self._facts(trace.facts, "tool.provider_unavailable")
-        runtime_failures = self._facts(trace.facts, "runtime.failed")
+        runtime_failures = (
+            self._facts(trace.facts, "runtime.failed")
+            + self._facts(trace.facts, "runtime.terminated")
+        )
 
         action_facts = tuple(
             fact for fact in trace.facts if fact.kind == "action.started"

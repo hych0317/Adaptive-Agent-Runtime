@@ -11,7 +11,12 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import JsonValue, SecretStr
 
-from adaptive_agent_runtime.core import AgentRuntime, AgentTask, RunResult
+from adaptive_agent_runtime.core import (
+    AgentRuntime,
+    AgentTask,
+    RunResult,
+    RunStopPolicy,
+)
 from adaptive_agent_runtime.governance import (
     DeterministicConfidenceEvaluator,
     DeterministicRuleEvaluator,
@@ -249,7 +254,31 @@ def build_terminal_application(
         executor=executor,
         state_store=persistence.state_store,
         trace_sink=persistence.trace_sink,
-        max_steps=execution_policy.max_commands,
+        stop_policy=RunStopPolicy(
+            max_action_steps=execution_policy.max_commands,
+            max_wall_clock_seconds=execution_policy.max_wall_clock_seconds,
+            max_active_execution_seconds=(
+                execution_policy.max_active_execution_seconds
+            ),
+            default_tool_timeout_seconds=float(
+                execution_policy.default_timeout_sec
+            ),
+            max_tool_timeout_seconds=float(execution_policy.max_timeout_sec),
+            external_job_deadline_seconds=(
+                execution_policy.external_job_deadline_seconds
+            ),
+            cleanup_grace_seconds=execution_policy.cleanup_grace_seconds,
+            max_total_tokens=execution_policy.max_total_tokens,
+            max_monetary_cost=execution_policy.max_cost_usd,
+            currency=(
+                "USD" if execution_policy.max_cost_usd is not None else None
+            ),
+            repeated_invocation_limit=(
+                execution_policy.repeated_invocation_limit
+            ),
+            max_no_progress_steps=execution_policy.max_no_progress_steps,
+            max_no_progress_seconds=execution_policy.max_no_progress_seconds,
+        ),
     )
     return TerminalSequentialApplication(
         trial_id=trial_id,

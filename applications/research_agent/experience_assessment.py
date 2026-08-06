@@ -726,7 +726,11 @@ class ResearchExperienceAssessmentHandler:
         evaluation: EvaluationReport,
         artifact: WorkspaceArtifactCommitReceipt,
     ) -> None:
-        if final_state.status not in {RunStatus.COMPLETED, RunStatus.FAILED}:
+        if final_state.status not in {
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.TERMINATED,
+        }:
             raise ValueError("Experience requires a terminal persisted execution")
         if evaluation.run_id != final_state.run_id:
             raise ValueError("Experience Evaluation belongs to another run")

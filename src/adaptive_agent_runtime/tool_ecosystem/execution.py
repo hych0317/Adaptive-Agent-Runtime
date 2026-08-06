@@ -10,6 +10,7 @@ from uuid import UUID
 
 from pydantic import JsonValue
 
+from adaptive_agent_runtime.core.invocation import current_run_invocation_guard
 from adaptive_agent_runtime.tool_ecosystem.contracts import (
     ToolExecutionGovernor,
     ToolProvider,
@@ -109,6 +110,26 @@ class ManagedToolExecutor:
                 started_at,
                 f"provider '{invocation.provider_id}' is unavailable",
             )
+
+        guard = current_run_invocation_guard()
+        if guard is not None:
+            admitted = await guard.admit(
+                capability_id=invocation.capability_id,
+                provider_id=invocation.provider_id,
+                arguments=invocation.arguments,
+                exempt="polling" in metadata.tags,
+            )
+            if not admitted:
+                return await self._finish(
+                    invocation,
+                    started_at,
+                    (),
+                    ToolExecutionStatus.POLICY_REJECTED,
+                    error=(
+                        "Run repeated-invocation guard rejected this Tool call "
+                        "before Provider execution"
+                    ),
+                )
 
         attempts: list[ToolAttempt] = []
         while True:

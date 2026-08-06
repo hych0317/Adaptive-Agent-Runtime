@@ -85,13 +85,13 @@ class SQLiteExperienceMetadataStore:
                     "Experience source execution has no persisted outcome"
                 )
             state = AgentState.model_validate_json(state_row["snapshot_json"])
-            expected_status = (
-                RunStatus.COMPLETED
+            expected_statuses = (
+                {RunStatus.COMPLETED}
                 if effect.execution_outcome is ExperienceExecutionOutcome.SUCCEEDED
-                else RunStatus.FAILED
+                else {RunStatus.FAILED, RunStatus.TERMINATED}
             )
             if (
-                state.status is not expected_status
+                state.status not in expected_statuses
                 or state.revision != effect.runtime_observation.state_revision
                 or decision_fingerprint(state)
                 != effect.runtime_observation.state_fingerprint

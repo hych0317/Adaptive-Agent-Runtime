@@ -9,6 +9,9 @@ from uuid import UUID
 from adaptive_agent_runtime import (
     ActionRequest,
     AgentState,
+    FailureCriticality,
+    FailureDisposition,
+    FailureRecoveryStatus,
     Observation,
     PlanDecision,
     RuntimeResumeBlockedError,
@@ -178,7 +181,33 @@ class DynamicTaskGraphPlanner:
                 for node in failed_nodes
             )
             await self._save_checkpoint(state, graph)
-            return PlanDecision.fail(error=f"task graph failed: {failure_text}")
+            critical_nodes = tuple(
+                node
+                for node in failed_nodes
+                if node.criticality is FailureCriticality.CRITICAL
+            )
+            failure = None
+            if critical_nodes:
+                critical_ids = {node.node_id for node in critical_nodes}
+                exhausted = any(
+                    record.plan.analysis.node_id in critical_ids
+                    and record.plan.aborts
+                    for record in self._recovery_records[state.run_id]
+                )
+                failure = FailureDisposition(
+                    failure_code="orchestration.critical_node_failed",
+                    criticality=FailureCriticality.CRITICAL,
+                    retryable=False,
+                    recovery_status=(
+                        FailureRecoveryStatus.EXHAUSTED
+                        if exhausted
+                        else FailureRecoveryStatus.UNAVAILABLE
+                    ),
+                )
+            return PlanDecision.fail(
+                error=f"task graph failed: {failure_text}",
+                failure=failure,
+            )
 
         running_nodes = tuple(
             node

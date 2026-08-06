@@ -10,6 +10,7 @@ from adaptive_agent_runtime import (
     AgentTask,
     CoreEventKind,
     RunStatus,
+    RunTerminationReason,
     RuntimeResumeBlockedError,
 )
 from adaptive_agent_runtime.orchestration import (
@@ -134,6 +135,66 @@ def task_node(
 
 
 class SQLiteRuntimeResumeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_terminated_run_is_persisted_and_resume_is_idempotent(self) -> None:
+        first = task_node("first")
+        second = task_node("second", dependencies=(first.node_id,))
+        template = DynamicTaskGraph(nodes=(first, second))
+        run_id = uuid4()
+
+        with TemporaryDirectory() as directory:
+            path = f"{directory}/terminated.sqlite3"
+            persistence = SQLitePersistence(
+                path,
+                enforce_authoritative_commits=False,
+            )
+            runtime = AgentRuntime(
+                planner=DynamicTaskGraphPlanner(
+                    template,
+                    graph_store=persistence.task_graph_store,
+                ),
+                executor=StrategyActionExecutor((MockExecutionStrategy(),)),
+                state_store=persistence.state_store,
+                trace_sink=persistence.trace_sink,
+                max_steps=1,
+            )
+
+            initial = await runtime.run(
+                AgentTask(description="persist a stop decision"),
+                run_id=run_id,
+            )
+            self.assertEqual(initial.final_state.status, RunStatus.TERMINATED)
+            assert initial.final_state.termination is not None
+            self.assertEqual(
+                initial.final_state.termination.primary_reason,
+                RunTerminationReason.MAX_ACTION_STEPS,
+            )
+            terminal_revision = initial.final_state.revision
+            persistence.close()
+
+            reopened = SQLitePersistence(
+                path,
+                enforce_authoritative_commits=False,
+            )
+            resumed = await AgentRuntime(
+                planner=DynamicTaskGraphPlanner(
+                    template,
+                    graph_store=reopened.task_graph_store,
+                ),
+                executor=StrategyActionExecutor((MockExecutionStrategy(),)),
+                state_store=reopened.state_store,
+                trace_sink=reopened.trace_sink,
+                max_steps=1,
+            ).resume(run_id)
+
+            self.assertEqual(resumed.final_state, initial.final_state)
+            self.assertEqual(resumed.final_state.revision, terminal_revision)
+            entries = await reopened.trace_sink.entries_for(run_id)
+            self.assertNotIn(
+                CoreEventKind.RUNTIME_RESUMED,
+                tuple(entry.event.kind for entry in entries),
+            )
+            reopened.close()
+
     async def test_reopens_database_and_continues_at_next_graph_node(self) -> None:
         first = task_node("first")
         second = task_node("second", dependencies=(first.node_id,))

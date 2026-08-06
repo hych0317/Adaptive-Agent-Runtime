@@ -7,7 +7,16 @@ from typing import cast
 
 from pydantic import JsonValue
 
-from adaptive_agent_runtime.core import ActionRequest, AgentState, Observation
+from adaptive_agent_runtime.core import (
+    ActionRequest,
+    AgentState,
+    FailureDisposition,
+    FailureRecoveryStatus,
+    Observation,
+    ObservationControl,
+    OutcomeCertainty,
+    ProgressKind,
+)
 
 from adaptive_agent_runtime.tool_ecosystem import (
     ToolExecutionStatus,
@@ -92,6 +101,19 @@ class TerminalActionExecutor:
                 action.action_id,
                 error=f"terminal decision did not apply: {decision.reason or decision.status}",
                 metadata=cast(Mapping[str, JsonValue], metadata),
+                control=ObservationControl(
+                    progress_kind=ProgressKind.NO_PROGRESS,
+                    failure=FailureDisposition(
+                        failure_code="terminal.decision_not_applied",
+                        retryable=False,
+                        recovery_status=FailureRecoveryStatus.UNAVAILABLE,
+                        outcome_certainty=(
+                            OutcomeCertainty.IN_DOUBT
+                            if decision.execution_in_doubt
+                            else OutcomeCertainty.CERTAIN
+                        ),
+                    ),
+                ),
             )
         effect = outcome.effect
         tool_observation = outcome.observation
@@ -122,6 +144,13 @@ class TerminalActionExecutor:
                 action.action_id,
                 output=execution_result.model_dump(mode="json"),
                 metadata=cast(Mapping[str, JsonValue], metadata),
+                control=ObservationControl(
+                    progress_kind=(
+                        ProgressKind.TASK_PROGRESS
+                        if execution_result.return_code == 0
+                        else ProgressKind.NO_PROGRESS
+                    ),
+                ),
             )
         return Observation.failed(
             action.action_id,
@@ -130,6 +159,19 @@ class TerminalActionExecutor:
                 f"{execution_result.stderr or tool_observation.error or 'unknown state'}"
             ),
             metadata=cast(Mapping[str, JsonValue], metadata),
+            control=ObservationControl(
+                progress_kind=ProgressKind.NO_PROGRESS,
+                failure=FailureDisposition(
+                    failure_code=(
+                        "tool.timeout"
+                        if execution_result.timed_out
+                        else "terminal.execution_uncertain"
+                    ),
+                    retryable=False,
+                    recovery_status=FailureRecoveryStatus.UNAVAILABLE,
+                    outcome_certainty=OutcomeCertainty.IN_DOUBT,
+                ),
+            ),
         )
 
     @staticmethod

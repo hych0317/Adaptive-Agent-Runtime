@@ -356,7 +356,10 @@ class GatewayTerminalTurnProposalCapability:
                 required_structured_output=StructuredOutputLevel.JSON_SCHEMA,
                 max_output_tokens=self._max_output_tokens,
             ),
-            correlation=InferenceCorrelation(),
+            correlation=InferenceCorrelation(
+                run_id=request.run_id,
+                task_id=request.task_id,
+            ),
             trace_attributes={
                 "application": "terminal_bench",
                 "profile": AAR_TERMINAL_SEQUENTIAL_PROFILE,
@@ -461,6 +464,7 @@ class TerminalSequentialPlanner:
             action_id=action_id,
             name=TERMINAL_COMMAND_ACTION,
             arguments=intent.model_dump(mode="json"),
+            timeout_seconds=float(intent.timeout_sec),
         )
         self._journal.save_pending(
             TerminalPendingCommand(
@@ -504,6 +508,8 @@ class TerminalSequentialPlanner:
             else max(0.0, self._policy.max_cost_usd - session.cost_usd)
         )
         return TerminalTurnRequest(
+            run_id=state.run_id,
+            task_id=state.task.task_id,
             instruction=state.task.description,
             session=session,
             recent_history=history,

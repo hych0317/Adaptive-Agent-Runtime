@@ -346,7 +346,11 @@ class SQLiteLearningInsightStore(LearningInsightStore):
         if state_row is None:
             raise PersistenceConflictError("Learning source Run is missing")
         state = AgentState.model_validate_json(state_row["snapshot_json"])
-        if state.status not in {RunStatus.COMPLETED, RunStatus.FAILED}:
+        if state.status not in {
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.TERMINATED,
+        }:
             raise PersistenceConflictError("Learning source Run is non-terminal")
         if state.task.task_id != record.source_task_id:
             raise PersistenceConflictError("Learning source task changed")

@@ -11,6 +11,7 @@ from jsonschema.exceptions import (  # type: ignore[import-untyped]
 
 from adaptive_agent_runtime.llm.errors import (
     InferenceContractError,
+    InferenceUsageAccountingError,
     ResponseSchemaValidationError,
 )
 from adaptive_agent_runtime.llm.models import (
@@ -121,14 +122,14 @@ class ProviderNeutralResponseValidator:
             or usage.output_tokens is None
             or usage.total_tokens is None
         ):
-            raise InferenceContractError(
+            raise InferenceUsageAccountingError(
                 target.target_id,
                 "target promised token usage but the response omitted it",
             )
         if target.metering.reports_monetary_cost and (
             usage.monetary_cost is None or usage.currency is None
         ):
-            raise InferenceContractError(
+            raise InferenceUsageAccountingError(
                 target.target_id,
                 "target promised monetary cost but the response omitted it",
             )

@@ -16,6 +16,7 @@ from adaptive_agent_runtime import (
     InMemoryStateStore,
     InMemoryTraceSink,
     RunResult,
+    RunStopPolicy,
     TraceSink,
     RuntimeEvent,
     TraceEntry,
@@ -353,6 +354,7 @@ class ResearchAgent:
         ),
         decision_fault_injector: Callable[..., None] | None = None,
         auto_adaptation_enabled: bool = False,
+        run_stop_policy: RunStopPolicy | None = None,
     ) -> None:
         if run_kind not in {"runtime", "test", "demo", "benchmark"}:
             raise ValueError("unsupported Research run kind")
@@ -360,6 +362,9 @@ class ResearchAgent:
             raise ValueError("real Runtime runs cannot be disposable")
         self._run_kind = run_kind
         self._disposable = disposable
+        self._run_stop_policy = run_stop_policy or RunStopPolicy(
+            max_action_steps=20
+        )
         self._cognitive_capabilities = (
             cognitive_capabilities or ResearchCognitiveCapabilities()
         )
@@ -946,7 +951,7 @@ class ResearchAgent:
                 ),
                 state_store=self._persistence.state_store,
                 trace_sink=runtime_trace_writer,
-                max_steps=20,
+                stop_policy=self._run_stop_policy,
             )
             runtime_result = (
                 await runtime.resume(run_id)

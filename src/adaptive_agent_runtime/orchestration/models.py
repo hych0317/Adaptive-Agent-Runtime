@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
-from adaptive_agent_runtime import Observation
+from adaptive_agent_runtime.core.models import FailureCriticality, Observation
 
 
 class OrchestrationModel(BaseModel):
@@ -41,6 +41,7 @@ class TaskNode(OrchestrationModel):
     dependencies: tuple[UUID, ...] = ()
     expected_output: str = Field(min_length=1)
     strategy_id: str = Field(min_length=1)
+    criticality: FailureCriticality = FailureCriticality.REQUIRED
     status: TaskNodeStatus = TaskNodeStatus.PENDING
     observation: Observation | None = None
     failure_reason: str | None = None

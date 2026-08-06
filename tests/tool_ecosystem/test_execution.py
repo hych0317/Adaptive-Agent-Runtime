@@ -8,6 +8,10 @@ from uuid import uuid4
 
 from pydantic import JsonValue, ValidationError
 
+from adaptive_agent_runtime.core.invocation import (
+    RunInvocationGuard,
+    bind_run_invocation_guard,
+)
 from adaptive_agent_runtime.tool_ecosystem import (
     Capability,
     CapabilityRequirement,
@@ -183,6 +187,35 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         arguments = cast(dict[str, JsonValue], payload["arguments"])
         with self.assertRaises(TypeError):
             arguments["symbol"] = "MUTATION"
+
+    async def test_repeated_guard_blocks_provider_before_third_call(self) -> None:
+        provider = ScriptedProvider(
+            "primary",
+            [
+                ToolProviderResult.ok(output=1),
+                ToolProviderResult.ok(output=2),
+                ToolProviderResult.ok(output=3),
+            ],
+        )
+        _, _, executor, invocation = execution_fixture(provider)
+        guard = RunInvocationGuard(repeated_invocation_limit=3)
+
+        with bind_run_invocation_guard(guard):
+            first = await executor.execute(invocation, ToolExecutionPolicy())
+            second = await executor.execute(
+                invocation.model_copy(update={"invocation_id": uuid4()}),
+                ToolExecutionPolicy(),
+            )
+            third = await executor.execute(
+                invocation.model_copy(update={"invocation_id": uuid4()}),
+                ToolExecutionPolicy(),
+            )
+
+        self.assertEqual(first.status, ToolExecutionStatus.SUCCEEDED)
+        self.assertEqual(second.status, ToolExecutionStatus.SUCCEEDED)
+        self.assertEqual(third.status, ToolExecutionStatus.POLICY_REJECTED)
+        self.assertEqual(third.attempts, ())
+        self.assertEqual(provider.calls, 2)
 
     async def test_explicit_failure_and_exception_are_normalized(self) -> None:
         failure = ScriptedProvider(

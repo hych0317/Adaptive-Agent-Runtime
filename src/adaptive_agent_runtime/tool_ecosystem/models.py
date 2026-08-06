@@ -101,6 +101,7 @@ class ToolExecutionStatus(StrEnum):
     FAILED = "failed"
     TIMED_OUT = "timed_out"
     PROVIDER_UNAVAILABLE = "provider_unavailable"
+    POLICY_REJECTED = "policy_rejected"
 
 
 class RetryStatus(StrEnum):
@@ -295,17 +296,28 @@ class ToolObservation(ToolModel):
         numbers = tuple(item.attempt_number for item in self.attempts)
         if numbers != tuple(range(1, len(self.attempts) + 1)):
             raise ValueError("tool attempt numbers must be consecutive")
-        if self.status is ToolExecutionStatus.PROVIDER_UNAVAILABLE:
+        if self.status in {
+            ToolExecutionStatus.PROVIDER_UNAVAILABLE,
+            ToolExecutionStatus.POLICY_REJECTED,
+        }:
             if not self.error:
-                raise ValueError("unavailable provider result requires an error")
+                raise ValueError("pre-execution rejection requires an error")
+            if (
+                self.status is ToolExecutionStatus.POLICY_REJECTED
+                and self.attempts
+            ):
+                raise ValueError("policy rejection cannot contain attempts")
             if any(
                 attempt.status is ToolAttemptStatus.SUCCEEDED
                 for attempt in self.attempts
             ):
-                raise ValueError("execution cannot become unavailable after success")
+                raise ValueError("execution cannot be rejected after success")
             expected_retry_status = (
                 RetryStatus.ABORTED
-                if self.attempts
+                if (
+                    self.status is ToolExecutionStatus.PROVIDER_UNAVAILABLE
+                    and self.attempts
+                )
                 else RetryStatus.NOT_RETRIED
             )
         elif not self.attempts:
