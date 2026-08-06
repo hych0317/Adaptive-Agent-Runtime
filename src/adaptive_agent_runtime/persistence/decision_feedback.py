@@ -28,6 +28,10 @@ from adaptive_agent_runtime.governance import (
 )
 from adaptive_agent_runtime.orchestration import PLANNING_DECISION_TYPE
 from adaptive_agent_runtime.persistence.errors import PersistenceConflictError
+from adaptive_agent_runtime.persistence.decisioning import (
+    DecisionProof,
+    SQLiteDecisionRecordReader,
+)
 from adaptive_agent_runtime.persistence.sqlite import SQLiteDatabase
 
 
@@ -42,29 +46,18 @@ class SQLiteDecisionFeedbackStore(DecisionFeedbackStore):
     ) -> None:
         self._database = database
         self._permit_verifier = permit_verifier
+        self._decisions = SQLiteDecisionRecordReader(database)
 
     async def find_applied_subject(
         self,
         run_id: UUID,
         decision_type: str,
     ) -> DecisionFeedbackSubjectReference | None:
-        with self._database.reader() as cursor:
-            rows = cursor.execute(
-                "SELECT checkpoints.checkpoint_json "
-                "FROM decision_checkpoint_current AS current "
-                "JOIN decision_checkpoints AS checkpoints "
-                "ON checkpoints.request_id = current.request_id "
-                "AND checkpoints.revision = current.revision "
-                "WHERE checkpoints.run_id = ?",
-                (str(run_id),),
-            ).fetchall()
         subjects = []
-        for row in rows:
-            checkpoint = json.loads(row["checkpoint_json"])
-            request = checkpoint.get("request")
-            if not isinstance(request, Mapping) or request.get("decision_type") != decision_type:
-                continue
-            subject = self._subject_from_checkpoint(checkpoint)
+        for proof in self._decisions.find_completed_decisions(
+            run_id, decision_type
+        ):
+            subject = self._subject_from_proof(proof)
             if subject is not None:
                 subjects.append(subject)
         if len(subjects) > 1:
@@ -336,71 +329,40 @@ class SQLiteDecisionFeedbackStore(DecisionFeedbackStore):
         )
 
     @staticmethod
-    def _load_checkpoint(cursor: object, decision_id: UUID) -> dict[str, object]:
-        row = cursor.execute(  # type: ignore[attr-defined]
-            "SELECT checkpoints.checkpoint_json "
-            "FROM decision_checkpoint_current AS current "
-            "JOIN decision_checkpoints AS checkpoints "
-            "ON checkpoints.request_id = current.request_id "
-            "AND checkpoints.revision = current.revision "
-            "WHERE current.request_id = ?",
-            (str(decision_id),),
-        ).fetchone()
-        if row is None:
+    def _load_checkpoint(cursor: object, decision_id: UUID) -> DecisionProof:
+        proof = SQLiteDecisionRecordReader.load_proof_in_transaction(
+            cursor, decision_id
+        )
+        if proof is None:
             raise PersistenceConflictError("Feedback subject Decision is missing")
-        value = json.loads(row["checkpoint_json"])
-        if not isinstance(value, dict):
-            raise PersistenceConflictError("Feedback subject checkpoint is invalid")
-        return value
+        return proof
 
     @staticmethod
-    def _subject_from_checkpoint(
-        checkpoint: Mapping[str, object],
+    def _subject_from_proof(
+        proof: DecisionProof,
     ) -> DecisionFeedbackSubjectReference | None:
-        request = checkpoint.get("request")
-        validated = checkpoint.get("validated_decision")
-        result = checkpoint.get("result")
-        if (
-            checkpoint.get("stage") != "completed"
-            or not isinstance(request, Mapping)
-            or not isinstance(validated, Mapping)
-            or not isinstance(result, Mapping)
-            or result.get("status") != "applied"
-        ):
-            return None
-        normalized = validated.get("normalized_effect")
-        receipt = result.get("apply_receipt")
-        if not isinstance(normalized, Mapping) or not isinstance(receipt, Mapping):
-            return None
-        effect_fingerprint = normalized.get("effect_fingerprint")
-        if (
-            not isinstance(effect_fingerprint, str)
-            or receipt.get("effect_fingerprint") != effect_fingerprint
-        ):
+        if not proof.is_applied or proof.effect_fingerprint is None:
             return None
         return DecisionFeedbackSubjectReference(
-            decision_id=UUID(str(request["request_id"])),
-            decision_type=str(request["decision_type"]),
-            effect_fingerprint=effect_fingerprint,
+            decision_id=proof.request_id,
+            decision_type=proof.decision_type,
+            effect_fingerprint=proof.effect_fingerprint,
         )
 
     def _verify_subject_checkpoint(
         self,
-        checkpoint: Mapping[str, object],
+        checkpoint: DecisionProof,
         expected: DecisionFeedbackSubjectReference,
         effect: DecisionFeedbackEffect,
     ) -> None:
-        subject = self._subject_from_checkpoint(checkpoint)
-        request = checkpoint.get("request")
-        if subject != expected or not isinstance(request, Mapping):
+        subject = self._subject_from_proof(checkpoint)
+        if subject != expected:
             raise PersistenceConflictError(
                 "Feedback subject Decision is not APPLIED or changed"
             )
-        correlation = request.get("correlation")
         if (
-            not isinstance(correlation, Mapping)
-            or correlation.get("run_id") != str(effect.source_run_id)
-            or correlation.get("task_id") != str(effect.source_task_id)
+            checkpoint.run_id != effect.source_run_id
+            or checkpoint.task_id != effect.source_task_id
         ):
             raise PersistenceConflictError(
                 "Feedback subject Decision belongs to another run or task"
@@ -441,7 +403,7 @@ class SQLiteDecisionFeedbackStore(DecisionFeedbackStore):
     def _verify_recall(
         cursor: object,
         effect: DecisionFeedbackEffect,
-        planning_checkpoint: Mapping[str, object],
+        planning_checkpoint: DecisionProof,
     ) -> None:
         recall = effect.recall
         if recall is None:
@@ -470,13 +432,8 @@ class SQLiteDecisionFeedbackStore(DecisionFeedbackStore):
             or decision_fingerprint(bundle) != recall.bundle_fingerprint
         ):
             raise PersistenceConflictError("Recall Feedback Bundle changed")
-        request = planning_checkpoint.get("request")
-        evidence = request.get("evidence") if isinstance(request, Mapping) else None
         expected = f"recall-bundle:{bundle.bundle_id}"
-        if not isinstance(evidence, list) or not any(
-            isinstance(item, Mapping) and item.get("evidence_id") == expected
-            for item in evidence
-        ):
+        if expected not in planning_checkpoint.evidence_ids:
             raise PersistenceConflictError(
                 "Planning Decision did not consume the Recall Bundle"
             )

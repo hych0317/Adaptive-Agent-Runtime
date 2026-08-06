@@ -170,7 +170,12 @@ class DecisionLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 DecisionTraceKind.APPLIED,
             ],
         )
-        self.assertEqual(len(store.history_for(request.request_id)), 7)
+        transitions = store.transitions_for(request.request_id)
+        self.assertEqual(len(transitions), 8)
+        self.assertEqual(
+            transitions[-2].to_stage,
+            DecisionCheckpointStage.EFFECT_COMMITTED,
+        )
         self.assertNotIn(
             "secret",
             str(checkpoint.context_manifest.model_dump(mode="json")),

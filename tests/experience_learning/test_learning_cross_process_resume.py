@@ -57,14 +57,11 @@ class LearningCrossProcessResumeTests(unittest.TestCase):
                         "SELECT learning_insight_id, effect_fingerprint, "
                         "evidence_set_fingerprint FROM learning_insights"
                     ).fetchall()
-                    checkpoints = tuple(
-                        json.loads(row[0])
-                        for row in connection.execute(
-                            "SELECT checkpoint_json FROM decision_checkpoints "
-                            "WHERE checkpoint_json LIKE "
-                            "'%experience.learning.assessment%'"
-                        ).fetchall()
-                    )
+                    current = connection.execute(
+                        "SELECT stage, result_status, effect_ref "
+                        "FROM decision_current WHERE decision_type = "
+                        "'experience.learning.assessment'"
+                    ).fetchone()
                 finally:
                     connection.close()
                 self.assertEqual(rows, [(
@@ -72,12 +69,11 @@ class LearningCrossProcessResumeTests(unittest.TestCase):
                     payload["effect_fingerprint"],
                     payload["evidence_set_fingerprint"],
                 )])
-                current = max(checkpoints, key=lambda item: item["revision"])
-                self.assertEqual(current["stage"], "completed")
-                self.assertEqual(current["result"]["status"], "applied")
+                assert current is not None
+                self.assertEqual(current[0], "completed")
+                self.assertEqual(current[1], "applied")
                 self.assertEqual(
-                    current["validated_decision"]["normalized_effect"]
-                    ["effect_fingerprint"],
+                    current[2],
                     payload["effect_fingerprint"],
                 )
 

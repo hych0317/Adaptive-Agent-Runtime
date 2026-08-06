@@ -23,6 +23,7 @@ from adaptive_agent_runtime.persistence import SQLitePersistence
 
 
 SOURCE_ROOT = Path(__file__).parents[2] / "src" / "adaptive_agent_runtime"
+PROJECT_ROOT = Path(__file__).parents[2]
 
 
 class PersistenceBoundaryTests(unittest.TestCase):
@@ -74,6 +75,23 @@ class PersistenceBoundaryTests(unittest.TestCase):
                 DecisionCheckpointStore,
             )
             persistence.close()
+
+    def test_decision_consumers_use_the_proof_query_boundary(self) -> None:
+        roots = (
+            PROJECT_ROOT / "applications",
+            SOURCE_ROOT / "persistence",
+        )
+        for root in roots:
+            for path in root.rglob("*.py"):
+                if path.name == "decisioning.py" and root == SOURCE_ROOT / "persistence":
+                    continue
+                source = path.read_text(encoding="utf-8")
+                self.assertNotIn("decision_checkpoints", source, str(path))
+                self.assertNotIn("decision_checkpoint_current", source, str(path))
+                self.assertNotIn("checkpoint_json LIKE", source, str(path))
+        for path in (PROJECT_ROOT / "applications").rglob("*.py"):
+            source = path.read_text(encoding="utf-8")
+            self.assertNotIn("SQLiteDecisionRecordReader", source, str(path))
 
 
 if __name__ == "__main__":

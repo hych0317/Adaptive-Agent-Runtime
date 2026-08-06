@@ -36,7 +36,9 @@ from adaptive_agent_runtime.persistence.governance import (
     SQLiteHumanReviewService,
 )
 from adaptive_agent_runtime.persistence.decisioning import (
+    DecisionProof,
     SQLiteDecisionCheckpointStore,
+    SQLiteDecisionRecordReader,
 )
 from adaptive_agent_runtime.persistence.orchestration import SQLiteTaskGraphStore
 from adaptive_agent_runtime.persistence.sqlite import SQLiteDatabase
@@ -71,6 +73,10 @@ from adaptive_agent_runtime.persistence.optimization_configuration import (
 from adaptive_agent_runtime.persistence.auto_adaptation import (
     SQLiteAutoAdaptationTriggerStore,
 )
+from adaptive_agent_runtime.persistence.retention import (
+    PurgeRunReport,
+    SQLiteDisposableRunCleaner,
+)
 
 
 RequestCheckpointT = TypeVar("RequestCheckpointT", bound=BaseModel)
@@ -90,6 +96,8 @@ class SQLitePersistence:
         self.database = SQLiteDatabase(path)
         self.state_store = SQLiteStateStore(self.database)
         self.trace_sink = SQLiteTraceSink(self.database)
+        self.decision_records = SQLiteDecisionRecordReader(self.database)
+        self.disposable_runs = SQLiteDisposableRunCleaner(self.database)
         self.context_store = SQLiteContextStore(self.database)
         self.human_review_service = SQLiteHumanReviewService(self.database)
         self.authorization_store = SQLiteAuthorizationConsumptionStore(
@@ -207,13 +215,17 @@ class SQLitePersistence:
 
 
 __all__ = [
+    "DecisionProof",
     "PersistenceConflictError",
     "PersistenceError",
     "PersistenceSchemaError",
+    "PurgeRunReport",
     "SQLiteContextArchive",
     "SQLiteContextStore",
     "SQLiteDatabase",
     "SQLiteDecisionCheckpointStore",
+    "SQLiteDecisionRecordReader",
+    "SQLiteDisposableRunCleaner",
     "SQLiteEvaluationReportStore",
     "SQLiteExperienceMetadataStore",
     "SQLiteDecisionFeedbackStore",

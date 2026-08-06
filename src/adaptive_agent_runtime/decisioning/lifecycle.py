@@ -425,7 +425,10 @@ class DecisionLifecycleCoordinator(
         if checkpoint.stage is DecisionCheckpointStage.AUTHORIZED:
             approval = self._governance.restore_approval(validated, receipt)
             return await self._apply(checkpoint, approval)
-        if checkpoint.stage is not DecisionCheckpointStage.APPLYING:
+        if checkpoint.stage not in {
+            DecisionCheckpointStage.APPLYING,
+            DecisionCheckpointStage.EFFECT_COMMITTED,
+        }:
             raise DecisionResumeError(
                 f"decision stage '{checkpoint.stage.value}' cannot safely resume"
             )
@@ -440,7 +443,40 @@ class DecisionLifecycleCoordinator(
                 raise DecisionInvariantError(
                     "committed reconciliation has no Apply receipt"
                 )
+            if checkpoint.stage is DecisionCheckpointStage.EFFECT_COMMITTED:
+                persisted = checkpoint.commit_receipt
+                if persisted is None or (
+                    persisted.effect_fingerprint != apply_receipt.effect_fingerprint
+                    or persisted.committed_state_fingerprint
+                    != apply_receipt.committed_state_fingerprint
+                    or persisted.result != apply_receipt.result
+                ):
+                    return await self._complete(
+                        checkpoint,
+                        status=DecisionResultStatus.FAILED,
+                        reason=(
+                            "Apply reconciliation failed closed: committed "
+                            "read-back conflicts with persisted Commit receipt"
+                        ),
+                        trace_kind=DecisionTraceKind.FAILED,
+                        reconciliation_status=DecisionReconciliationStatus.UNKNOWN,
+                    )
+                return await self._complete_applied(checkpoint, persisted)
+            checkpoint = await self._mark_effect_committed(
+                checkpoint, apply_receipt
+            )
             return await self._complete_applied(checkpoint, apply_receipt)
+        if checkpoint.stage is DecisionCheckpointStage.EFFECT_COMMITTED:
+            return await self._complete(
+                checkpoint,
+                status=DecisionResultStatus.FAILED,
+                reason=(
+                    "Apply reconciliation failed closed: persisted Commit "
+                    "receipt has no authoritative committed read-back"
+                ),
+                trace_kind=DecisionTraceKind.FAILED,
+                reconciliation_status=DecisionReconciliationStatus.UNKNOWN,
+            )
         if reconciliation.status is DecisionReconciliationStatus.EXPIRED:
             return await self._expire(checkpoint, reconciliation.reason)
         if reconciliation.status is DecisionReconciliationStatus.UNKNOWN:
@@ -464,6 +500,7 @@ class DecisionLifecycleCoordinator(
             apply_receipt = await self._applier.resume_apply(validated, approval)
         except Exception as exc:
             return await self._fail(checkpoint, "Decision Apply resume", exc)
+        checkpoint = await self._mark_effect_committed(checkpoint, apply_receipt)
         return await self._complete_applied(checkpoint, apply_receipt)
 
     async def _handle_governance(
@@ -590,8 +627,33 @@ class DecisionLifecycleCoordinator(
                 "Decision apply",
                 DecisionInvariantError("Apply receipt belongs to another effect"),
             )
+        checkpoint = await self._mark_effect_committed(checkpoint, apply_receipt)
         self._inject_fault(DecisionFaultPoint.EFFECT_COMMITTED, checkpoint)
         return await self._complete_applied(checkpoint, apply_receipt)
+
+    async def _mark_effect_committed(
+        self,
+        checkpoint: DecisionCheckpoint[
+            RequestPayloadT,
+            ProposalPayloadT,
+            EffectPayloadT,
+        ],
+        apply_receipt: DecisionApplyReceipt,
+    ) -> DecisionCheckpoint[
+        RequestPayloadT,
+        ProposalPayloadT,
+        EffectPayloadT,
+    ]:
+        validated = checkpoint.validated_decision
+        if validated is None:
+            raise DecisionInvariantError("Commit receipt has no validated effect")
+        if apply_receipt.effect_fingerprint != validated.normalized_effect.effect_fingerprint:
+            raise DecisionInvariantError("Commit receipt belongs to another effect")
+        return await self._advance(
+            checkpoint,
+            stage=DecisionCheckpointStage.EFFECT_COMMITTED,
+            commit_receipt=apply_receipt,
+        )
 
     async def _complete_applied(
         self,
@@ -626,6 +688,7 @@ class DecisionLifecycleCoordinator(
         checkpoint = await self._advance(
             checkpoint,
             stage=DecisionCheckpointStage.COMPLETED,
+            commit_receipt=apply_receipt,
             result=result,
         )
         await self._trace(

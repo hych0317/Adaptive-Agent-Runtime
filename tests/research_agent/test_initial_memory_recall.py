@@ -95,15 +95,24 @@ def planning_checkpoint(path: Path) -> dict:
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
     try:
-        rows = connection.execute(
-            "SELECT checkpoint_json FROM decision_checkpoints "
-            "WHERE checkpoint_json LIKE '%planning.task_graph.initialize%' "
-            "ORDER BY rowid DESC"
-        ).fetchall()
+        row = connection.execute(
+            "SELECT requests.canonical_payload AS request_json, "
+            "proposals.canonical_payload AS proposal_json "
+            "FROM decision_current AS current "
+            "JOIN decision_requests AS requests "
+            "ON requests.request_id = current.request_ref "
+            "JOIN decision_proposals AS proposals "
+            "ON proposals.proposal_id = current.proposal_ref "
+            "WHERE current.decision_type = 'planning.task_graph.initialize' "
+            "ORDER BY current.updated_at DESC LIMIT 1"
+        ).fetchone()
     finally:
         connection.close()
-    assert rows
-    return json.loads(rows[0]["checkpoint_json"])
+    assert row is not None
+    return {
+        "request": json.loads(row["request_json"]),
+        "proposal": json.loads(row["proposal_json"]),
+    }
 
 
 class InitialPlanningMemoryRecallTests(unittest.IsolatedAsyncioTestCase):

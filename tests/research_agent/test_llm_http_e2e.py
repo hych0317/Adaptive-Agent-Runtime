@@ -20,11 +20,21 @@ from adaptive_agent_runtime.llm import (
 )
 
 from applications.research_agent import (
-    ResearchAgent,
+    ResearchAgent as RuntimeResearchAgent,
     ResearchLLMCapability,
     ResearchLLMDeploymentConfig,
     build_research_llm_deployment,
 )
+from tests.runtime_database import register_test_resource, runtime_database_path
+
+
+def ResearchAgent(**kwargs: object) -> RuntimeResearchAgent:
+    kwargs.setdefault("persistence_path", runtime_database_path())
+    kwargs.setdefault("run_kind", "test")
+    kwargs.setdefault("disposable", True)
+    return register_test_resource(
+        RuntimeResearchAgent(**kwargs)  # type: ignore[arg-type]
+    )
 from applications.research_agent.report import ReportSection, ResearchReport
 
 

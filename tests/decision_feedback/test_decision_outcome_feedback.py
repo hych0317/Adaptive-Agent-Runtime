@@ -121,14 +121,11 @@ class DecisionOutcomeFeedbackTests(unittest.IsolatedAsyncioTestCase):
             connection = sqlite3.connect(path)
             try:
                 planning_id = str(result.decision_feedback[0].subject_decision_id)
-                earliest = connection.execute(
-                    "SELECT MIN(revision) FROM decision_checkpoints WHERE request_id = ?",
-                    (planning_id,),
-                ).fetchone()[0]
                 connection.execute(
-                    "UPDATE decision_checkpoint_current SET revision = ? "
-                    "WHERE request_id = ?",
-                    (earliest, planning_id),
+                    "UPDATE decision_current SET stage = 'applying', "
+                    "commit_receipt_ref = NULL, result_ref = NULL, "
+                    "result_status = NULL WHERE request_id = ?",
+                    (planning_id,),
                 )
                 connection.commit()
             finally:

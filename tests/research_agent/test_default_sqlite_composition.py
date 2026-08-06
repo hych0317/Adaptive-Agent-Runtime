@@ -12,12 +12,26 @@ from applications.research_agent.agent import ResearchAgent
 
 
 class ResearchDefaultSQLiteCompositionTests(unittest.TestCase):
-    def test_default_constructor_uses_one_stable_persistent_database_identity(self) -> None:
-        first = ResearchAgent()
-        second = ResearchAgent()
-        try:
-            first_identity = first.persistence_identity
-            second_identity = second.persistence_identity
+    def test_bare_constructor_cannot_select_the_runtime_database(self) -> None:
+        with self.assertRaises(TypeError):
+            ResearchAgent()  # type: ignore[call-arg]
+
+    def test_runtime_factory_uses_one_stable_persistent_database_identity(self) -> None:
+        with TemporaryDirectory() as directory:
+            runtime_path = Path(directory) / "runtime.sqlite3"
+            import applications.research_agent.agent as agent_module
+
+            original = agent_module.DEFAULT_RESEARCH_RUNTIME_DB
+            agent_module.DEFAULT_RESEARCH_RUNTIME_DB = runtime_path
+            first = ResearchAgent.for_runtime()
+            second = ResearchAgent.for_runtime()
+            try:
+                first_identity = first.persistence_identity
+                second_identity = second.persistence_identity
+            finally:
+                first.close()
+                second.close()
+                agent_module.DEFAULT_RESEARCH_RUNTIME_DB = original
             self.assertTrue(first_identity.is_persistent)
             self.assertNotEqual(first_identity.database_path, ":memory:")
             self.assertTrue(Path(first_identity.database_path).is_absolute())
@@ -62,7 +76,11 @@ class ResearchDefaultSQLiteCompositionTests(unittest.TestCase):
                     "agent_state_snapshots",
                     "task_graph_checkpoints",
                     "runtime_trace",
-                    "decision_checkpoints",
+                    "decision_current",
+                    "decision_transitions",
+                    "decision_requests",
+                    "decision_effects",
+                    "decision_evidence_snapshots",
                     "context_snapshots",
                     "context_archives",
                     "memory_snapshots",
@@ -82,27 +100,28 @@ class ResearchDefaultSQLiteCompositionTests(unittest.TestCase):
                     "auto_adaptation_trigger_history",
                 }.issubset(tables)
             )
-        finally:
-            first.close()
-            second.close()
-
     def test_default_database_identity_is_stable_across_processes(self) -> None:
-        script = (
-            "import json; from applications.research_agent.agent import ResearchAgent; "
-            "a=ResearchAgent(); print(json.dumps(a.persistence_identity.__dict__)); a.close()"
-        )
-        paths = []
-        for _ in range(2):
-            process = subprocess.run(
-                [sys.executable, "-c", script],
-                cwd=Path(__file__).resolve().parents[2],
-                capture_output=True,
-                text=True,
-                check=True,
+        with TemporaryDirectory() as directory:
+            runtime_path = Path(directory) / "runtime.sqlite3"
+            script = (
+                "import json; import applications.research_agent.agent as m; "
+                "from pathlib import Path; m.DEFAULT_RESEARCH_RUNTIME_DB=Path(r'"
+                + str(runtime_path)
+                + "'); a=m.ResearchAgent.for_runtime(); "
+                "print(json.dumps(a.persistence_identity.__dict__)); a.close()"
             )
-            paths.append(json.loads(process.stdout)["database_path"])
-        self.assertEqual(paths[0], paths[1])
-        self.assertNotEqual(paths[0], ":memory:")
+            paths = []
+            for _ in range(2):
+                process = subprocess.run(
+                    [sys.executable, "-c", script],
+                    cwd=Path(__file__).resolve().parents[2],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                paths.append(json.loads(process.stdout)["database_path"])
+            self.assertEqual(paths[0], paths[1])
+            self.assertEqual(paths[0], str(runtime_path.resolve()))
 
     def test_sqlite_initialization_failure_does_not_fall_back_to_memory(self) -> None:
         with TemporaryDirectory() as directory:

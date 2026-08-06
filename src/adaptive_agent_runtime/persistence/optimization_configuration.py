@@ -33,6 +33,7 @@ from adaptive_agent_runtime.optimization import (
     runtime_configuration_target_id,
 )
 from adaptive_agent_runtime.persistence.errors import PersistenceConflictError
+from adaptive_agent_runtime.persistence.decisioning import SQLiteDecisionRecordReader
 from adaptive_agent_runtime.persistence.sqlite import SQLiteDatabase
 from adaptive_agent_runtime.persistence.optimization import (
     verify_optimization_proposal_phase3_in_transaction,
@@ -777,28 +778,14 @@ def _load_and_verify_proposal(
         raise PersistenceConflictError("Optimization Proposal was revoked")
     if proposal.expires_at is not None and proposal.expires_at <= datetime.now(timezone.utc):
         raise PersistenceConflictError("Optimization Proposal expired")
-    decision_row = cursor.execute(  # type: ignore[attr-defined]
-        "SELECT checkpoints.checkpoint_json "
-        "FROM decision_checkpoint_current AS current "
-        "JOIN decision_checkpoints AS checkpoints "
-        "ON checkpoints.request_id = current.request_id "
-        "AND checkpoints.revision = current.revision "
-        "WHERE current.request_id = ?",
-        (str(proposal.source_decision_request_id),),
-    ).fetchone()
-    if decision_row is None:
+    proof = SQLiteDecisionRecordReader.load_proof_in_transaction(
+        cursor, proposal.source_decision_request_id
+    )
+    if proof is None:
         raise PersistenceConflictError("Optimization Proposal has no source Decision")
-    import json
-
-    checkpoint = json.loads(decision_row["checkpoint_json"])
-    result = checkpoint.get("result") or {}
-    normalized = (checkpoint.get("validated_decision") or {}).get(
-        "normalized_effect"
-    ) or {}
     if (
-        checkpoint.get("stage") != "completed"
-        or result.get("status") != "applied"
-        or normalized.get("effect_fingerprint") != proposal.effect_fingerprint
+        not proof.is_applied
+        or proof.effect_fingerprint != proposal.effect_fingerprint
     ):
         raise PersistenceConflictError("Optimization Proposal Decision is not APPLIED")
     return proposal

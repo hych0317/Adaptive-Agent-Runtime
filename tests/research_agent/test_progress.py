@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import unittest
 
-from applications.research_agent.agent import ResearchAgent
+from applications.research_agent.agent import ResearchAgent as RuntimeResearchAgent
+from tests.runtime_database import register_test_resource, runtime_database_path
+
+
+def ResearchAgent(**kwargs: object) -> RuntimeResearchAgent:
+    kwargs.setdefault("persistence_path", runtime_database_path())
+    kwargs.setdefault("run_kind", "test")
+    kwargs.setdefault("disposable", True)
+    return register_test_resource(
+        RuntimeResearchAgent(**kwargs)  # type: ignore[arg-type]
+    )
 from applications.research_agent.progress import (
     ResearchProgressEvent,
     ResearchProgressKind,

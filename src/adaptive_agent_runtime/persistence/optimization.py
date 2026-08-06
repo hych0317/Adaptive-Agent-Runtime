@@ -11,13 +11,11 @@ from adaptive_agent_runtime.decision_feedback import (
     DecisionFeedbackCommitReceipt,
     DecisionFeedbackRecord,
 )
-from adaptive_agent_runtime.decisioning import DecisionCheckpoint, decision_fingerprint
+from adaptive_agent_runtime.decisioning import decision_fingerprint
 from adaptive_agent_runtime.evaluation import EvaluationReport
 from adaptive_agent_runtime.experience_learning import (
-    LearningAssessmentRequest,
     LearningInsight,
     LearningInsightCommitReceipt,
-    LearningInsightDraft,
     LearningInsightEffect,
 )
 from adaptive_agent_runtime.context_memory import (
@@ -41,6 +39,7 @@ from adaptive_agent_runtime.optimization import (
     stable_optimization_evidence_ref,
 )
 from adaptive_agent_runtime.persistence.errors import PersistenceConflictError
+from adaptive_agent_runtime.persistence.decisioning import SQLiteDecisionRecordReader
 from adaptive_agent_runtime.persistence.sqlite import SQLiteDatabase
 
 
@@ -496,28 +495,21 @@ def verify_optimization_proposal_phase3_in_transaction(
 ) -> None:
     """Verify Proposal Decision plus every persisted Phase 3 evidence receipt."""
 
-    decision_row = cursor.execute(  # type: ignore[attr-defined]
-        "SELECT checkpoints.checkpoint_json "
-        "FROM decision_checkpoint_current AS current "
-        "JOIN decision_checkpoints AS checkpoints "
-        "ON checkpoints.request_id = current.request_id "
-        "AND checkpoints.revision = current.revision "
-        "WHERE current.request_id = ?",
-        (str(proposal.source_decision_request_id),),
-    ).fetchone()
-    if decision_row is None:
+    proof = SQLiteDecisionRecordReader.load_proof_in_transaction(
+        cursor, proposal.source_decision_request_id
+    )
+    if proof is None:
         raise PersistenceConflictError("Optimization Proposal has no source Decision")
-    checkpoint = json.loads(decision_row["checkpoint_json"])
-    result = checkpoint.get("result") or {}
-    normalized = (checkpoint.get("validated_decision") or {}).get(
-        "normalized_effect"
-    ) or {}
     if (
-        checkpoint.get("stage") != "completed"
-        or result.get("status") != "applied"
-        or normalized.get("effect_fingerprint") != proposal.effect_fingerprint
+        not proof.is_applied
+        or proof.effect_fingerprint != proposal.effect_fingerprint
     ):
         raise PersistenceConflictError("Optimization Proposal Decision is not APPLIED")
+    normalized = SQLiteDecisionRecordReader.load_effect_in_transaction(
+        cursor, proposal.effect_fingerprint
+    )
+    if normalized is None:
+        raise PersistenceConflictError("Optimization Proposal Effect is missing")
     effect = OptimizationProposalEffect.model_validate(normalized.get("payload"))
     if (
         effect.proposal_id != proposal.proposal_id
@@ -613,38 +605,22 @@ def verify_optimization_proposal_phase3_in_transaction(
 
 
 def _learning_effect(cursor: object, insight: LearningInsight) -> LearningInsightEffect:
-    rows = cursor.execute(  # type: ignore[attr-defined]
-        "SELECT checkpoints.checkpoint_json FROM decision_checkpoint_current AS current "
-        "JOIN decision_checkpoints AS checkpoints "
-        "ON checkpoints.request_id = current.request_id "
-        "AND checkpoints.revision = current.revision "
-        "WHERE checkpoints.stage = 'completed' "
-        "AND checkpoints.checkpoint_json LIKE ? "
-        "AND checkpoints.checkpoint_json LIKE ?",
-        (
-            f"%{insight.effect_fingerprint}%",
-            f"%{insight.learning_insight_id}%",
-        ),
-    ).fetchall()
-    checkpoint_type = DecisionCheckpoint[
-        LearningAssessmentRequest,
-        LearningInsightDraft,
-        LearningInsightEffect,
-    ]
-    for row in rows:
-        try:
-            checkpoint = checkpoint_type.model_validate_json(row["checkpoint_json"])
-        except ValueError:
-            continue
-        validated = checkpoint.validated_decision
-        if validated is None:
-            continue
-        normalized = validated.normalized_effect
-        if (
-            normalized.effect_fingerprint == insight.effect_fingerprint
-            and normalized.payload.learning_insight_id == insight.learning_insight_id
-        ):
-            return normalized.payload
+    row = cursor.execute(  # type: ignore[attr-defined]
+        "SELECT request_id FROM decision_current WHERE stage = 'completed' "
+        "AND effect_ref = ?",
+        (insight.effect_fingerprint,),
+    ).fetchone()
+    if row is not None:
+        proof = SQLiteDecisionRecordReader.load_proof_in_transaction(
+            cursor, UUID(str(row["request_id"]))
+        )
+        normalized = SQLiteDecisionRecordReader.load_effect_in_transaction(
+            cursor, insight.effect_fingerprint
+        )
+        if proof is not None and proof.is_applied and normalized is not None:
+            effect = LearningInsightEffect.model_validate(normalized.get("payload"))
+            if effect.learning_insight_id == insight.learning_insight_id:
+                return effect
     raise PersistenceConflictError(
         "Learning Insight has no APPLIED Decision provenance"
     )

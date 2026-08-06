@@ -11,6 +11,7 @@ from adaptive_agent_runtime.decisioning.errors import (
 )
 from adaptive_agent_runtime.decisioning.models import (
     DecisionCheckpoint,
+    DecisionTransition,
     EffectPayloadT,
     ProposalPayloadT,
     RequestPayloadT,
@@ -27,16 +28,9 @@ class InMemoryDecisionCheckpointStore(
             UUID,
             DecisionCheckpoint[RequestPayloadT, ProposalPayloadT, EffectPayloadT],
         ] = {}
-        self._history: defaultdict[
-            UUID,
-            list[
-                DecisionCheckpoint[
-                    RequestPayloadT,
-                    ProposalPayloadT,
-                    EffectPayloadT,
-                ]
-            ],
-        ] = defaultdict(list)
+        self._transitions: defaultdict[UUID, list[DecisionTransition]] = defaultdict(
+            list
+        )
 
     async def save(
         self,
@@ -65,8 +59,55 @@ class InMemoryDecisionCheckpointStore(
                 raise DecisionCheckpointConflictError(
                     "decision checkpoint write is not the next revision"
                 )
+        transition = DecisionTransition(
+            request_id=checkpoint.request_id,
+            from_revision=-1 if current is None else current.revision,
+            to_revision=checkpoint.revision,
+            from_stage=None if current is None else current.stage,
+            to_stage=checkpoint.stage,
+            occurred_at=checkpoint.updated_at,
+            request_ref=str(checkpoint.request_id),
+            proposal_ref=(
+                str(checkpoint.proposal.proposal_id)
+                if checkpoint.proposal is not None
+                else None
+            ),
+            validation_ref=(
+                str(checkpoint.validation.validation_id)
+                if checkpoint.validation is not None
+                else None
+            ),
+            effect_ref=(
+                checkpoint.validated_decision.normalized_effect.effect_fingerprint
+                if checkpoint.validated_decision is not None
+                else None
+            ),
+            governance_receipt_ref=(
+                str(checkpoint.governance_receipt.governance_decision_id)
+                if checkpoint.governance_receipt is not None
+                else None
+            ),
+            authorization_id=(
+                checkpoint.governance_receipt.authorization_id
+                if checkpoint.governance_receipt is not None
+                else None
+            ),
+            commit_receipt_ref=(
+                checkpoint.commit_receipt.effect_fingerprint
+                if checkpoint.commit_receipt is not None
+                else None
+            ),
+            result_ref=(
+                str(checkpoint.result.result_id)
+                if checkpoint.result is not None
+                else None
+            ),
+            result_status=(
+                checkpoint.result.status if checkpoint.result is not None else None
+            ),
+        )
         self._current[checkpoint.request_id] = checkpoint
-        self._history[checkpoint.request_id].append(checkpoint)
+        self._transitions[checkpoint.request_id].append(transition)
 
     async def load(
         self,
@@ -77,11 +118,8 @@ class InMemoryDecisionCheckpointStore(
     ):
         return self._current.get(request_id)
 
-    def history_for(
+    def transitions_for(
         self,
         request_id: UUID,
-    ) -> tuple[
-        DecisionCheckpoint[RequestPayloadT, ProposalPayloadT, EffectPayloadT],
-        ...,
-    ]:
-        return tuple(self._history.get(request_id, ()))
+    ) -> tuple[DecisionTransition, ...]:
+        return tuple(self._transitions.get(request_id, ()))

@@ -33,9 +33,9 @@ class MemoryRecallCrossProcessResumeTests(unittest.TestCase):
         connection.row_factory = sqlite3.Row
         try:
             checkpoint = connection.execute(
-                "SELECT checkpoint_json FROM decision_checkpoints "
-                "WHERE checkpoint_json LIKE '%memory.recall%' "
-                "ORDER BY revision DESC LIMIT 1"
+                "SELECT stage, result_status, proposal_ref, effect_ref, "
+                "authorization_id FROM decision_current "
+                "WHERE decision_type = 'memory.recall'"
             ).fetchone()
             calls = connection.execute(
                 "SELECT calls FROM closeout_recall_invocations WHERE singleton = 1"
@@ -50,7 +50,7 @@ class MemoryRecallCrossProcessResumeTests(unittest.TestCase):
             connection.close()
         assert checkpoint is not None and calls is not None
         return {
-            "checkpoint": json.loads(checkpoint["checkpoint_json"]),
+            "checkpoint": dict(checkpoint),
             "calls": int(calls["calls"]),
             "bundles": tuple(row["bundle_json"] for row in bundles),
             "memories": tuple(row["snapshot_json"] for row in memories),
@@ -72,21 +72,18 @@ class MemoryRecallCrossProcessResumeTests(unittest.TestCase):
             self.assertEqual(after["bundles"], before["bundles"])
             self.assertEqual(after["memories"], before["memories"])
             self.assertEqual(after["checkpoint"]["stage"], "completed")
-            self.assertEqual(after["checkpoint"]["result"]["status"], "applied")
+            self.assertEqual(after["checkpoint"]["result_status"], "applied")
             self.assertEqual(
-                after["checkpoint"]["proposal"], before["checkpoint"]["proposal"]
+                after["checkpoint"]["proposal_ref"],
+                before["checkpoint"]["proposal_ref"],
             )
             self.assertEqual(
-                after["checkpoint"]["validated_decision"]["normalized_effect"][
-                    "effect_fingerprint"
-                ],
-                before["checkpoint"]["validated_decision"]["normalized_effect"][
-                    "effect_fingerprint"
-                ],
+                after["checkpoint"]["effect_ref"],
+                before["checkpoint"]["effect_ref"],
             )
             self.assertEqual(
-                after["checkpoint"]["governance_receipt"]["authorization_id"],
-                before["checkpoint"]["governance_receipt"]["authorization_id"],
+                after["checkpoint"]["authorization_id"],
+                before["checkpoint"]["authorization_id"],
             )
 
             repeated = self.worker(database, "resume")

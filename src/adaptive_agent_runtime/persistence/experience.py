@@ -21,6 +21,7 @@ from adaptive_agent_runtime.governance import (
     RuntimeCommitPermit,
 )
 from adaptive_agent_runtime.persistence.errors import PersistenceConflictError
+from adaptive_agent_runtime.persistence.decisioning import SQLiteDecisionRecordReader
 from adaptive_agent_runtime.persistence.sqlite import SQLiteDatabase
 
 
@@ -127,26 +128,14 @@ class SQLiteExperienceMetadataStore:
                     )
 
             for decision_id in effect.source_decision_ids:
-                row = cursor.execute(
-                    "SELECT checkpoints.checkpoint_json "
-                    "FROM decision_checkpoint_current AS current "
-                    "JOIN decision_checkpoints AS checkpoints "
-                    "ON checkpoints.request_id = current.request_id "
-                    "AND checkpoints.revision = current.revision "
-                    "WHERE current.request_id = ?",
-                    (str(decision_id),),
-                ).fetchone()
-                if row is None:
+                proof = SQLiteDecisionRecordReader.load_proof_in_transaction(
+                    cursor, decision_id
+                )
+                if proof is None:
                     raise PersistenceConflictError(
                         "Experience references an uncommitted Decision"
                     )
-                checkpoint = json.loads(row["checkpoint_json"])
-                result = checkpoint.get("result")
-                if (
-                    checkpoint.get("stage") != "completed"
-                    or not isinstance(result, dict)
-                    or result.get("status") != "applied"
-                ):
+                if not proof.is_applied:
                     raise PersistenceConflictError(
                         "Experience source Decision is not APPLIED"
                     )

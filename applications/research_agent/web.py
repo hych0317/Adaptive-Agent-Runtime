@@ -16,6 +16,7 @@ import ipaddress
 import json
 from pathlib import Path
 from queue import Empty, Queue
+from tempfile import TemporaryDirectory
 from threading import Event, Lock, Thread
 import time
 from typing import Any
@@ -528,14 +529,19 @@ class ResearchConsoleApplication:
             )
         )
         if resolved_mode is ResearchInformationMode.FIXTURE_DEMO:
-            agent = ResearchAgent()
-            try:
-                result = await agent.run_demo(
-                    task,
-                    progress_sink=progress_sink,
+            with TemporaryDirectory(prefix="research-agent-web-demo-") as directory:
+                agent = ResearchAgent(
+                    persistence_path=Path(directory) / "runtime.sqlite3",
+                    run_kind="demo",
+                    disposable=True,
                 )
-            finally:
-                agent.close()
+                try:
+                    result = await agent.run_demo(
+                        task,
+                        progress_sink=progress_sink,
+                    )
+                finally:
+                    agent.close()
             inference_label = "Deterministic Runtime · Fixture Demo"
         else:
             if llm_config is None:
@@ -553,7 +559,7 @@ class ResearchConsoleApplication:
                     f"LLM preflight failed: {probe.availability.value} "
                     f"({diagnostics})"
                 )
-            agent = ResearchAgent(
+            agent = ResearchAgent.for_runtime(
                 cognitive_capabilities=deployment.cognitive_capabilities,
                 information_mode=ResearchInformationMode.LLM_RESEARCH,
             )

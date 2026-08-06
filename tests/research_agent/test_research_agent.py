@@ -66,7 +66,7 @@ from adaptive_agent_runtime.llm import (
 from adaptive_agent_runtime.orchestration import TaskNode, TaskNodeStatus
 
 from applications.research_agent import (
-    ResearchAgent,
+    ResearchAgent as RuntimeResearchAgent,
     ResearchCognitiveCapabilities,
     ResearchContextProjection,
     ResearchInformationMode,
@@ -74,6 +74,16 @@ from applications.research_agent import (
     build_research_task,
     build_research_task_from_draft,
 )
+from tests.runtime_database import register_test_resource, runtime_database_path
+
+
+def ResearchAgent(**kwargs: object) -> RuntimeResearchAgent:
+    kwargs.setdefault("persistence_path", runtime_database_path())
+    kwargs.setdefault("run_kind", "test")
+    kwargs.setdefault("disposable", True)
+    return register_test_resource(
+        RuntimeResearchAgent(**kwargs)  # type: ignore[arg-type]
+    )
 from applications.research_agent.capabilities import (
     CALCULATION,
     DOCUMENT_ANALYSIS,

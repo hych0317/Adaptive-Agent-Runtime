@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 import sqlite3
@@ -7,6 +8,7 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from uuid import UUID
 
 from adaptive_agent_runtime.decisioning import (
     DecisionCheckpoint,
@@ -14,6 +16,7 @@ from adaptive_agent_runtime.decisioning import (
     DecisionReconciliationStatus,
     decision_fingerprint,
 )
+from adaptive_agent_runtime.persistence import SQLitePersistence
 from tests.decisioning.fakes import (
     FakeEffectPayload,
     FakeProposalPayload,
@@ -51,14 +54,10 @@ class CrossProcessDecisionResumeTests(unittest.TestCase):
         connection.row_factory = sqlite3.Row
         try:
             checkpoint_row = connection.execute(
-                "SELECT c.checkpoint_json FROM decision_checkpoint_current AS current "
-                "JOIN decision_checkpoints AS c ON c.request_id = current.request_id "
-                "AND c.revision = current.revision"
+                "SELECT request_id FROM decision_current"
             ).fetchone()
             assert checkpoint_row is not None
-            checkpoint = CHECKPOINT_TYPE.model_validate_json(
-                checkpoint_row["checkpoint_json"]
-            )
+            request_id = UUID(str(checkpoint_row["request_id"]))
             invocation = connection.execute(
                 "SELECT calls FROM closeout_agent_invocations"
             ).fetchone()
@@ -74,8 +73,7 @@ class CrossProcessDecisionResumeTests(unittest.TestCase):
                     "SELECT entry_json FROM runtime_trace ORDER BY sequence"
                 ).fetchall()
             )
-            return {
-                "checkpoint": checkpoint,
+            facts = {
                 "agent_calls": int(invocation["calls"]) if invocation else 0,
                 "commit_count": int(commit["commit_count"]) if commit else 0,
                 "apply_attempts": int(attempt["attempts"]) if attempt else 0,
@@ -83,6 +81,17 @@ class CrossProcessDecisionResumeTests(unittest.TestCase):
             }
         finally:
             connection.close()
+        persistence = SQLitePersistence(database)
+        try:
+            checkpoint = asyncio.run(
+                persistence.create_decision_checkpoint_store(CHECKPOINT_TYPE).load(
+                    request_id
+                )
+            )
+        finally:
+            persistence.close()
+        assert checkpoint is not None
+        return {"checkpoint": checkpoint, **facts}
 
     def _assert_identity_stable(self, before, after) -> None:  # type: ignore[no-untyped-def]
         assert before.proposal is not None and after.proposal is not None

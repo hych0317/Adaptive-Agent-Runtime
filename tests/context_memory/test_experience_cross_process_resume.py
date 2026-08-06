@@ -72,9 +72,8 @@ class ExperienceCrossProcessResumeTests(unittest.TestCase):
                     "SELECT calls FROM experience_agent_invocations WHERE singleton = 1"
                 ).fetchone()
                 checkpoint_row = connection.execute(
-                    "SELECT checkpoint_json FROM decision_checkpoints "
-                    "WHERE checkpoint_json LIKE '%experience.assessment%' "
-                    "ORDER BY revision DESC LIMIT 1"
+                    "SELECT stage, result_status FROM decision_current "
+                    "WHERE decision_type = 'experience.assessment'"
                 ).fetchone()
             finally:
                 connection.close()
@@ -91,9 +90,8 @@ class ExperienceCrossProcessResumeTests(unittest.TestCase):
                 before["effect_fingerprint"],
             )
             assert checkpoint_row is not None
-            checkpoint = json.loads(checkpoint_row["checkpoint_json"])
-            self.assertEqual(checkpoint["stage"], "completed")
-            self.assertEqual(checkpoint["result"]["status"], "applied")
+            self.assertEqual(checkpoint_row["stage"], "completed")
+            self.assertEqual(checkpoint_row["result_status"], "applied")
 
 
 if __name__ == "__main__":

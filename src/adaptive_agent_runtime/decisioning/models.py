@@ -122,6 +122,7 @@ class DecisionCheckpointStage(StrEnum):
     REVIEW_PENDING = "review_pending"
     AUTHORIZED = "authorized"
     APPLYING = "applying"
+    EFFECT_COMMITTED = "effect_committed"
     COMPLETED = "completed"
 
 
@@ -552,6 +553,7 @@ class DecisionCheckpoint(
         ValidatedDecision[RequestPayloadT, ProposalPayloadT, EffectPayloadT] | None
     ) = None
     governance_receipt: DecisionGovernanceReceipt | None = None
+    commit_receipt: DecisionApplyReceipt | None = None
     result: DecisionResult | None = None
     updated_at: AwareDatetime = Field(default_factory=utc_now)
 
@@ -584,6 +586,56 @@ class DecisionCheckpoint(
                 or receipt.outcome is not DecisionGovernanceOutcome.REVIEW_REQUIRED
             ):
                 raise ValueError("review checkpoint requires a review receipt")
+        if self.stage is DecisionCheckpointStage.EFFECT_COMMITTED:
+            if self.commit_receipt is None or self.result is not None:
+                raise ValueError(
+                    "effect-committed checkpoint requires only a Commit receipt"
+                )
+        if (
+            self.stage is not DecisionCheckpointStage.EFFECT_COMMITTED
+            and self.stage is not DecisionCheckpointStage.COMPLETED
+            and self.commit_receipt is not None
+        ):
+            raise ValueError(
+                "only effect-committed or completed checkpoints can contain "
+                "a Commit receipt"
+            )
+        if self.result is not None and self.result.status is DecisionResultStatus.APPLIED:
+            if (
+                self.commit_receipt is None
+                or self.result.apply_receipt != self.commit_receipt
+            ):
+                raise ValueError(
+                    "applied result must reference the checkpoint Commit receipt"
+                )
+        return self
+
+
+class DecisionTransition(DecisionModel):
+    """Lightweight immutable audit record for one lifecycle state change."""
+
+    request_id: UUID
+    from_revision: int = Field(ge=-1)
+    to_revision: int = Field(ge=0)
+    from_stage: DecisionCheckpointStage | None = None
+    to_stage: DecisionCheckpointStage
+    occurred_at: AwareDatetime
+    request_ref: str = Field(min_length=1)
+    proposal_ref: str | None = None
+    validation_ref: str | None = None
+    effect_ref: str | None = None
+    governance_receipt_ref: str | None = None
+    authorization_id: UUID | None = None
+    commit_receipt_ref: str | None = None
+    result_ref: str | None = None
+    result_status: DecisionResultStatus | None = None
+
+    @model_validator(mode="after")
+    def validate_revision_step(self) -> DecisionTransition:
+        if self.to_revision != self.from_revision + 1:
+            raise ValueError("Decision transition revisions must be consecutive")
+        if self.from_revision == -1 and self.from_stage is not None:
+            raise ValueError("Initial Decision transition cannot have a prior stage")
         return self
 
 

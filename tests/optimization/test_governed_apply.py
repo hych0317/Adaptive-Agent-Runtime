@@ -510,17 +510,20 @@ class GovernedOptimizationApplyTests(unittest.IsolatedAsyncioTestCase):
             try:
                 with persistence.database.reader() as cursor:
                     row = cursor.execute(
-                        "SELECT checkpoint_json FROM decision_checkpoints "
-                        "WHERE run_id = ? AND checkpoint_json LIKE ? LIMIT 1",
+                        "SELECT requests.canonical_payload AS request_json "
+                        "FROM decision_current AS current "
+                        "JOIN decision_requests AS requests "
+                        "ON requests.request_id = current.request_ref "
+                        "WHERE current.run_id = ? AND current.decision_type = ? LIMIT 1",
                         (
                             str(result.runtime_result.final_state.run_id),
-                            '%"decision_type":"planning.task_graph.initialize"%',
+                            "planning.task_graph.initialize",
                         ),
                     ).fetchone()
                 self.assertIsNotNone(row)
                 self.assertIn(
                     result.runtime_configuration.snapshot_fingerprint,
-                    row["checkpoint_json"],
+                    row["request_json"],
                 )
             finally:
                 persistence.close()

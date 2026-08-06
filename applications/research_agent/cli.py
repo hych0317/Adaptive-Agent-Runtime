@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import tomllib
 from typing import cast
 
@@ -178,7 +179,16 @@ async def async_main(
     llm_config: ResearchLLMDeploymentConfig | None = None,
 ) -> ResearchRunResult:
     if llm_config is None:
-        result = await ResearchAgent().run_demo(task)
+        with TemporaryDirectory(prefix="research-agent-demo-") as directory:
+            agent = ResearchAgent(
+                persistence_path=Path(directory) / "runtime.sqlite3",
+                run_kind="demo",
+                disposable=True,
+            )
+            try:
+                result = await agent.run_demo(task)
+            finally:
+                agent.close()
     else:
         deployment = build_research_llm_deployment(llm_config)
         probe = await deployment.probe()
@@ -196,10 +206,14 @@ async def async_main(
         )
         if probe.diagnostics:
             print("LLM preflight diagnostics: " + ",".join(probe.diagnostics))
-        result = await ResearchAgent(
+        agent = ResearchAgent.for_runtime(
             cognitive_capabilities=deployment.cognitive_capabilities,
             information_mode=ResearchInformationMode.LLM_RESEARCH,
-        ).run(task)
+        )
+        try:
+            result = await agent.run(task)
+        finally:
+            agent.close()
     print(format_result(result))
     return result
 

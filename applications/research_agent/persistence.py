@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from types import MappingProxyType
+from typing import Protocol
 from uuid import UUID
 
 from adaptive_agent_runtime.decisioning import decision_fingerprint
@@ -15,6 +17,7 @@ from adaptive_agent_runtime.orchestration import (
     TaskNodeStatus,
 )
 from adaptive_agent_runtime.persistence import (
+    DecisionProof,
     SQLiteDatabase,
     WorkspaceArtifactCommitReceipt,
 )
@@ -33,6 +36,12 @@ class ResearchPersistenceIdentity:
         return self.database_path != ":memory:"
 
 
+class DecisionProofQueries(Protocol):
+    def load_proof_in_transaction(
+        self, cursor: object, request_id: UUID
+    ) -> DecisionProof | None: ...
+
+
 class SQLiteResearchRunManifestStore:
     module_id = "research_agent.run_manifest.sqlite"
     application_id = "research_agent"
@@ -47,6 +56,8 @@ class SQLiteResearchRunManifestStore:
         task: str,
         definition: ResearchTaskDefinition,
         configuration_snapshot: RuntimeConfigurationSnapshot,
+        run_kind: str,
+        disposable: bool,
     ) -> None:
         payload = json.dumps(
             {
@@ -66,6 +77,27 @@ class SQLiteResearchRunManifestStore:
             sort_keys=True,
         )
         with self._database.transaction() as cursor:
+            metadata = cursor.execute(
+                "SELECT run_kind, disposable FROM runtime_run_metadata "
+                "WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            if metadata is None:
+                cursor.execute(
+                    "INSERT INTO runtime_run_metadata "
+                    "(run_id, run_kind, disposable, created_at) VALUES (?, ?, ?, ?)",
+                    (
+                        str(run_id),
+                        run_kind,
+                        int(disposable),
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+            elif (
+                metadata["run_kind"] != run_kind
+                or int(metadata["disposable"]) != int(disposable)
+            ):
+                raise RuntimeError("Research run retention identity was reused")
             current = cursor.execute(
                 "SELECT manifest_json FROM application_run_manifests "
                 "WHERE application_id = ? AND run_id = ?",
@@ -123,8 +155,13 @@ class SQLiteReportDispatchReconciler:
 
     module_id = "research_agent.report_dispatch_reconciler.sqlite"
 
-    def __init__(self, database: SQLiteDatabase) -> None:
+    def __init__(
+        self,
+        database: SQLiteDatabase,
+        decisions: DecisionProofQueries,
+    ) -> None:
         self._database = database
+        self._decisions = decisions
 
     async def reconcile(self, run_id: UUID) -> bool:
         with self._database.transaction() as cursor:
@@ -162,33 +199,24 @@ class SQLiteReportDispatchReconciler:
                     raise RuntimeError(
                         "report Artifact receipt is not bound to its persisted content"
                     )
-                decision_row = cursor.execute(
-                    "SELECT checkpoints.checkpoint_json "
-                    "FROM decision_checkpoint_current AS current "
-                    "JOIN decision_checkpoints AS checkpoints "
-                    "ON checkpoints.request_id = current.request_id "
-                    "AND checkpoints.revision = current.revision "
-                    "WHERE current.request_id = ?",
-                    (str(request_id),),
-                ).fetchone()
-                if decision_row is None:
+                proof = self._decisions.load_proof_in_transaction(
+                    cursor, request_id
+                )
+                if proof is None:
                     raise RuntimeError(
                         "report Artifact has no durable source Decision"
                     )
-                decision = json.loads(decision_row["checkpoint_json"])
-                validated = decision.get("validated_decision") or {}
-                normalized = validated.get("normalized_effect") or {}
-                request = decision.get("request") or {}
-                proposal = decision.get("proposal") or {}
                 if (
-                    decision.get("stage") not in {"applying", "completed"}
-                    or request.get("decision_type") != "artifact.report_commit"
-                    or request.get("request_id") != str(request_id)
-                    or (request.get("target") or {}).get("target_id")
-                    != f"{run_id}:{in_flight.node_id}"
-                    or proposal.get("proposal_id") != str(proposal_id)
-                    or normalized.get("effect_fingerprint")
-                    != receipt.effect_fingerprint
+                    proof.stage.value not in {
+                        "applying",
+                        "effect_committed",
+                        "completed",
+                    }
+                    or proof.decision_type != "artifact.report_commit"
+                    or proof.request_id != request_id
+                    or proof.target_id != f"{run_id}:{in_flight.node_id}"
+                    or proof.proposal_id != proposal_id
+                    or proof.effect_fingerprint != receipt.effect_fingerprint
                 ):
                     raise RuntimeError(
                         "report dispatch reconciliation proof is inconsistent"

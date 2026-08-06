@@ -43,21 +43,18 @@ class DecisionFeedbackCrossProcessResumeTests(unittest.TestCase):
                     "SELECT COUNT(*) FROM decision_feedback WHERE source_run_id = ?",
                     (payload["run_id"],),
                 ).fetchone()[0]
-                feedback_checkpoints = [
-                    json.loads(row[0])
-                    for row in connection.execute(
-                        "SELECT checkpoint_json FROM decision_checkpoints "
-                        "WHERE checkpoint_json LIKE '%decision.outcome_feedback%'"
-                    ).fetchall()
-                ]
+                current = connection.execute(
+                    "SELECT stage, result_status, effect_ref FROM decision_current "
+                    "WHERE decision_type = 'decision.outcome_feedback'"
+                ).fetchone()
             finally:
                 connection.close()
             self.assertEqual(record_count, 1)
-            current = max(feedback_checkpoints, key=lambda item: item["revision"])
-            self.assertEqual(current["stage"], "completed")
-            self.assertEqual(current["result"]["status"], "applied")
+            assert current is not None
+            self.assertEqual(current[0], "completed")
+            self.assertEqual(current[1], "applied")
             self.assertEqual(
-                current["result"]["apply_receipt"]["effect_fingerprint"],
+                current[2],
                 payload["effect_fingerprints"][0],
             )
 

@@ -32,6 +32,10 @@ from adaptive_agent_runtime.governance import (
 )
 from adaptive_agent_runtime.orchestration import PLANNING_DECISION_TYPE
 from adaptive_agent_runtime.persistence.errors import PersistenceConflictError
+from adaptive_agent_runtime.persistence.decisioning import (
+    DecisionProof,
+    SQLiteDecisionRecordReader,
+)
 from adaptive_agent_runtime.persistence.sqlite import SQLiteDatabase
 
 
@@ -353,19 +357,19 @@ class SQLiteLearningInsightStore(LearningInsightStore):
                 record.source_run_id, record.subject_decision_id
             ),
         )
-        feedback_effect = self._applied_effect(feedback_checkpoint)
+        feedback_effect = self._applied_effect(cursor, feedback_checkpoint)
         if (
             feedback_effect.get("effect_fingerprint") != record.effect_fingerprint
             or not self._trace_applied(
                 cursor,
                 record.source_run_id,
-                UUID(str(feedback_checkpoint["request_id"])),
+                feedback_checkpoint.request_id,
                 record.effect_fingerprint,
             )
         ):
             raise PersistenceConflictError("Learning Feedback is not APPLIED")
         subject_checkpoint = self._checkpoint(cursor, record.subject_decision_id)
-        subject_effect = self._applied_effect(subject_checkpoint)
+        subject_effect = self._applied_effect(cursor, subject_checkpoint)
         if (
             subject_effect.get("effect_fingerprint")
             != record.subject_effect_fingerprint
@@ -517,39 +521,25 @@ class SQLiteLearningInsightStore(LearningInsightStore):
             raise PersistenceConflictError("Learning Feedback receipt is invalid")
 
     @staticmethod
-    def _checkpoint(cursor: object, request_id: UUID) -> Mapping[str, object]:
-        row = cursor.execute(  # type: ignore[attr-defined]
-            "SELECT checkpoints.checkpoint_json FROM decision_checkpoint_current "
-            "AS current JOIN decision_checkpoints AS checkpoints "
-            "ON checkpoints.request_id = current.request_id "
-            "AND checkpoints.revision = current.revision "
-            "WHERE current.request_id = ?",
-            (str(request_id),),
-        ).fetchone()
-        if row is None:
+    def _checkpoint(cursor: object, request_id: UUID) -> DecisionProof:
+        proof = SQLiteDecisionRecordReader.load_proof_in_transaction(
+            cursor, request_id
+        )
+        if proof is None:
             raise PersistenceConflictError("Learning Decision checkpoint is missing")
-        value = json.loads(row["checkpoint_json"])
-        if not isinstance(value, Mapping):
-            raise PersistenceConflictError("Learning Decision checkpoint is invalid")
-        return value
+        return proof
 
     @staticmethod
-    def _applied_effect(checkpoint: Mapping[str, object]) -> Mapping[str, object]:
-        validated = checkpoint.get("validated_decision")
-        result = checkpoint.get("result")
-        if (
-            checkpoint.get("stage") != "completed"
-            or not isinstance(validated, Mapping)
-            or not isinstance(result, Mapping)
-            or result.get("status") != "applied"
-        ):
+    def _applied_effect(
+        cursor: object, checkpoint: DecisionProof
+    ) -> Mapping[str, object]:
+        if not checkpoint.is_applied or checkpoint.effect_fingerprint is None:
             raise PersistenceConflictError("Learning evidence Decision is not APPLIED")
-        normalized = validated.get("normalized_effect")
-        receipt = result.get("apply_receipt")
-        if not isinstance(normalized, Mapping) or not isinstance(receipt, Mapping):
-            raise PersistenceConflictError("Learning evidence has no Apply receipt")
-        if receipt.get("effect_fingerprint") != normalized.get("effect_fingerprint"):
-            raise PersistenceConflictError("Learning evidence fingerprints differ")
+        normalized = SQLiteDecisionRecordReader.load_effect_in_transaction(
+            cursor, checkpoint.effect_fingerprint
+        )
+        if normalized is None:
+            raise PersistenceConflictError("Learning evidence Effect is missing")
         return normalized
 
     @staticmethod

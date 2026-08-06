@@ -72,9 +72,8 @@ class ReportCrossProcessResumeTests(unittest.TestCase):
                     "SELECT calls FROM closeout_report_invocations WHERE singleton = 1"
                 ).fetchone()
                 report_decision = connection.execute(
-                    "SELECT checkpoint_json FROM decision_checkpoints "
-                    "WHERE checkpoint_json LIKE '%artifact.report_commit%' "
-                    "ORDER BY revision DESC LIMIT 1"
+                    "SELECT stage, result_status FROM decision_current "
+                    "WHERE decision_type = 'artifact.report_commit'"
                 ).fetchone()
             finally:
                 connection.close()
@@ -91,9 +90,8 @@ class ReportCrossProcessResumeTests(unittest.TestCase):
             self.assertIsNotNone(receipt["source_proposal_id"])
             self.assertTrue(receipt["provenance"])
             assert report_decision is not None
-            checkpoint = json.loads(report_decision["checkpoint_json"])
-            self.assertEqual(checkpoint["stage"], "completed")
-            self.assertEqual(checkpoint["result"]["status"], "applied")
+            self.assertEqual(report_decision["stage"], "completed")
+            self.assertEqual(report_decision["result_status"], "applied")
 
 
 if __name__ == "__main__":

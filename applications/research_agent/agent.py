@@ -7,6 +7,7 @@ from enum import StrEnum
 from collections.abc import Callable
 from tempfile import TemporaryDirectory
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 from adaptive_agent_runtime import (
@@ -327,19 +328,38 @@ DEFAULT_RESEARCH_RUNTIME_DB = (
 class ResearchAgent:
     """Application facade demonstrating the full Adaptive Runtime stack."""
 
+    @classmethod
+    def for_runtime(cls, **kwargs: Any) -> ResearchAgent:
+        """Create a real Runtime instance backed by the production database."""
+
+        return cls(
+            persistence_path=DEFAULT_RESEARCH_RUNTIME_DB,
+            run_kind="runtime",
+            disposable=False,
+            **kwargs,
+        )
+
     def __init__(
         self,
         *,
+        persistence_path: str | Path,
+        run_kind: str = "runtime",
+        disposable: bool = False,
         autonomous_risk_backend: AutonomousAgentBackend | None = None,
         cognitive_capabilities: ResearchCognitiveCapabilities | None = None,
         planning_execution_policy: PlanningExecutionPolicy | None = None,
         information_mode: ResearchInformationMode = (
             ResearchInformationMode.FIXTURE_DEMO
         ),
-        persistence_path: str | Path = DEFAULT_RESEARCH_RUNTIME_DB,
         decision_fault_injector: Callable[..., None] | None = None,
         auto_adaptation_enabled: bool = False,
     ) -> None:
+        if run_kind not in {"runtime", "test", "demo", "benchmark"}:
+            raise ValueError("unsupported Research run kind")
+        if run_kind == "runtime" and disposable:
+            raise ValueError("real Runtime runs cannot be disposable")
+        self._run_kind = run_kind
+        self._disposable = disposable
         self._cognitive_capabilities = (
             cognitive_capabilities or ResearchCognitiveCapabilities()
         )
@@ -380,7 +400,8 @@ class ResearchAgent:
             self._persistence.database
         )
         self._report_dispatch_reconciler = SQLiteReportDispatchReconciler(
-            self._persistence.database
+            self._persistence.database,
+            self._persistence.decision_records,
         )
         self._context_store = self._persistence.context_store
         self._context_archive = self._persistence.context_archive
@@ -539,6 +560,8 @@ class ResearchAgent:
                 task=task,
                 definition=definition,
                 configuration_snapshot=configuration_snapshot,
+                run_kind=self._run_kind,
+                disposable=self._disposable,
             )
         await publish_progress(
             progress_sink,

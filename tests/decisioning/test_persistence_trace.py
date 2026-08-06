@@ -102,7 +102,7 @@ class DecisionPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 trace_writer=FakeTraceWriter(),
             )
             completed = await resumed.resume_review(request.request_id)
-            history = await reopened_store.history_for(request.request_id)
+            history = await reopened_store.transitions_for(request.request_id)
             reopened.close()
 
         self.assertEqual(pending.stage, DecisionCheckpointStage.REVIEW_PENDING)
