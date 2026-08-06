@@ -10,6 +10,7 @@ from adaptive_agent_runtime.governance.models import (
     ConfidenceAssessment,
     ConfidencePolicy,
     GovernanceAuthorization,
+    RuntimeCommitPermit,
     AuthorizationUse,
     GovernanceDecision,
     GovernancePolicy,
@@ -95,7 +96,7 @@ class GovernedOperationTarget(RuntimeModule, Protocol[T_co]):
     @property
     def subject_fingerprint(self) -> str: ...
 
-    async def apply(self) -> T_co: ...
+    async def apply(self, permit: RuntimeCommitPermit) -> T_co: ...
 
 
 @runtime_checkable
@@ -121,3 +122,15 @@ class AuthorizationConsumptionStore(RuntimeModule, Protocol):
     ) -> None: ...
 
     async def load(self, authorization_id: UUID) -> AuthorizationUse | None: ...
+
+
+@runtime_checkable
+class CommitPermitValidation(RuntimeModule, Protocol):
+    async def verify(
+        self,
+        permit: RuntimeCommitPermit,
+        *,
+        operation: str,
+        target: GovernanceTarget,
+        subject_fingerprint: str,
+    ) -> None: ...

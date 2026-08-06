@@ -6,7 +6,7 @@ from typing import Protocol, Sequence, runtime_checkable
 from uuid import UUID
 
 from adaptive_agent_runtime import RuntimeModule
-from adaptive_agent_runtime.evaluation import OptimizationProposal
+from adaptive_agent_runtime.evaluation.models import OptimizationProposal
 from adaptive_agent_runtime.evolution.models import (
     OptimizationApplication,
     OptimizationDeployment,

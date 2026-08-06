@@ -1,10 +1,9 @@
-"""Replay-validated and governance-ready Runtime evolution."""
+"""Legacy Replay models retained without public mutation capabilities.
 
-from adaptive_agent_runtime.evolution.apply import (
-    ConfigurationPatchPlanner,
-    InMemoryEvolutionStore,
-    OptimizationDeploymentService,
-)
+Phase 4-A intentionally does not export deployment, activation, or rollback
+services.  Historical tests may import the explicitly internal implementation
+module and opt into its disabled-by-default mutation flag.
+"""
 from adaptive_agent_runtime.evolution.contracts import (
     OptimizationChangePlanner,
     ReplayCaseStore,
@@ -13,6 +12,7 @@ from adaptive_agent_runtime.evolution.contracts import (
     RuntimeConfigurationStore,
 )
 from adaptive_agent_runtime.evolution.errors import (
+    EvolutionBoundaryError,
     EvolutionConflictError,
     EvolutionError,
     ReplayValidationError,
@@ -29,24 +29,20 @@ from adaptive_agent_runtime.evolution.models import (
     RuntimeConfigurationSnapshot,
     stable_evolution_id,
 )
-from adaptive_agent_runtime.evolution.integration import EvaluationReplayCaseFactory
 from adaptive_agent_runtime.evolution.replay import (
     DeterministicReplayValidator,
     RuntimeReplayRunner,
 )
 
 __all__ = [
-    "ConfigurationPatchPlanner",
     "DeterministicReplayValidator",
+    "EvolutionBoundaryError",
     "EvolutionConflictError",
     "EvolutionError",
-    "EvaluationReplayCaseFactory",
-    "InMemoryEvolutionStore",
     "OptimizationApplication",
     "OptimizationApplicationStatus",
     "OptimizationChangePlanner",
     "OptimizationDeployment",
-    "OptimizationDeploymentService",
     "ReplayCase",
     "ReplayCaseStore",
     "ReplayExecutionResult",

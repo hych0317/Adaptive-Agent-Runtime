@@ -756,8 +756,9 @@ class ResearchAgentFlowTests(unittest.IsolatedAsyncioTestCase):
             }.issubset(lifecycle_states)
         )
         self.assertEqual(len(result.context_assemblies), 8)
-        self.assertTrue(
-            any(assembly.semantic_context for assembly in result.context_assemblies)
+        self.assertFalse(
+            any(assembly.semantic_context for assembly in result.context_assemblies),
+            "Phase 3-A forbids persisted Memory recall inside node execution",
         )
         self.assertTrue(
             any(
@@ -772,7 +773,7 @@ class ResearchAgentFlowTests(unittest.IsolatedAsyncioTestCase):
             }.issubset({memory.memory_key for memory in result.memories}),
         )
         self.assertIn("Tesla Investment Research", result.report.markdown)
-        self.assertIn("risks", result.report.executive_summary.lower())
+        self.assertTrue(result.report.risk_factors)
         self.assertEqual(result.agent_executions, ())
         self.assertIsNone(result.llm_judgement)
         self.assertIsNone(result.llm_task_graph_draft)
@@ -783,8 +784,13 @@ class ResearchAgentFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.llm_context_packages, ())
         self.assertEqual(result.llm_tool_intents, ())
 
-    async def test_evaluation_and_both_review_scenarios_are_generated(self) -> None:
-        result = await ResearchAgent().run_demo("分析 Tesla 投资价值")
+    async def test_evaluation_does_not_trigger_legacy_optimization_demo(self) -> None:
+        with TemporaryDirectory() as directory:
+            agent = ResearchAgent(
+                persistence_path=Path(directory) / "research.sqlite3"
+            )
+            result = await agent.run_demo("分析 Tesla 投资价值")
+            agent.close()
 
         self.assertEqual(result.evaluation.outcome.verdict, EvaluationVerdict.PASS)
         self.assertIsNotNone(result.evaluation.trajectory.score)
@@ -798,8 +804,7 @@ class ResearchAgentFlowTests(unittest.IsolatedAsyncioTestCase):
             {"orchestration", "tool", "context_memory"},
         )
         self.assertTrue(result.failure_analysis.patterns)
-        self.assertTrue(result.optimization_proposals)
-        self.assertGreaterEqual(result.evaluation_history_runs, 2)
+        self.assertEqual(result.optimization_proposals, ())
 
         tool_review = next(
             record
@@ -807,15 +812,15 @@ class ResearchAgentFlowTests(unittest.IsolatedAsyncioTestCase):
             if record.scenario == "tool"
             and record.preliminary.outcome is DecisionOutcome.REVIEW_REQUIRED
         )
-        optimization_review = next(
-            record
-            for record in result.governance_records
-            if record.scenario == "optimization"
+        self.assertEqual(tool_review.final.outcome, DecisionOutcome.ALLOW)
+        self.assertIsNotNone(tool_review.review)
+        self.assertIsNotNone(tool_review.authorization)
+        self.assertFalse(
+            any(
+                record.request.operation == "optimization.apply"
+                for record in result.governance_records
+            )
         )
-        for record in (tool_review, optimization_review):
-            self.assertEqual(record.final.outcome, DecisionOutcome.ALLOW)
-            self.assertIsNotNone(record.review)
-            self.assertIsNotNone(record.authorization)
 
     async def test_isolated_risk_result_and_cli_sections_are_visible(self) -> None:
         result = await ResearchAgent().run("分析 Example Corp 投资价值")
@@ -1014,8 +1019,9 @@ class ResearchAgentFlowTests(unittest.IsolatedAsyncioTestCase):
         package = result.llm_context_packages[0]
         self.assertEqual(package.target_id, target.target_id)
         self.assertTrue(package.blocks)
-        self.assertTrue(
-            any("format" in block.redacted_keys for block in package.blocks)
+        self.assertFalse(
+            any(block.source is ContextSource.MEMORY_RECALL for block in package.blocks),
+            "Phase 3-A does not inject Memory into Report Generation",
         )
         request_context = generator.requests[0].context
         assert isinstance(request_context, Mapping)
@@ -1507,10 +1513,13 @@ class ApplicationBoundaryTests(unittest.TestCase):
             "adaptive_agent_runtime",
             "adaptive_agent_runtime.context_memory",
             "adaptive_agent_runtime.decisioning",
+            "adaptive_agent_runtime.decision_feedback",
+            "adaptive_agent_runtime.experience_learning",
             "adaptive_agent_runtime.evaluation",
             "adaptive_agent_runtime.governance",
             "adaptive_agent_runtime.llm",
             "adaptive_agent_runtime.orchestration",
+            "adaptive_agent_runtime.optimization",
             "adaptive_agent_runtime.persistence",
             "adaptive_agent_runtime.tool_ecosystem",
         }

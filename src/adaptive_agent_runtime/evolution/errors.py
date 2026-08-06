@@ -16,3 +16,6 @@ class UnsupportedOptimizationError(EvolutionError):
 class ReplayValidationError(EvolutionError):
     """The candidate did not pass isolated replay validation."""
 
+
+class EvolutionBoundaryError(EvolutionError):
+    """A legacy configuration mutation was attempted outside explicit tests."""

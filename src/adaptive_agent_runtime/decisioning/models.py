@@ -134,6 +134,15 @@ class DecisionReconciliationStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+class DecisionFaultPoint(StrEnum):
+    """Persisted lifecycle boundaries available to fault-injection tests."""
+
+    REVIEW_PENDING = "review_pending"
+    AUTHORIZED = "authorized"
+    APPLYING = "applying"
+    EFFECT_COMMITTED = "effect_committed"
+
+
 class DecisionTraceKind(StrEnum):
     REQUESTED = "decision.requested"
     CONTEXT_PROJECTED = "decision.context_projected"
@@ -496,6 +505,7 @@ class DecisionResult(DecisionModel):
     status: DecisionResultStatus
     reason: str = Field(min_length=1)
     apply_receipt: DecisionApplyReceipt | None = None
+    reconciliation_status: DecisionReconciliationStatus | None = None
     completed_at: AwareDatetime = Field(default_factory=utc_now)
 
     @model_validator(mode="after")
@@ -505,6 +515,11 @@ class DecisionResult(DecisionModel):
                 raise ValueError("applied result requires proposal and apply receipt")
         elif self.apply_receipt is not None:
             raise ValueError("only an applied result can contain an apply receipt")
+        if (
+            self.reconciliation_status is DecisionReconciliationStatus.UNKNOWN
+            and self.status is not DecisionResultStatus.FAILED
+        ):
+            raise ValueError("unknown reconciliation must fail closed")
         return self
 
 

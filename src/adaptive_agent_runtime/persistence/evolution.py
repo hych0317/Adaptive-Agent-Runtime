@@ -17,6 +17,7 @@ from adaptive_agent_runtime.evolution import (
     stable_evolution_id,
 )
 from adaptive_agent_runtime.persistence.sqlite import SQLiteDatabase
+from adaptive_agent_runtime.evolution.errors import EvolutionBoundaryError
 
 
 def _json_text(value: object) -> str:
@@ -35,10 +36,17 @@ class SQLiteEvolutionStore:
 
     module_id = "evolution.store.sqlite"
 
-    def __init__(self, database: SQLiteDatabase) -> None:
+    def __init__(
+        self,
+        database: SQLiteDatabase,
+        *,
+        allow_legacy_mutations: bool = False,
+    ) -> None:
         self._database = database
+        self._allow_legacy_mutations = allow_legacy_mutations
 
     async def initialize(self, snapshot: RuntimeConfigurationSnapshot) -> None:
+        self._require_legacy_mutation_access()
         payload = _json_text(snapshot)
         with self._database.transaction() as cursor:
             active = cursor.execute(
@@ -91,6 +99,7 @@ class SQLiteEvolutionStore:
         self,
         deployment: OptimizationDeployment,
     ) -> OptimizationApplication:
+        self._require_legacy_mutation_access()
         if not deployment.validation.passed:
             raise ReplayValidationError("candidate failed Replay validation")
         component = deployment.baseline.component
@@ -182,6 +191,7 @@ class SQLiteEvolutionStore:
         self,
         application_id: UUID,
     ) -> OptimizationApplication:
+        self._require_legacy_mutation_access()
         with self._database.transaction() as cursor:
             row = cursor.execute(
                 "SELECT application_json FROM optimization_application_current "
@@ -303,3 +313,8 @@ class SQLiteEvolutionStore:
             ).fetchall()
         return tuple(ReplayCase.model_validate_json(row["case_json"]) for row in rows)
 
+    def _require_legacy_mutation_access(self) -> None:
+        if not self._allow_legacy_mutations:
+            raise EvolutionBoundaryError(
+                "legacy SQLite Evolution mutation is disabled during Phase 4-A"
+            )

@@ -15,8 +15,13 @@ from adaptive_agent_runtime.context_memory import (
     MemorySnapshotConflictError,
     MemoryUnit,
     MemoryBatchWrite,
+    MemoryBatchCommitReceipt,
 )
 from adaptive_agent_runtime.context_memory.json_types import utc_now
+from adaptive_agent_runtime.decisioning import decision_fingerprint
+from adaptive_agent_runtime.governance.contracts import CommitPermitValidation
+from adaptive_agent_runtime.governance.errors import AuthorizationVerificationError
+from adaptive_agent_runtime.governance.models import GovernanceTarget, RuntimeCommitPermit
 from adaptive_agent_runtime.persistence.sqlite import SQLiteDatabase
 
 
@@ -186,8 +191,14 @@ class SQLiteContextArchive:
 
     module_id = "context.archive.sqlite"
 
-    def __init__(self, database: SQLiteDatabase) -> None:
+    def __init__(
+        self,
+        database: SQLiteDatabase,
+        *,
+        permit_verifier: CommitPermitValidation,
+    ) -> None:
         self._database = database
+        self._permit_verifier = permit_verifier
 
     async def archive(
         self,
@@ -230,6 +241,239 @@ class SQLiteContextArchive:
                 ),
             )
         return reference
+
+    async def stage_compression(
+        self,
+        unit: ContextUnit,
+        *,
+        reference: ContextArchiveReference,
+        effect_fingerprint: str,
+        source_fingerprint: str,
+    ) -> ContextArchiveReference:
+        """Persist an invisible, fingerprint-bound recovery snapshot."""
+
+        if (
+            reference.context_id != unit.context_id
+            or decision_fingerprint(unit) != source_fingerprint
+        ):
+            raise ContextSnapshotConflictError(
+                "compression Archive stage does not match its source snapshot"
+            )
+        values = unit.model_dump(mode="python")
+        values["lifecycle_state"] = ContextLifecycleState.ARCHIVED
+        metadata = unit.metadata.model_dump(mode="python")
+        metadata["updated_at"] = utc_now()
+        values["metadata"] = metadata
+        archived = ContextUnit.model_validate(values)
+        payload = _model_json(archived)
+        with self._database.transaction() as cursor:
+            row = cursor.execute(
+                "SELECT archive_id, context_id, source_fingerprint, archive_json "
+                "FROM context_archive_transactions WHERE effect_fingerprint = ?",
+                (effect_fingerprint,),
+            ).fetchone()
+            if row is not None:
+                if (
+                    row["archive_id"] != str(reference.archive_id)
+                    or row["context_id"] != str(unit.context_id)
+                    or row["source_fingerprint"] != source_fingerprint
+                ):
+                    raise ContextSnapshotConflictError(
+                        "compression Effect is bound to another pending Archive"
+                    )
+                existing = ContextUnit.model_validate_json(row["archive_json"])
+                if (
+                    existing.context_id != unit.context_id
+                    or existing.revision != unit.revision
+                    or existing.content != unit.content
+                ):
+                    raise ContextSnapshotConflictError(
+                        "pending Archive source payload changed"
+                    )
+                return ContextArchiveReference(
+                    archive_id=reference.archive_id,
+                    context_id=unit.context_id,
+                    archived_at=existing.metadata.updated_at,
+                )
+            cursor.execute(
+                "INSERT INTO context_archive_transactions "
+                "(effect_fingerprint, archive_id, context_id, source_fingerprint, "
+                "status, archive_json) VALUES (?, ?, ?, ?, 'pending', ?)",
+                (
+                    effect_fingerprint,
+                    str(reference.archive_id),
+                    str(unit.context_id),
+                    source_fingerprint,
+                    payload,
+                ),
+            )
+        return ContextArchiveReference(
+            archive_id=reference.archive_id,
+            context_id=unit.context_id,
+            archived_at=archived.metadata.updated_at,
+        )
+
+    async def commit_compression(
+        self,
+        source: ContextUnit,
+        compressed: ContextUnit,
+        *,
+        reference: ContextArchiveReference,
+        effect_fingerprint: str,
+        source_fingerprint: str,
+        permit: RuntimeCommitPermit,
+        target: GovernanceTarget,
+        subject_fingerprint: str,
+    ) -> ContextUnit:
+        """Publish Archive and resident revision in one SQLite transaction."""
+
+        await self._permit_verifier.verify(
+            permit,
+            operation="context.compress",
+            target=target,
+            subject_fingerprint=subject_fingerprint,
+        )
+
+        if (
+            decision_fingerprint(source) != source_fingerprint
+            or compressed.context_id != source.context_id
+            or compressed.revision != source.revision + 1
+            or compressed.recovery_reference is None
+            or compressed.recovery_reference.archive_id != reference.archive_id
+            or compressed.last_effect_fingerprint != effect_fingerprint
+        ):
+            raise ContextSnapshotConflictError(
+                "compression commit payload is not bound to the staged Effect"
+            )
+        context_id = str(source.context_id)
+        compressed_json = _model_json(compressed)
+        with self._database.transaction() as cursor:
+            transaction = cursor.execute(
+                "SELECT archive_id, context_id, source_fingerprint, status, archive_json "
+                "FROM context_archive_transactions WHERE effect_fingerprint = ?",
+                (effect_fingerprint,),
+            ).fetchone()
+            if transaction is None:
+                raise ContextSnapshotConflictError(
+                    "compression commit has no pending Archive"
+                )
+            if (
+                transaction["archive_id"] != str(reference.archive_id)
+                or transaction["context_id"] != context_id
+                or transaction["source_fingerprint"] != source_fingerprint
+            ):
+                raise ContextSnapshotConflictError(
+                    "pending Archive identity conflicts with compression Effect"
+                )
+            current = cursor.execute(
+                "SELECT current.revision, snapshots.snapshot_json "
+                "FROM context_current AS current JOIN context_snapshots AS snapshots "
+                "ON snapshots.context_id = current.context_id "
+                "AND snapshots.revision = current.revision "
+                "WHERE current.context_id = ?",
+                (context_id,),
+            ).fetchone()
+            if transaction["status"] == "committed":
+                if current is None or current["snapshot_json"] != compressed_json:
+                    raise ContextSnapshotConflictError(
+                        "committed compression failed authoritative read-back"
+                    )
+                return ContextUnit.model_validate_json(current["snapshot_json"])
+            if (
+                current is None
+                or int(current["revision"]) != source.revision
+                or current["snapshot_json"] != _model_json(source)
+            ):
+                raise ContextSnapshotConflictError(
+                    "compression source is no longer authoritative"
+                )
+            cursor.execute(
+                "INSERT INTO context_archives "
+                "(archive_id, context_id, snapshot_json) VALUES (?, ?, ?)",
+                (
+                    str(reference.archive_id),
+                    context_id,
+                    transaction["archive_json"],
+                ),
+            )
+            cursor.execute(
+                "INSERT INTO context_snapshots "
+                "(context_id, revision, run_id, snapshot_json) VALUES (?, ?, ?, ?)",
+                (
+                    context_id,
+                    compressed.revision,
+                    str(compressed.metadata.run_id),
+                    compressed_json,
+                ),
+            )
+            cursor.execute(
+                "UPDATE context_current SET revision = ? WHERE context_id = ?",
+                (compressed.revision, context_id),
+            )
+            cursor.execute(
+                "UPDATE context_archive_transactions SET status = 'committed' "
+                "WHERE effect_fingerprint = ? AND status = 'pending'",
+                (effect_fingerprint,),
+            )
+        readback = await SQLiteContextStore(self._database).load(source.context_id)
+        if readback != compressed:
+            raise ContextSnapshotConflictError(
+                "compression transaction failed final resident read-back"
+            )
+        restored = await self.restore(reference)
+        if (
+            restored.context_id != source.context_id
+            or restored.revision != source.revision
+            or decision_fingerprint(source) != source_fingerprint
+        ):
+            raise ContextSnapshotConflictError(
+                "compression transaction failed Archive read-back"
+            )
+        return readback
+
+    async def pending_count(self) -> int:
+        with self._database.reader() as cursor:
+            row = cursor.execute(
+                "SELECT COUNT(*) AS count FROM context_archive_transactions "
+                "WHERE status = 'pending'"
+            ).fetchone()
+        return int(row["count"])
+
+    async def verify_compression(
+        self,
+        unit: ContextUnit,
+        *,
+        effect_fingerprint: str,
+        source_fingerprint: str,
+    ) -> bool:
+        reference = unit.recovery_reference
+        if reference is None:
+            return False
+        with self._database.reader() as cursor:
+            row = cursor.execute(
+                "SELECT tx.archive_id, tx.context_id, tx.source_fingerprint, "
+                "tx.status, archives.snapshot_json "
+                "FROM context_archive_transactions AS tx "
+                "LEFT JOIN context_archives AS archives "
+                "ON archives.archive_id = tx.archive_id "
+                "WHERE tx.effect_fingerprint = ?",
+                (effect_fingerprint,),
+            ).fetchone()
+        if (
+            row is None
+            or row["status"] != "committed"
+            or row["archive_id"] != str(reference.archive_id)
+            or row["context_id"] != str(unit.context_id)
+            or row["source_fingerprint"] != source_fingerprint
+            or row["snapshot_json"] is None
+        ):
+            return False
+        archived = ContextUnit.model_validate_json(row["snapshot_json"])
+        return (
+            archived.context_id == unit.context_id
+            and archived.revision + 1 == unit.revision
+            and unit.last_effect_fingerprint == effect_fingerprint
+        )
 
     async def discard(self, reference: ContextArchiveReference) -> None:
         with self._database.transaction() as cursor:
@@ -284,8 +528,14 @@ class SQLiteMemoryStore:
 
     module_id = "memory.store.sqlite"
 
-    def __init__(self, database: SQLiteDatabase) -> None:
+    def __init__(
+        self,
+        database: SQLiteDatabase,
+        *,
+        permit_verifier: CommitPermitValidation,
+    ) -> None:
         self._database = database
+        self._permit_verifier = permit_verifier
 
     async def save(
         self,
@@ -401,16 +651,66 @@ class SQLiteMemoryStore:
         writes: tuple[MemoryBatchWrite, ...],
         *,
         effect_fingerprint: str,
+        permit: RuntimeCommitPermit | None = None,
+        target: GovernanceTarget | None = None,
+        subject_fingerprint: str | None = None,
     ) -> tuple[MemoryUnit, ...]:
+        if permit is None or target is None or subject_fingerprint is None:
+            raise AuthorizationVerificationError(
+                "Memory batch commit requires a Runtime Permit"
+            )
+        await self._permit_verifier.verify(
+            permit,
+            operation="memory.write",
+            target=target,
+            subject_fingerprint=subject_fingerprint,
+        )
+        payload_fingerprint = decision_fingerprint(writes)
         with self._database.transaction() as cursor:
             prior = cursor.execute(
-                "SELECT result_json FROM memory_applied_effects "
+                "SELECT payload_fingerprint, result_json FROM memory_batch_receipts "
                 "WHERE effect_fingerprint = ?",
                 (effect_fingerprint,),
             ).fetchone()
             if prior is not None:
+                if prior["payload_fingerprint"] != payload_fingerprint:
+                    raise MemorySnapshotConflictError(
+                        "Memory Effect fingerprint was reused with another batch"
+                    )
                 raw = json.loads(prior["result_json"])
                 return tuple(MemoryUnit.model_validate(item) for item in raw)
+            legacy = cursor.execute(
+                "SELECT result_json FROM memory_applied_effects "
+                "WHERE effect_fingerprint = ?",
+                (effect_fingerprint,),
+            ).fetchone()
+            if legacy is not None:
+                raw = json.loads(legacy["result_json"])
+                committed_legacy = tuple(
+                    MemoryUnit.model_validate(item) for item in raw
+                )
+                if committed_legacy != tuple(write.memory for write in writes):
+                    raise MemorySnapshotConflictError(
+                        "legacy Memory Effect conflicts with requested batch"
+                    )
+                receipt = MemoryBatchCommitReceipt(
+                    effect_fingerprint=effect_fingerprint,
+                    payload_fingerprint=payload_fingerprint,
+                    result_fingerprint=decision_fingerprint(committed_legacy),
+                    memory_count=len(committed_legacy),
+                )
+                cursor.execute(
+                    "INSERT INTO memory_batch_receipts "
+                    "(effect_fingerprint, payload_fingerprint, result_json, "
+                    "receipt_json) VALUES (?, ?, ?, ?)",
+                    (
+                        effect_fingerprint,
+                        payload_fingerprint,
+                        legacy["result_json"],
+                        _model_json(receipt),
+                    ),
+                )
+                return committed_legacy
             committed: list[MemoryUnit] = []
             for write in writes:
                 memory = write.memory
@@ -461,17 +761,32 @@ class SQLiteMemoryStore:
                 )
                 committed.append(memory)
             result = tuple(committed)
+            result_json = json.dumps(
+                [item.model_dump(mode="json") for item in result],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            receipt = MemoryBatchCommitReceipt(
+                effect_fingerprint=effect_fingerprint,
+                payload_fingerprint=payload_fingerprint,
+                result_fingerprint=decision_fingerprint(result),
+                memory_count=len(result),
+            )
             cursor.execute(
                 "INSERT INTO memory_applied_effects "
                 "(effect_fingerprint, result_json) VALUES (?, ?)",
+                (effect_fingerprint, result_json),
+            )
+            cursor.execute(
+                "INSERT INTO memory_batch_receipts "
+                "(effect_fingerprint, payload_fingerprint, result_json, receipt_json) "
+                "VALUES (?, ?, ?, ?)",
                 (
                     effect_fingerprint,
-                    json.dumps(
-                        [item.model_dump(mode="json") for item in result],
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    ),
+                    payload_fingerprint,
+                    result_json,
+                    _model_json(receipt),
                 ),
             )
         return result
@@ -490,6 +805,20 @@ class SQLiteMemoryStore:
             return None
         raw = json.loads(row["result_json"])
         return tuple(MemoryUnit.model_validate(item) for item in raw)
+
+    async def load_batch_receipt(
+        self,
+        effect_fingerprint: str,
+    ) -> MemoryBatchCommitReceipt | None:
+        with self._database.reader() as cursor:
+            row = cursor.execute(
+                "SELECT receipt_json FROM memory_batch_receipts "
+                "WHERE effect_fingerprint = ?",
+                (effect_fingerprint,),
+            ).fetchone()
+        if row is None:
+            return None
+        return MemoryBatchCommitReceipt.model_validate_json(row["receipt_json"])
 
     async def history_for(self, memory_id: UUID) -> tuple[MemoryUnit, ...]:
         with self._database.reader() as cursor:

@@ -21,17 +21,20 @@ from pydantic import Field
 
 from adaptive_agent_runtime.governance import (
     BoundGovernedOperation,
+    CommitPermitVerifier,
     DecisionOutcome,
     DeterministicConfidenceEvaluator,
     DeterministicRuleEvaluator,
     GovernanceAuthorizationIssuer,
     GovernedOperationExecutor,
+    HMACCommitPermitAuthority,
     InMemoryAuthorizationConsumptionStore,
     InMemoryHumanReviewService,
     RuntimeGovernanceEvaluator,
     StrictAuthorizationVerifier,
     ToolGovernanceAdapter,
     default_governance_policy,
+    governance_fingerprint,
 )
 from adaptive_agent_runtime.tool_ecosystem import (
     Capability,
@@ -42,7 +45,7 @@ from adaptive_agent_runtime.tool_ecosystem import (
     InMemoryCapabilityCatalog,
     InMemoryToolRegistry,
     InMemoryToolTraceSink,
-    ManagedToolExecutor,
+    PermitBoundToolExecutor,
     RetryPolicy,
     ToolCorrelation,
     ToolExecutionPolicy,
@@ -51,8 +54,8 @@ from adaptive_agent_runtime.tool_ecosystem import (
     ToolProviderMetadata,
     ToolProviderResult,
     ToolSelectionContext,
+    build_permit_bound_tool_executor,
 )
-from adaptive_agent_runtime.tool_ecosystem.contracts import ToolExecutor
 from adaptive_agent_runtime.tool_ecosystem.errors import ToolIntegrationError
 from adaptive_agent_runtime.tool_ecosystem.models import ImmutableJsonObject
 
@@ -524,7 +527,13 @@ class LowRiskGovernedToolExecutor:
 
     module_id = "personal_knowledge.tool_executor.governed"
 
-    def __init__(self, delegate: ToolExecutor) -> None:
+    def __init__(
+        self,
+        delegate: PermitBoundToolExecutor,
+        *,
+        issuer: GovernanceAuthorizationIssuer,
+        operation_executor: GovernedOperationExecutor,
+    ) -> None:
         reviews = InMemoryHumanReviewService()
         self._delegate = delegate
         self._governance = RuntimeGovernanceEvaluator(
@@ -533,11 +542,8 @@ class LowRiskGovernedToolExecutor:
             confidence_evaluator=DeterministicConfidenceEvaluator(),
             review_service=reviews,
         )
-        self._issuer = GovernanceAuthorizationIssuer()
-        self._operation_executor = GovernedOperationExecutor(
-            verifier=StrictAuthorizationVerifier(),
-            consumption_store=InMemoryAuthorizationConsumptionStore(),
-        )
+        self._issuer = issuer
+        self._operation_executor = operation_executor
         self._adapter = ToolGovernanceAdapter()
 
     async def execute(
@@ -554,7 +560,16 @@ class LowRiskGovernedToolExecutor:
         authorization = self._issuer.issue(request, decision)
 
         async def apply() -> ToolObservation:
-            return await self._delegate.execute(invocation, policy)
+            raise ToolIntegrationError("source Tool requires a Runtime Permit")
+
+        async def apply_with_permit(permit) -> ToolObservation:  # type: ignore[no-untyped-def]
+            return await self._delegate.execute(
+                invocation,
+                policy,
+                permit=permit,
+                target=request.target,
+                subject_fingerprint=governance_fingerprint(invocation),
+            )
 
         return await self._operation_executor.execute(
             request=request,
@@ -566,6 +581,7 @@ class LowRiskGovernedToolExecutor:
                 target=request.target,
                 subject=invocation,
                 apply=apply,
+                apply_with_permit=apply_with_permit,
             ),
         )
 
@@ -673,14 +689,32 @@ def build_source_tool_stack(
         matcher=ExactCapabilityMatcher(),
     )
     trace_sink = InMemoryToolTraceSink()
-    managed = ManagedToolExecutor(registry=registry, trace_sink=trace_sink)
+    authorization_store = InMemoryAuthorizationConsumptionStore()
+    permit_authority = HMACCommitPermitAuthority()
+    permit_verifier = CommitPermitVerifier(
+        authority=permit_authority,
+        consumption_store=authorization_store,
+    )
+    managed = build_permit_bound_tool_executor(
+        registry=registry,
+        trace_sink=trace_sink,
+        permit_verifier=permit_verifier,
+    )
     return KnowledgeSourceToolStack(
         catalog=catalog,
         registry=registry,
         resolver=resolver,
         selector=DeterministicToolSelector(),
         trace_sink=trace_sink,
-        executor=LowRiskGovernedToolExecutor(managed),
+        executor=LowRiskGovernedToolExecutor(
+            managed,
+            issuer=GovernanceAuthorizationIssuer(authority=permit_authority),
+            operation_executor=GovernedOperationExecutor(
+                verifier=StrictAuthorizationVerifier(permit_authority),
+                consumption_store=authorization_store,
+                permit_authority=permit_authority,
+            ),
+        ),
     )
 
 
@@ -793,3 +827,4 @@ class SourceToolRunner:
                 observation.error or "source Tool returned no structured text"
             )
         return FetchedSourceText.model_validate(observation.output), observation
+    HMACCommitPermitAuthority,

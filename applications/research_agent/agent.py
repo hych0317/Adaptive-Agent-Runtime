@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import StrEnum
+from collections.abc import Callable
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -18,7 +19,10 @@ from adaptive_agent_runtime import (
     RuntimeEvent,
     TraceEntry,
 )
-from adaptive_agent_runtime.persistence import SQLitePersistence
+from adaptive_agent_runtime.persistence import (
+    SQLitePersistence,
+    default_runtime_configuration_snapshot,
+)
 from adaptive_agent_runtime.context_memory import (
     ConditionalMemoryRecall,
     ContextAssembler,
@@ -36,6 +40,9 @@ from adaptive_agent_runtime.context_memory import (
     DeterministicContextLifecyclePolicy,
     DeterministicContextPressureMonitor,
     EvidenceDrivenMemoryConsolidator,
+    ExperienceAssessmentDraft,
+    ExperienceAssessmentRequest,
+    ExperienceMetadataEffect,
     InMemoryContextArchive,
     InMemoryContextStore,
     InMemoryMemoryStore,
@@ -44,6 +51,11 @@ from adaptive_agent_runtime.context_memory import (
     MemoryEvidence,
     MemoryEvolutionType,
     MemoryUpdateResult,
+    MemoryRecallBundle,
+    MemoryRecallDraft,
+    MemoryRecallEffect,
+    MemoryRecallRequest,
+    MemoryScope,
     MemoryExtractionExecutionPolicy,
     MemoryExtractionDecisionPayload,
     MemoryExtractionEffect,
@@ -51,8 +63,6 @@ from adaptive_agent_runtime.context_memory import (
 )
 from adaptive_agent_runtime.evaluation import (
     AgentEvaluationPipeline,
-    ConservativeOptimizationAgent,
-    ConservativeOptimizationPolicy,
     ContextMemoryComponentEvaluator,
     ContextMemoryTraceAdapter,
     DeterministicFailureAnalyzer,
@@ -62,7 +72,6 @@ from adaptive_agent_runtime.evaluation import (
     EvaluationCriteria,
     EvaluationInputAssembler,
     EvaluationReport,
-    EvaluationResult,
     GraphSnapshotAdapter,
     InMemoryRootCauseAssessmentStore,
     OrchestrationComponentEvaluator,
@@ -87,7 +96,6 @@ from adaptive_agent_runtime.governance import (
     InMemoryHumanReviewService,
     InMemoryAuthorizationConsumptionStore,
     MemoryGovernanceAdapter,
-    OptimizationGovernanceAdapter,
     ReviewOutcome,
     RuntimeGovernanceEvaluator,
     StrictAuthorizationVerifier,
@@ -98,6 +106,7 @@ from adaptive_agent_runtime.orchestration import (
     DynamicTaskGraphPlanner,
     IsolatedAgentExecutor,
     PlanningExecutionPolicy,
+    PLANNING_DECISION_TYPE,
     PlanningDecisionPayload,
     PlanningGraphEffect,
     RecoveryExecutionPolicy,
@@ -148,10 +157,65 @@ from applications.research_agent.context_compression import (
     ResearchContextCompressionDecisionHandler,
 )
 from applications.research_agent.graph_mutation import (
+    DeterministicResearchGraphMutationCapability,
     ResearchGraphMutationDecisionHandler,
 )
 from applications.research_agent.memory_extraction import (
     ResearchMemoryExtractionDecisionHandler,
+)
+from applications.research_agent.memory_recall import (
+    DeterministicMemoryRecallCapability,
+    ResearchInitialMemoryRecallHandler,
+    ResearchMemoryRecallResult,
+)
+from applications.research_agent.experience_assessment import (
+    DeterministicExperienceAssessmentCapability,
+    ResearchExperienceAssessmentHandler,
+)
+from applications.research_agent.decision_feedback import (
+    ResearchDecisionFeedbackHandler,
+)
+from applications.research_agent.experience_learning import (
+    DeterministicLearningAssessmentCapability,
+    ResearchExperienceLearningHandler,
+)
+from applications.research_agent.optimization import (
+    DeterministicOptimizationAssessmentCapability,
+    ResearchOptimizationProposalHandler,
+    ResearchPlanningOptimizationBaselineProvider,
+    research_initial_planning_optimization_scope,
+)
+from applications.research_agent.optimization_apply import (
+    ResearchOptimizationConfigurationGateway,
+    ResearchOptimizationConfigurationResult,
+)
+from applications.research_agent.auto_adaptation import (
+    ResearchAutoAdaptationCoordinator,
+    create_unpersisted_auto_adaptation_failure_outcome,
+)
+from adaptive_agent_runtime.optimization import (
+    AutoAdaptationPolicy,
+    OptimizationApplyEffect,
+    OptimizationApplyIntent,
+    OptimizationApplyRequest,
+    OptimizationAssessmentRequest,
+    OptimizationProposalDraft,
+    OptimizationProposalEffect,
+    OptimizationRollbackEffect,
+    OptimizationRollbackIntent,
+    OptimizationRollbackRequest,
+    OptimizationTargetKey,
+    RuntimeConfigurationSnapshot,
+)
+from adaptive_agent_runtime.decision_feedback import (
+    DecisionFeedbackDraft,
+    DecisionFeedbackEffect,
+    DecisionFeedbackRequest,
+)
+from adaptive_agent_runtime.experience_learning import (
+    LearningAssessmentRequest,
+    LearningInsightDraft,
+    LearningInsightEffect,
 )
 from applications.research_agent.ready_node_selection import (
     LLMReadyTaskNodeSelector,
@@ -167,7 +231,7 @@ from applications.research_agent.report_decision import (
     ReportDraft,
     ResearchReportDecisionHandler,
 )
-from adaptive_agent_runtime.decisioning import DecisionCheckpoint
+from adaptive_agent_runtime.decisioning import DecisionCheckpoint, decision_fingerprint
 from applications.research_agent.progress import (
     ObservableTraceSink,
     ResearchProgressEvent,
@@ -175,8 +239,15 @@ from applications.research_agent.progress import (
     ResearchProgressSink,
     publish_progress,
 )
-from applications.research_agent.planning import run_adaptive_planning
-from applications.research_agent.persistence import SQLiteResearchRunManifestStore
+from applications.research_agent.planning import (
+    DeterministicResearchPlanningCapability,
+    run_adaptive_planning,
+)
+from applications.research_agent.persistence import (
+    ResearchPersistenceIdentity,
+    SQLiteReportDispatchReconciler,
+    SQLiteResearchRunManifestStore,
+)
 from applications.research_agent.recovery import ResearchRecoveryDecisionHandler
 from applications.research_agent.root_cause import (
     ResearchRootCauseDecisionHandler,
@@ -195,7 +266,6 @@ from applications.research_agent.strategies import (
     GovernedContextLifecycleExecutor,
     ReportStrategy,
     ResearchStrategy,
-    ResearchGraphMutationApplier,
     ResearchContextRequirementProvider,
     ResearchRecoveryPlanApplier,
     ResearchWorkspace,
@@ -209,7 +279,6 @@ from applications.research_agent.tasks import (
     RESEARCH_STRATEGY_ID,
     REVIEW_STRATEGY_ID,
     ResearchTaskDefinition,
-    build_research_task,
 )
 
 
@@ -250,6 +319,11 @@ class _PersistentTraceMirror:
         return durable
 
 
+DEFAULT_RESEARCH_RUNTIME_DB = (
+    Path(__file__).resolve().parents[2] / "data" / "research_runtime.sqlite3"
+)
+
+
 class ResearchAgent:
     """Application facade demonstrating the full Adaptive Runtime stack."""
 
@@ -262,7 +336,9 @@ class ResearchAgent:
         information_mode: ResearchInformationMode = (
             ResearchInformationMode.FIXTURE_DEMO
         ),
-        persistence_path: str | Path = Path("data/research_runtime.sqlite3"),
+        persistence_path: str | Path = DEFAULT_RESEARCH_RUNTIME_DB,
+        decision_fault_injector: Callable[..., None] | None = None,
+        auto_adaptation_enabled: bool = False,
     ) -> None:
         self._cognitive_capabilities = (
             cognitive_capabilities or ResearchCognitiveCapabilities()
@@ -275,6 +351,11 @@ class ResearchAgent:
                 "LLM Research mode requires the generation capability"
             )
         self._information_mode = information_mode
+        self._decision_fault_injector = decision_fault_injector
+        self._auto_adaptation_policy = AutoAdaptationPolicy(
+            enabled=auto_adaptation_enabled,
+            scope=research_initial_planning_optimization_scope(),
+        )
         planner_capability = self._cognitive_capabilities.task_planner
         self._planning_execution_policy = (
             planning_execution_policy
@@ -286,15 +367,19 @@ class ResearchAgent:
                 )
             )
         )
+        self._persistence = SQLitePersistence(persistence_path)
         self._tools = build_research_tool_stack(
             llm_information_generator=(
                 self._cognitive_capabilities.report_generator
                 if information_mode is ResearchInformationMode.LLM_RESEARCH
                 else None
-            )
+            ),
+            permit_verifier=self._persistence.commit_permit_verifier,
         )
-        self._persistence = SQLitePersistence(persistence_path)
         self._manifest_store = SQLiteResearchRunManifestStore(
+            self._persistence.database
+        )
+        self._report_dispatch_reconciler = SQLiteReportDispatchReconciler(
             self._persistence.database
         )
         self._context_store = self._persistence.context_store
@@ -310,14 +395,15 @@ class ResearchAgent:
             confidence_evaluator=DeterministicConfidenceEvaluator(),
             review_service=self._reviews,
         )
-        self._issuer = GovernanceAuthorizationIssuer()
+        self._issuer = self._persistence.authorization_issuer
         self._authorization_store = self._persistence.authorization_store
-        self._operation_executor = GovernedOperationExecutor(
-            verifier=StrictAuthorizationVerifier(),
-            consumption_store=self._authorization_store,
-        )
-        self._evaluation_history: list[EvaluationResult] = []
+        self._operation_executor = self._persistence.operation_executor
         self._autonomous_risk_backend = autonomous_risk_backend
+        self._optimization_configuration_gateway = (
+            self._build_optimization_configuration_gateway(
+                self._persistence.trace_sink
+            )
+        )
 
     async def run(
         self,
@@ -329,6 +415,10 @@ class ResearchAgent:
         """Execute one research run and evaluate it after Runtime completion."""
 
         resuming = _resume_run_id is not None
+        memory_baseline = {
+            item.memory_id: decision_fingerprint(item)
+            for item in await self._memory_store.list_all()
+        }
         graph_store: TaskGraphStore | None
         if resuming:
             assert _resume_run_id is not None
@@ -336,16 +426,31 @@ class ResearchAgent:
             manifest = self._manifest_store.load(_resume_run_id)
             if restored_state is None or manifest is None:
                 raise RuntimeError("Research run cannot resume without State and manifest")
-            task, restored_definition = manifest
+            task, restored_definition, restored_configuration = manifest
             agent_task = restored_state.task
             company = restored_definition.company
             run_id = _resume_run_id
+            configuration_snapshot = (
+                restored_configuration
+                or default_runtime_configuration_snapshot(
+                    research_initial_planning_optimization_scope()
+                )
+            )
         else:
             company = company_from_task(task)
             run_id = uuid4()
             agent_task = AgentTask(
                 description=task,
                 input={"company": company, "application": "research_agent"},
+            )
+            configuration_snapshot = (
+                await self._persistence.runtime_configuration.load_active(
+                    research_initial_planning_optimization_scope(),
+                    OptimizationTargetKey.PLANNER_MAX_NODES,
+                )
+                or default_runtime_configuration_snapshot(
+                    research_initial_planning_optimization_scope()
+                )
             )
         await publish_progress(
             progress_sink,
@@ -365,7 +470,7 @@ class ResearchAgent:
         )
         if progress_sink is not None:
             runtime_trace_writer = ObservableTraceSink(
-                runtime_trace_sink,
+                runtime_trace_writer,
                 progress_sink,
             )
         root_cause_store = InMemoryRootCauseAssessmentStore()
@@ -403,21 +508,37 @@ class ResearchAgent:
             definition = restored_definition
             llm_task_graph_draft = None
             planning_record = None
+            recall_result = None
+            recall_bundle = await self._persistence.memory_recall_bundle_store.load_for_run(
+                run_id
+            )
             graph_store = self._persistence.task_graph_store
+            await self._report_dispatch_reconciler.reconcile(run_id)
         else:
-            definition, llm_task_graph_draft, planning_record, graph_store = (
+            (
+                definition,
+                llm_task_graph_draft,
+                planning_record,
+                graph_store,
+                recall_result,
+            ) = (
                 await self._build_task_definition(
                     company=company,
                     task=task,
                     run_id=run_id,
                     agent_task=agent_task,
                     trace_sink=runtime_trace_writer,
+                    configuration_snapshot=configuration_snapshot,
                 )
+            )
+            recall_bundle = (
+                recall_result.bundle if recall_result is not None else None
             )
             self._manifest_store.save(
                 run_id=run_id,
                 task=task,
                 definition=definition,
+                configuration_snapshot=configuration_snapshot,
             )
         await publish_progress(
             progress_sink,
@@ -492,7 +613,9 @@ class ResearchAgent:
                 max_units=64,
                 max_tokens=8192,
             ),
-            memory_recall=ConditionalMemoryRecall(self._memory_store),
+            # Phase 3-A permits persisted Recall only once, before Planning.
+            # Node execution Context must not perform an ungoverned dynamic recall.
+            memory_recall=ConditionalMemoryRecall(InMemoryMemoryStore()),
             lifecycle=ContextLifecycleRuntime(
                 store=self._context_store,
                 pressure_monitor=DeterministicContextPressureMonitor(
@@ -515,6 +638,8 @@ class ResearchAgent:
         )
         if planning_record is not None:
             workspace.governance_records.append(planning_record)
+        if recall_result is not None and recall_result.governance_record is not None:
+            workspace.governance_records.append(recall_result.governance_record)
         context_trace = ContextMemoryTraceAdapter()
         goal_context = ContextUnit(
             content={"research_goal": task, "company": company},
@@ -659,6 +784,7 @@ class ResearchAgent:
                         ReportArtifactEffect,
                     ]
                 ),
+                fault_injector=self._decision_fault_injector,
             ),
         )
         isolated_directory: TemporaryDirectory[str] | None = None
@@ -708,43 +834,36 @@ class ResearchAgent:
                 if action_planner is not None
                 else None
             )
-            mutation_decision_handler = None
-            if self._cognitive_capabilities.mutation_planner is not None:
-                mutation_context = self._cognitive_capabilities.mutation_context
-                if mutation_context is None:
-                    raise RuntimeError(
-                        "Graph Mutation Decision requires Context projection"
-                    )
-                mutation_decision_handler = ResearchGraphMutationDecisionHandler(
-                    capability=self._cognitive_capabilities.mutation_planner,
-                    context_projection=mutation_context,
-                    execution_policy=GraphMutationExecutionPolicy(),
-                    governance=self._governance,
-                    reviews=self._reviews,
-                    issuer=self._issuer,
-                    operation_executor=self._operation_executor,
-                    trace_sink=runtime_trace_writer,
-                    workspace=workspace,
-                    checkpoint_store=self._persistence.create_decision_checkpoint_store(
-                        DecisionCheckpoint[
-                            GraphMutationDecisionPayload,
-                            GraphMutationProposalDraft,
-                            GraphMutationEffect,
-                        ]
-                    ),
-                )
+            mutation_capability = self._cognitive_capabilities.mutation_planner
+            mutation_decision_handler = ResearchGraphMutationDecisionHandler(
+                capability=(
+                    mutation_capability
+                    if mutation_capability is not None
+                    else DeterministicResearchGraphMutationCapability(workspace)
+                ),
+                context_projection=self._cognitive_capabilities.mutation_context,
+                execution_policy=GraphMutationExecutionPolicy(),
+                governance=self._governance,
+                reviews=self._reviews,
+                issuer=self._issuer,
+                operation_executor=self._operation_executor,
+                trace_sink=runtime_trace_writer,
+                workspace=workspace,
+                record_agent_proposal=mutation_capability is not None,
+                checkpoint_store=self._persistence.create_decision_checkpoint_store(
+                    DecisionCheckpoint[
+                        GraphMutationDecisionPayload,
+                        GraphMutationProposalDraft,
+                        GraphMutationEffect,
+                    ]
+                ),
+            )
             planner = DynamicTaskGraphPlanner(
                 definition.initial_graph,
                 graph_store=graph_store,
+                commit_permit_verifier=self._persistence.commit_permit_verifier,
                 ready_node_selector=ready_node_selector,
-                mutation_applier=ResearchGraphMutationApplier(
-                    authorize=lambda request: self._authorize_with_demo_review(
-                        request,
-                        scenario="graph_mutation_apply",
-                    ),
-                    operation_executor=self._operation_executor,
-                    workspace=workspace,
-                ),
+                mutation_applier=None,
                 mutation_decision_handler=mutation_decision_handler,
                 recovery_planner=(
                     None
@@ -906,12 +1025,24 @@ class ResearchAgent:
             subject,
             EvaluationCriteria(required_output_keys=("graph_id", "nodes")),
         )
+        if resuming:
+            persisted_evaluation = (
+                await self._persistence.evaluation_report_store.load_for_run(run_id)
+            )
+            evaluation = (
+                persisted_evaluation
+                if persisted_evaluation is not None
+                else await self._persistence.evaluation_report_store.save(evaluation)
+            )
+        else:
+            evaluation = await self._persistence.evaluation_report_store.save(
+                evaluation
+            )
         if root_cause_handler is not None and not resuming:
             await root_cause_handler.analyze_post_run(
                 evaluation,
                 subject.trace,
             )
-        self._evaluation_history.extend(evaluation.results)
         llm_judgement = (
             None
             if resuming
@@ -921,23 +1052,11 @@ class ResearchAgent:
                 runtime_result,
             )
         )
+        # Deterministic failure analysis remains read-only Evaluation output.  It
+        # is no longer accumulated in process and cannot create a Proposal.
         failure_analysis = DeterministicFailureAnalyzer().analyze(
-            self._evaluation_history
+            evaluation.results
         )
-        proposals = ConservativeOptimizationAgent().propose(
-            failure_analysis,
-            ConservativeOptimizationPolicy(
-                min_affected_runs=2,
-                min_pattern_confidence=0.7,
-                min_expected_benefit=0.5,
-                min_evidence_findings=2,
-            ),
-        )
-        for proposal in proposals:
-            request = OptimizationGovernanceAdapter().to_request(proposal)
-            workspace.governance_records.append(
-                self._authorize_with_demo_review(request, scenario="optimization")
-            )
 
         raw_report = workspace.output_for_role(REPORT_GENERATION)
         if raw_report is None:
@@ -951,11 +1070,173 @@ class ResearchAgent:
         if report_commit_receipt is None:
             raise RuntimeError("Research report has no authoritative commit receipt")
         memories = await self._memory_store.list_all()
-        history_runs = len(
-            {result.run_id for result in self._evaluation_history}
+        run_evidence_refs = {
+            f"tool:{observation.invocation_id}"
+            for observation in workspace.tool_observations
+        }
+        experience_source_memories = tuple(
+            memory
+            for memory in memories
+            if (
+                memory_baseline.get(memory.memory_id)
+                != decision_fingerprint(memory)
+                or any(
+                    evidence.source_reference in run_evidence_refs
+                    for evidence in memory.evidence
+                )
+            )
         )
+        experience_handler = ResearchExperienceAssessmentHandler(
+            state_store=self._persistence.state_store,
+            artifact_readback=self._persistence.workspace_artifact_committer,
+            metadata_store=self._persistence.experience_metadata_store,
+            capability=(
+                self._cognitive_capabilities.experience_assessor
+                or DeterministicExperienceAssessmentCapability()
+            ),
+            governance=self._governance,
+            reviews=self._reviews,
+            issuer=self._issuer,
+            operation_executor=self._operation_executor,
+            trace_sink=runtime_trace_writer,
+            checkpoint_store=self._persistence.create_decision_checkpoint_store(
+                DecisionCheckpoint[
+                    ExperienceAssessmentRequest,
+                    ExperienceAssessmentDraft,
+                    ExperienceMetadataEffect,
+                ]
+            ),
+            fault_injector=self._decision_fault_injector,
+        )
+        experience_result = (
+            await experience_handler.resume(run_id) if resuming else None
+        )
+        if experience_result is None:
+            existing_experience = (
+                await self._persistence.experience_metadata_store.list_for_run(run_id)
+            )
+            if existing_experience:
+                experience_metadata = existing_experience[-1]
+            else:
+                experience_result = await experience_handler.assess(
+                    final_state=final_state,
+                    evaluation=evaluation,
+                    artifact_receipt=report_commit_receipt,
+                    source_memories=experience_source_memories,
+                )
+                experience_metadata = experience_result.metadata
+        else:
+            experience_metadata = experience_result.metadata
+        if (
+            experience_result is not None
+            and experience_result.governance_record is not None
+        ):
+            workspace.governance_records.append(
+                experience_result.governance_record
+            )
+        feedback_handler = ResearchDecisionFeedbackHandler(
+            state_store=self._persistence.state_store,
+            evaluation_store=self._persistence.evaluation_report_store,
+            feedback_store=self._persistence.decision_feedback_store,
+            governance=self._governance,
+            reviews=self._reviews,
+            issuer=self._issuer,
+            operation_executor=self._operation_executor,
+            trace_sink=runtime_trace_writer,
+            checkpoint_store=self._persistence.create_decision_checkpoint_store(
+                DecisionCheckpoint[
+                    DecisionFeedbackRequest,
+                    DecisionFeedbackDraft,
+                    DecisionFeedbackEffect,
+                ]
+            ),
+            fault_injector=self._decision_fault_injector,
+        )
+        feedback_result = await feedback_handler.record_for_run(
+            final_state=final_state,
+            evaluation=evaluation,
+            artifact_receipt=report_commit_receipt,
+            experience=experience_metadata,
+            recall_bundle=recall_bundle,
+        )
+        workspace.governance_records.extend(feedback_result.governance_records)
+        learning_handler = ResearchExperienceLearningHandler(
+            store=self._persistence.learning_insight_store,
+            capability=(
+                self._cognitive_capabilities.experience_learner
+                or DeterministicLearningAssessmentCapability()
+            ),
+            governance=self._governance,
+            reviews=self._reviews,
+            issuer=self._issuer,
+            operation_executor=self._operation_executor,
+            trace_sink=runtime_trace_writer,
+            checkpoint_store=self._persistence.create_decision_checkpoint_store(
+                DecisionCheckpoint[
+                    LearningAssessmentRequest,
+                    LearningInsightDraft,
+                    LearningInsightEffect,
+                ]
+            ),
+            fault_injector=self._decision_fault_injector,
+        )
+        learning_result = await learning_handler.assess(
+            trigger_run_id=run_id,
+            task_id=final_state.task.task_id,
+            scope=MemoryScope(
+                tenant_id="default",
+                project_id="research",
+                agent_scope="planner",
+            ),
+            subject_decision_type=PLANNING_DECISION_TYPE,
+        )
+        if learning_result.governance_record is not None:
+            workspace.governance_records.append(
+                learning_result.governance_record
+            )
+        optimization_handler = ResearchOptimizationProposalHandler(
+            evidence_resolver=self._persistence.optimization_evidence_resolver,
+            baseline_provider=ResearchPlanningOptimizationBaselineProvider(
+                self._persistence.runtime_configuration
+            ),
+            store=self._persistence.optimization_proposal_store,
+            capability=(
+                self._cognitive_capabilities.optimization_assessor
+                or DeterministicOptimizationAssessmentCapability()
+            ),
+            governance=self._governance,
+            reviews=self._reviews,
+            issuer=self._issuer,
+            operation_executor=self._operation_executor,
+            trace_sink=runtime_trace_writer,
+            checkpoint_store=self._persistence.create_decision_checkpoint_store(
+                DecisionCheckpoint[
+                    OptimizationAssessmentRequest,
+                    OptimizationProposalDraft,
+                    OptimizationProposalEffect,
+                ]
+            ),
+            fault_injector=self._decision_fault_injector,
+        )
+        optimization_result = await optimization_handler.assess(
+            trigger_run_id=run_id,
+            task_id=final_state.task.task_id,
+            scope=research_initial_planning_optimization_scope(),
+        )
+        if optimization_result.governance_record is not None:
+            workspace.governance_records.append(
+                optimization_result.governance_record
+            )
+        proposals = (
+            (optimization_result.proposal,)
+            if optimization_result.proposal is not None
+            else ()
+        )
+        # Everything above this point belongs to the completed Research Run.
+        # Freeze those outputs before entering the optional post-run control plane.
+        completed_governance_records = tuple(workspace.governance_records)
         authorization_uses_list = []
-        for record in workspace.governance_records:
+        for record in completed_governance_records:
             if record.authorization is None:
                 continue
             use = await self._authorization_store.load(
@@ -963,9 +1244,107 @@ class ResearchAgent:
             )
             if use is not None:
                 authorization_uses_list.append(use)
-        authorization_uses = tuple(authorization_uses_list)
+        completed_authorization_uses = tuple(authorization_uses_list)
         root_cause_assessments = await root_cause_store.list_for_run(run_id)
+        completed_runtime_entries = runtime_trace_sink.entries_for(run_id)
+
+        auto_adaptation_coordinator: ResearchAutoAdaptationCoordinator | None = None
+        try:
+            auto_adaptation_coordinator = ResearchAutoAdaptationCoordinator(
+                policy=self._auto_adaptation_policy,
+                proposals=self._persistence.optimization_proposal_store,
+                configurations=self._persistence.runtime_configuration,
+                state_store=self._persistence.state_store,
+                triggers=self._persistence.auto_adaptation_trigger_store,
+                gateway=self._build_optimization_configuration_gateway(
+                    runtime_trace_writer
+                ),
+                trace_sink=runtime_trace_writer,
+            )
+            auto_adaptation = (
+                await auto_adaptation_coordinator.evaluate_after_run(
+                    trigger_run_id=run_id,
+                    run_configuration=configuration_snapshot,
+                )
+            )
+        except Exception as error:
+            if auto_adaptation_coordinator is None:
+                auto_adaptation = (
+                    create_unpersisted_auto_adaptation_failure_outcome(
+                        policy=self._auto_adaptation_policy,
+                        trigger_run_id=run_id,
+                        run_configuration=configuration_snapshot,
+                        error=error,
+                    )
+                )
+            else:
+                try:
+                    auto_adaptation = (
+                        await auto_adaptation_coordinator
+                        .contain_infrastructure_failure(
+                            trigger_run_id=run_id,
+                            run_configuration=configuration_snapshot,
+                            error=error,
+                        )
+                    )
+                except Exception as containment_error:
+                    auto_adaptation = (
+                        create_unpersisted_auto_adaptation_failure_outcome(
+                            policy=self._auto_adaptation_policy,
+                            trigger_run_id=run_id,
+                            run_configuration=configuration_snapshot,
+                            error=error,
+                        ).model_copy(
+                            update={
+                                "error_summary": (
+                                    f"{type(error).__name__}: {error}; "
+                                    f"containment failed: "
+                                    f"{type(containment_error).__name__}: "
+                                    f"{containment_error}"
+                                )[:1024]
+                            }
+                        )
+                    )
+
+        final_governance_records = completed_governance_records
+        final_authorization_uses = completed_authorization_uses
+        if (
+            auto_adaptation_coordinator is not None
+            and auto_adaptation_coordinator.governance_record is not None
+        ):
+            auto_governance = auto_adaptation_coordinator.governance_record
+            final_governance_records = (
+                *completed_governance_records,
+                auto_governance,
+            )
+            if auto_governance.authorization is not None:
+                try:
+                    auto_use = await self._authorization_store.load(
+                        auto_governance.authorization.authorization_id
+                    )
+                except Exception as error:
+                    diagnostic = (
+                        f"authorization readback failed: "
+                        f"{type(error).__name__}: {error}"
+                    )[:1024]
+                    auto_adaptation = auto_adaptation.model_copy(
+                        update={
+                            "error_summary": (
+                                f"{auto_adaptation.error_summary}; {diagnostic}"
+                                if auto_adaptation.error_summary
+                                else diagnostic
+                            )[:1024]
+                        }
+                    )
+                else:
+                    if auto_use is not None:
+                        final_authorization_uses = (
+                            *completed_authorization_uses,
+                            auto_use,
+                        )
         runtime_entries = runtime_trace_sink.entries_for(run_id)
+        if not runtime_entries:
+            runtime_entries = completed_runtime_entries
         return ResearchRunResult(
             runtime_result=runtime_result,
             task_graph=final_graph,
@@ -974,14 +1353,24 @@ class ResearchAgent:
             evaluation=evaluation,
             failure_analysis=failure_analysis,
             optimization_proposals=proposals,
-            governance_records=tuple(workspace.governance_records),
-            authorization_uses=authorization_uses,
+            runtime_configuration=configuration_snapshot,
+            auto_adaptation=auto_adaptation,
+            governance_records=final_governance_records,
+            authorization_uses=final_authorization_uses,
             runtime_trace=runtime_entries,
             tool_trace=tool_entries,
             tool_observations=tuple(workspace.tool_observations),
             context_units=tuple(workspace.context_units),
             context_assemblies=tuple(workspace.context_assemblies),
             memories=memories,
+            memory_recall_bundle=recall_bundle,
+            experience_metadata=experience_metadata,
+            decision_feedback=feedback_result.records,
+            learning_insights=(
+                (learning_result.insight,)
+                if learning_result.insight is not None
+                else ()
+            ),
             agent_executions=tuple(workspace.agent_executions),
             llm_judgement=llm_judgement,
             llm_task_graph_draft=llm_task_graph_draft,
@@ -994,7 +1383,6 @@ class ResearchAgent:
             llm_context_packages=tuple(workspace.llm_context_packages),
             llm_tool_intents=tuple(workspace.llm_tool_intents),
             root_cause_assessments=root_cause_assessments,
-            evaluation_history_runs=history_runs,
         )
 
     async def resume(
@@ -1011,10 +1399,92 @@ class ResearchAgent:
             _resume_run_id=run_id,
         )
 
+    async def apply_optimization_proposal(
+        self,
+        proposal_id: UUID,
+        *,
+        requested_by: str,
+    ) -> ResearchOptimizationConfigurationResult:
+        """Explicitly request governed activation for one committed Proposal."""
+
+        return await self._optimization_configuration_gateway.request_apply(
+            proposal_id,
+            requested_by=requested_by,
+        )
+
+    def _build_optimization_configuration_gateway(
+        self,
+        trace_sink: TraceSink,
+    ) -> ResearchOptimizationConfigurationGateway:
+        return ResearchOptimizationConfigurationGateway(
+            proposals=self._persistence.optimization_proposal_store,
+            configurations=self._persistence.runtime_configuration,
+            governance=self._governance,
+            reviews=self._reviews,
+            issuer=self._issuer,
+            operation_executor=self._operation_executor,
+            trace_sink=trace_sink,
+            apply_checkpoints=self._persistence.create_decision_checkpoint_store(
+                DecisionCheckpoint[
+                    OptimizationApplyRequest,
+                    OptimizationApplyIntent,
+                    OptimizationApplyEffect,
+                ]
+            ),
+            rollback_checkpoints=self._persistence.create_decision_checkpoint_store(
+                DecisionCheckpoint[
+                    OptimizationRollbackRequest,
+                    OptimizationRollbackIntent,
+                    OptimizationRollbackEffect,
+                ]
+            ),
+            fault_injector=self._decision_fault_injector,
+        )
+
+    async def rollback_optimization(
+        self,
+        source_apply_effect_fingerprint: str,
+        *,
+        requested_by: str,
+    ) -> ResearchOptimizationConfigurationResult:
+        """Explicitly request governed restoration of the prior snapshot."""
+
+        return await self._optimization_configuration_gateway.request_rollback(
+            source_apply_effect_fingerprint,
+            requested_by=requested_by,
+        )
+
     def close(self) -> None:
         """Release the default SQLite composition explicitly."""
 
         self._persistence.close()
+
+    @property
+    def persistence_identity(self) -> ResearchPersistenceIdentity:
+        path = self._persistence.database.path
+        adapters = (
+            "state",
+            "graph",
+            "trace",
+            "decision",
+            "context",
+            "archive",
+            "memory",
+            "review",
+            "authorization",
+            "artifact",
+            "recall_bundle",
+            "experience",
+            "evaluation",
+            "decision_feedback",
+            "learning_insight",
+            "runtime_configuration",
+            "auto_adaptation",
+        )
+        return ResearchPersistenceIdentity(
+            database_path=path,
+            adapter_database_paths=tuple((name, path) for name in adapters),
+        )
 
     async def _build_task_definition(
         self,
@@ -1024,20 +1494,52 @@ class ResearchAgent:
         run_id: UUID,
         agent_task: AgentTask,
         trace_sink: TraceSink,
+        configuration_snapshot: RuntimeConfigurationSnapshot,
     ) -> tuple[
         ResearchTaskDefinition,
         TaskGraphDraft | None,
         GovernanceRecord | None,
         TaskGraphStore | None,
+        ResearchMemoryRecallResult | None,
     ]:
-        planner = self._cognitive_capabilities.task_planner
-        if planner is None:
-            return (
-                build_research_task(company),
-                None,
-                None,
-                self._persistence.task_graph_store,
+        configured_planner = self._cognitive_capabilities.task_planner
+        planner = configured_planner or DeterministicResearchPlanningCapability(
+            company
+        )
+        recall_handler = ResearchInitialMemoryRecallHandler(
+            memory_store=self._memory_store,
+            bundle_store=self._persistence.memory_recall_bundle_store,
+            experience_store=self._persistence.experience_metadata_store,
+            capability=(
+                self._cognitive_capabilities.memory_recall
+                or DeterministicMemoryRecallCapability()
+            ),
+            governance=self._governance,
+            reviews=self._reviews,
+            issuer=self._issuer,
+            operation_executor=self._operation_executor,
+            trace_sink=trace_sink,
+            checkpoint_store=self._persistence.create_decision_checkpoint_store(
+                DecisionCheckpoint[
+                    MemoryRecallRequest,
+                    MemoryRecallDraft,
+                    MemoryRecallEffect,
+                ]
+            ),
+        )
+        try:
+            recall_result = await recall_handler.recall(
+                goal=task,
+                run_id=run_id,
+                task_id=agent_task.task_id,
+                scope=MemoryScope(project_id="research", agent_scope="planner"),
+                facts={"domain": "financial_research"},
+                tags=("research",),
             )
+        except Exception:
+            # Recall is optional for Planning. Failure is fail-closed: no
+            # candidate or Draft content is injected into Planner context.
+            recall_result = None
         planning = await run_adaptive_planning(
             company=company,
             task=task,
@@ -1058,12 +1560,19 @@ class ResearchAgent:
                     PlanningGraphEffect,
                 ]
             ),
+            commit_permit_verifier=self._persistence.commit_permit_verifier,
+            deferred_news=configured_planner is None,
+            recall_bundle=(
+                recall_result.bundle if recall_result is not None else None
+            ),
+            configuration_snapshot=configuration_snapshot,
         )
         return (
             planning.definition,
-            planning.draft,
+            planning.draft if configured_planner is not None else None,
             planning.governance_record,
             planning.graph_store,
+            recall_result,
         )
 
     async def _judge_evaluation(
@@ -1135,9 +1644,8 @@ class ResearchAgent:
         *,
         progress_sink: ResearchProgressSink | None = None,
     ) -> ResearchRunResult:
-        """Run a baseline plus current run so conservative optimization can recur."""
+        """Run exactly one request; cross-run evidence comes only from SQLite."""
 
-        await self.run(task)
         return await self.run(task, progress_sink=progress_sink)
 
     async def _seed_memories(
@@ -1172,6 +1680,7 @@ class ResearchAgent:
                 ),
                 confidence=0.95,
                 evolution=MemoryEvolutionType.EXTEND,
+                scope=MemoryScope(project_id="research", agent_scope="planner"),
             ),
             MemoryCandidate(
                 memory_key="research.analysis_experience",
@@ -1199,6 +1708,7 @@ class ResearchAgent:
                 ),
                 confidence=0.95,
                 evolution=MemoryEvolutionType.EXTEND,
+                scope=MemoryScope(project_id="research", agent_scope="planner"),
             ),
         )
         for candidate in candidates:
@@ -1252,6 +1762,9 @@ class ResearchAgent:
             confidence=0.9,
             evolution=MemoryEvolutionType.SUPPORT,
             target_memory_id=preference.memory_id,
+            scope=preference.scope,
+            sensitivity=preference.sensitivity,
+            expires_at=preference.expires_at,
         )
         request = MemoryGovernanceAdapter().to_request(
             candidate,

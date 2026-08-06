@@ -9,6 +9,8 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue
 
 from adaptive_agent_runtime.decisioning import decision_fingerprint
+from adaptive_agent_runtime.governance.contracts import CommitPermitValidation
+from adaptive_agent_runtime.governance.models import GovernanceTarget, RuntimeCommitPermit
 from adaptive_agent_runtime.persistence.errors import PersistenceConflictError
 from adaptive_agent_runtime.persistence.sqlite import SQLiteDatabase
 
@@ -22,6 +24,8 @@ class WorkspaceArtifactCommitReceipt(BaseModel):
     effect_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     artifact_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     provenance: tuple[str, ...] = Field(min_length=1)
+    source_decision_request_id: UUID | None = None
+    source_proposal_id: UUID | None = None
     committed_at: AwareDatetime
 
 
@@ -30,10 +34,16 @@ class SQLiteWorkspaceArtifactStore:
 
     module_id = "workspace.artifact_store.sqlite"
 
-    def __init__(self, database: SQLiteDatabase) -> None:
+    def __init__(
+        self,
+        database: SQLiteDatabase,
+        *,
+        permit_verifier: CommitPermitValidation,
+    ) -> None:
         self._database = database
+        self._permit_verifier = permit_verifier
 
-    def _commit(
+    async def commit(
         self,
         *,
         run_id: UUID,
@@ -42,8 +52,21 @@ class SQLiteWorkspaceArtifactStore:
         effect_fingerprint: str,
         artifact: JsonValue,
         provenance: tuple[str, ...],
+        source_decision_request_id: UUID,
+        source_proposal_id: UUID,
+        permit: RuntimeCommitPermit,
+        subject_fingerprint: str,
         committed_at: datetime | None = None,
     ) -> WorkspaceArtifactCommitReceipt:
+        await self._permit_verifier.verify(
+            permit,
+            operation="workspace.report.commit",
+            target=GovernanceTarget(
+                target_type="workspace_report",
+                target_id=f"{run_id}:{node_id}",
+            ),
+            subject_fingerprint=subject_fingerprint,
+        )
         receipt = WorkspaceArtifactCommitReceipt(
             run_id=run_id,
             node_id=node_id,
@@ -51,6 +74,8 @@ class SQLiteWorkspaceArtifactStore:
             effect_fingerprint=effect_fingerprint,
             artifact_fingerprint=decision_fingerprint(artifact),
             provenance=provenance,
+            source_decision_request_id=source_decision_request_id,
+            source_proposal_id=source_proposal_id,
             committed_at=committed_at or datetime.now(timezone.utc),
         )
         artifact_json = json.dumps(
@@ -148,10 +173,23 @@ class WorkspaceArtifactCommitter:
     def __init__(self, store: SQLiteWorkspaceArtifactStore) -> None:
         self._store = store
 
-    def commit(self, **values: object) -> WorkspaceArtifactCommitReceipt:
-        return self._store._commit(**values)  # type: ignore[arg-type]
+    async def commit(self, **values: object) -> WorkspaceArtifactCommitReceipt:
+        return await self._store.commit(**values)  # type: ignore[arg-type]
 
     def load_by_effect(
         self, effect_fingerprint: str
     ) -> tuple[JsonValue, WorkspaceArtifactCommitReceipt] | None:
         return self._store.load_by_effect(effect_fingerprint)
+
+    def load(
+        self,
+        *,
+        run_id: UUID,
+        node_id: UUID,
+        artifact_type: str,
+    ) -> tuple[JsonValue, WorkspaceArtifactCommitReceipt] | None:
+        return self._store.load(
+            run_id=run_id,
+            node_id=node_id,
+            artifact_type=artifact_type,
+        )

@@ -42,6 +42,7 @@ from adaptive_agent_runtime.governance import (
     GovernanceAuthorizationIssuer,
     GovernanceDecision,
     GovernanceEvaluator,
+    GovernanceTarget,
     GovernanceRequest,
     GovernedDecisionApplier,
     GovernedOperationExecutor,
@@ -50,6 +51,7 @@ from adaptive_agent_runtime.governance import (
     ReviewOutcome,
     ReviewRequest,
     RuntimeDecisionGovernanceAdapter,
+    RuntimeCommitPermit,
     governance_fingerprint,
 )
 from adaptive_agent_runtime.llm import (
@@ -382,8 +384,9 @@ class ResearchRecoveryDecisionHandler(RecoveryDecisionHandler):
                 "effect_type": effect.effect.effect_type,
             }
 
-        async def apply_normalized_effect(
+        async def apply_authorized_effect(
             normalized: NormalizedDecisionEffect[RecoveryDecisionEffect],
+            permit: RuntimeCommitPermit,
         ) -> JsonValue:
             nonlocal applied_graph
             effect = normalized.payload
@@ -398,6 +401,12 @@ class ResearchRecoveryDecisionHandler(RecoveryDecisionHandler):
                 graph=candidate,
                 effect_fingerprint=normalized.effect_fingerprint,
                 recovery_record=record,
+                permit=permit,
+                target=GovernanceTarget(
+                    target_type=normalized.target.target_type,
+                    target_id=normalized.target.target_id,
+                ),
+                subject_fingerprint=governance_fingerprint(normalized),
             )
             if isinstance(effect.effect, AddRecoveryNodeEffect):
                 self._workspace.register_recovery_node(
@@ -468,7 +477,7 @@ class ResearchRecoveryDecisionHandler(RecoveryDecisionHandler):
             applier=GovernedDecisionApplier(
                 executor=self._operation_executor,
                 apply_effect=apply_effect,
-                apply_normalized_effect=apply_normalized_effect,
+                apply_authorized_effect=apply_authorized_effect,
                 reconcile_effect=reconcile_effect,
             ),
             checkpoint_store=self._checkpoint_store,

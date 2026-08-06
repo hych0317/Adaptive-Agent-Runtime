@@ -15,10 +15,6 @@ from adaptive_agent_runtime.context_memory import (
     MemoryStore,
 )
 from adaptive_agent_runtime.orchestration import TaskGraphStore
-from adaptive_agent_runtime.evolution import (
-    ReplayCaseStore,
-    RuntimeConfigurationStore,
-)
 from adaptive_agent_runtime.governance import (
     AuthorizationConsumptionStore,
     HumanReviewService,
@@ -65,13 +61,11 @@ class PersistenceBoundaryTests(unittest.TestCase):
                 persistence.authorization_store,
                 AuthorizationConsumptionStore,
             )
-            self.assertIsInstance(
-                persistence.runtime_configuration_store,
-                RuntimeConfigurationStore,
-            )
-            self.assertIsInstance(
-                persistence.replay_case_store,
-                ReplayCaseStore,
+            self.assertFalse(hasattr(persistence, "runtime_configuration_store"))
+            self.assertFalse(hasattr(persistence, "replay_case_store"))
+            self.assertFalse(hasattr(persistence, "evolution_store"))
+            self.assertTrue(
+                hasattr(persistence.optimization_proposal_store, "commit")
             )
             self.assertIsInstance(
                 persistence.create_decision_checkpoint_store(

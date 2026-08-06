@@ -5,6 +5,9 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from datetime import datetime
+import hashlib
+import hmac
+import secrets
 from typing import Generic, TypeVar
 from uuid import UUID
 
@@ -26,6 +29,7 @@ from adaptive_agent_runtime.governance.models import (
     GovernanceDecision,
     GovernanceRequest,
     GovernanceTarget,
+    RuntimeCommitPermit,
     governance_fingerprint,
     utc_now,
 )
@@ -46,12 +50,14 @@ class BoundGovernedOperation(Generic[T]):
         target: GovernanceTarget,
         subject: object,
         apply: Callable[[], Awaitable[T]],
+        apply_with_permit: Callable[[RuntimeCommitPermit], Awaitable[T]] | None = None,
     ) -> None:
         self.module_id = module_id
         self._operation = operation
         self._target = target
         self._subject_fingerprint = governance_fingerprint(subject)
         self._apply = apply
+        self._apply_with_permit = apply_with_permit
 
     @property
     def operation(self) -> str:
@@ -65,14 +71,158 @@ class BoundGovernedOperation(Generic[T]):
     def subject_fingerprint(self) -> str:
         return self._subject_fingerprint
 
-    async def apply(self) -> T:
+    async def apply(self, permit: RuntimeCommitPermit) -> T:
+        if self._apply_with_permit is not None:
+            return await self._apply_with_permit(permit)
         return await self._apply()
+
+
+class HMACCommitPermitAuthority:
+    """Authenticate Governance authorizations and commit capabilities."""
+
+    module_id = "governance.commit_permit.hmac"
+
+    def __init__(
+        self,
+        secret: bytes | None = None,
+        *,
+        allow_unsealed_authorizations: bool = False,
+    ) -> None:
+        self._secret = secret or secrets.token_bytes(32)
+        self._allow_unsealed_authorizations = allow_unsealed_authorizations
+        if len(self._secret) < 32:
+            raise ValueError("commit Permit secret must contain at least 32 bytes")
+
+    def seal_authorization(
+        self,
+        authorization: GovernanceAuthorization,
+    ) -> GovernanceAuthorization:
+        seal = self._seal(
+            authorization.model_dump(mode="json", exclude={"integrity_seal"})
+        )
+        return authorization.model_copy(update={"integrity_seal": seal})
+
+    def verify_authorization(self, authorization: GovernanceAuthorization) -> None:
+        seal = authorization.integrity_seal
+        if seal is None and self._allow_unsealed_authorizations:
+            return
+        expected = self._seal(
+            authorization.model_dump(mode="json", exclude={"integrity_seal"})
+        )
+        if seal is None or not hmac.compare_digest(seal, expected):
+            raise AuthorizationVerificationError(
+                "Governance authorization integrity seal is invalid"
+            )
+
+    def issue_permit(
+        self,
+        authorization: GovernanceAuthorization,
+        target: GovernedOperationTarget[object],
+        *,
+        issued_at: datetime,
+    ) -> RuntimeCommitPermit:
+        self.verify_authorization(authorization)
+        unsigned = RuntimeCommitPermit(
+            authorization_id=authorization.authorization_id,
+            request_id=authorization.request_id,
+            decision_id=authorization.decision_id,
+            operation=target.operation,
+            target=target.target,
+            subject_fingerprint=target.subject_fingerprint,
+            issued_at=issued_at,
+            integrity_seal="0" * 64,
+        )
+        return unsigned.model_copy(
+            update={
+                "integrity_seal": self._seal(
+                    unsigned.model_dump(mode="json", exclude={"integrity_seal"})
+                )
+            }
+        )
+
+    def verify_permit(
+        self,
+        permit: RuntimeCommitPermit,
+        *,
+        operation: str,
+        target: GovernanceTarget,
+        subject_fingerprint: str,
+    ) -> None:
+        expected = self._seal(
+            permit.model_dump(mode="json", exclude={"integrity_seal"})
+        )
+        checks = (
+            (hmac.compare_digest(permit.integrity_seal, expected), "Permit seal mismatch"),
+            (permit.operation == operation, "Permit operation mismatch"),
+            (permit.target == target, "Permit target mismatch"),
+            (
+                permit.subject_fingerprint == subject_fingerprint,
+                "Permit Effect fingerprint mismatch",
+            ),
+        )
+        for valid, message in checks:
+            if not valid:
+                raise AuthorizationVerificationError(message)
+
+    def _seal(self, value: object) -> str:
+        payload = governance_fingerprint(value).encode("ascii")
+        return hmac.new(self._secret, payload, hashlib.sha256).hexdigest()
+
+
+class CommitPermitVerifier:
+    """Validate cryptographic binding plus durable single-use reservation."""
+
+    module_id = "governance.commit_permit_verifier"
+
+    def __init__(
+        self,
+        *,
+        authority: HMACCommitPermitAuthority,
+        consumption_store: AuthorizationConsumptionStore,
+    ) -> None:
+        self._authority = authority
+        self._consumption_store = consumption_store
+
+    async def verify(
+        self,
+        permit: RuntimeCommitPermit,
+        *,
+        operation: str,
+        target: GovernanceTarget,
+        subject_fingerprint: str,
+    ) -> None:
+        if not isinstance(permit, RuntimeCommitPermit):
+            raise AuthorizationVerificationError(
+                "authoritative commit requires a Runtime-issued Permit"
+            )
+        self._authority.verify_permit(
+            permit,
+            operation=operation,
+            target=target,
+            subject_fingerprint=subject_fingerprint,
+        )
+        use = await self._consumption_store.load(permit.authorization_id)
+        if (
+            use is None
+            or use.status is not AuthorizationUseStatus.RESERVED
+            or use.request_id != permit.request_id
+            or use.decision_id != permit.decision_id
+            or use.operation != operation
+            or use.target != target
+            or use.subject_fingerprint != subject_fingerprint
+        ):
+            raise AuthorizationReplayError(
+                "commit Permit has no matching active authorization reservation"
+            )
 
 
 class StrictAuthorizationVerifier:
     """Fail closed unless request, decision, token, target, and subject agree."""
 
     module_id = "governance.authorization_verifier.strict"
+
+    def __init__(self, authority: HMACCommitPermitAuthority | None = None) -> None:
+        self._authority = authority
 
     def verify(
         self,
@@ -81,6 +231,8 @@ class StrictAuthorizationVerifier:
         authorization: GovernanceAuthorization,
         target: GovernedOperationTarget[object],
     ) -> None:
+        if self._authority is not None:
+            self._authority.verify_authorization(authorization)
         request_fingerprint = governance_fingerprint(request)
         expected_subject = request.attributes.get(SUBJECT_FINGERPRINT_ATTRIBUTE)
         checks = (
@@ -187,10 +339,14 @@ class GovernedOperationExecutor:
         verifier: StrictAuthorizationVerifier,
         consumption_store: AuthorizationConsumptionStore,
         clock: Callable[[], datetime] = utc_now,
+        permit_authority: HMACCommitPermitAuthority | None = None,
     ) -> None:
         self._verifier = verifier
         self._consumption_store = consumption_store
         self._clock = clock
+        self._permit_authority = permit_authority or HMACCommitPermitAuthority(
+            allow_unsealed_authorizations=True
+        )
 
     async def execute(
         self,
@@ -213,9 +369,14 @@ class GovernedOperationExecutor:
             reserved_at=now,
             updated_at=now,
         )
+        permit = self._permit_authority.issue_permit(
+            authorization,
+            target,
+            issued_at=now,
+        )
         await self._consumption_store.reserve(reserved)
         try:
-            result = await target.apply()
+            result = await target.apply(permit)
         except Exception as exc:
             detail = str(exc) or exc.__class__.__name__
             failed = reserved.model_copy(
@@ -255,16 +416,28 @@ class GovernedOperationExecutor:
         authorization: GovernanceAuthorization,
         target: GovernedOperationTarget[T],
     ) -> T:
-        """Resume only an already-reserved authorization after a proven no-commit."""
+        """Resume a reserved Apply, or reserve it if interruption preceded reservation."""
 
         self._verifier.verify(request, decision, authorization, target)
         reserved = await self._consumption_store.load(authorization.authorization_id)
-        if reserved is None or reserved.status is not AuthorizationUseStatus.RESERVED:
+        if reserved is None:
+            return await self.execute(
+                request=request,
+                decision=decision,
+                authorization=authorization,
+                target=target,
+            )
+        if reserved.status is not AuthorizationUseStatus.RESERVED:
             raise AuthorizationReplayError(
                 "only an existing reserved authorization can resume Apply"
             )
+        permit = self._permit_authority.issue_permit(
+            authorization,
+            target,
+            issued_at=self._clock(),
+        )
         try:
-            result = await target.apply()
+            result = await target.apply(permit)
         except Exception as exc:
             detail = str(exc) or exc.__class__.__name__
             failed = reserved.model_copy(

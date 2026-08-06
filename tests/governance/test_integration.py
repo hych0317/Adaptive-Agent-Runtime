@@ -26,7 +26,6 @@ from adaptive_agent_runtime.governance import (
     HumanReviewDecision,
     InMemoryHumanReviewService,
     MemoryGovernanceAdapter,
-    OptimizationGovernanceAdapter,
     ReviewOutcome,
     RiskLevel,
     RuntimeGovernanceEvaluator,
@@ -34,6 +33,9 @@ from adaptive_agent_runtime.governance import (
     default_governance_policy,
     governance_fingerprint,
     SUBJECT_FINGERPRINT_ATTRIBUTE,
+)
+from adaptive_agent_runtime.legacy.optimization_governance import (
+    LegacyOptimizationApplyGovernanceAdapter,
 )
 from adaptive_agent_runtime.tool_ecosystem import ToolCorrelation, ToolInvocation
 
@@ -173,7 +175,7 @@ class OptimizationGovernanceIntegrationTests(unittest.TestCase):
             rollback_plan=("Restore the prior policy.",),
             created_at=NOW,
         )
-        adapter = OptimizationGovernanceAdapter()
+        adapter = LegacyOptimizationApplyGovernanceAdapter()
         request = adapter.to_request(proposal)
         runtime_governor, reviews = governor(
             GovernancePolicy(policy_id="test", version="1")

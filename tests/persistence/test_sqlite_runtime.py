@@ -142,7 +142,9 @@ class SQLiteRuntimeResumeTests(unittest.IsolatedAsyncioTestCase):
 
         with TemporaryDirectory() as directory:
             path = f"{directory}/runtime.sqlite3"
-            first_persistence = SQLitePersistence(path)
+            first_persistence = SQLitePersistence(
+                path, enforce_authoritative_commits=False
+            )
             first_strategy = MockExecutionStrategy()
             first_runtime = AgentRuntime(
                 planner=DynamicTaskGraphPlanner(
@@ -168,7 +170,9 @@ class SQLiteRuntimeResumeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(persisted.step_count, 1)
             first_persistence.close()
 
-            resumed_persistence = SQLitePersistence(path)
+            resumed_persistence = SQLitePersistence(
+                path, enforce_authoritative_commits=False
+            )
             resumed_strategy = MockExecutionStrategy()
             resumed_planner = DynamicTaskGraphPlanner(
                 template,
@@ -221,7 +225,9 @@ class SQLiteRuntimeResumeTests(unittest.IsolatedAsyncioTestCase):
 
         with TemporaryDirectory() as directory:
             path = f"{directory}/runtime.sqlite3"
-            first_persistence = SQLitePersistence(path)
+            first_persistence = SQLitePersistence(
+                path, enforce_authoritative_commits=False
+            )
             runtime = AgentRuntime(
                 planner=DynamicTaskGraphPlanner(
                     template,
@@ -240,7 +246,9 @@ class SQLiteRuntimeResumeTests(unittest.IsolatedAsyncioTestCase):
                 )
             first_persistence.close()
 
-            resumed_persistence = SQLitePersistence(path)
+            resumed_persistence = SQLitePersistence(
+                path, enforce_authoritative_commits=False
+            )
             replay_strategy = MockExecutionStrategy()
             resumed = AgentRuntime(
                 planner=DynamicTaskGraphPlanner(
@@ -276,7 +284,9 @@ class SQLiteRuntimeResumeTests(unittest.IsolatedAsyncioTestCase):
 
         with TemporaryDirectory() as directory:
             path = f"{directory}/recovery.sqlite3"
-            first = SQLitePersistence(path)
+            first = SQLitePersistence(
+                path, enforce_authoritative_commits=False
+            )
             failing = MockExecutionStrategy(
                 {
                     failed_then_retried.node_id: NodeExecutionResult.failed(
@@ -300,7 +310,9 @@ class SQLiteRuntimeResumeTests(unittest.IsolatedAsyncioTestCase):
                 )
             first.close()
 
-            reopened = SQLitePersistence(path)
+            reopened = SQLitePersistence(
+                path, enforce_authoritative_commits=False
+            )
             successful = MockExecutionStrategy()
             planner = DynamicTaskGraphPlanner(
                 template,

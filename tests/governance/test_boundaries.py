@@ -36,12 +36,20 @@ def imports(path: Path) -> tuple[str, ...]:
 
 
 class GovernanceBoundaryTests(unittest.TestCase):
-    def test_runtime_modules_do_not_import_governance(self) -> None:
+    def test_runtime_modules_only_import_governance_commit_contracts(self) -> None:
+        allowed = {
+            "adaptive_agent_runtime.governance.contracts",
+            "adaptive_agent_runtime.governance.models",
+            "adaptive_agent_runtime.governance.errors",
+        }
         violations: list[str] = []
         for package_name in EXECUTION_PACKAGES:
             for path in (PACKAGE_ROOT / package_name).rglob("*.py"):
                 for module in imports(path):
-                    if module.startswith("adaptive_agent_runtime.governance"):
+                    if (
+                        module.startswith("adaptive_agent_runtime.governance")
+                        and module not in allowed
+                    ):
                         violations.append(f"{path.name}: {module}")
 
         self.assertEqual(violations, [])
@@ -84,7 +92,7 @@ class GovernanceBoundaryTests(unittest.TestCase):
         }
 
         self.assertEqual(integration_imports & forbidden, set())
-        self.assertIn(
+        self.assertNotIn(
             "adaptive_agent_runtime.evaluation.models",
             integration_imports,
         )
@@ -109,6 +117,35 @@ class GovernanceBoundaryTests(unittest.TestCase):
 
         self.assertEqual(evaluator_methods, {"evaluate", "finalize_review"})
         self.assertEqual(issuer_methods, {"issue"})
+
+    def test_applications_do_not_import_raw_authoritative_mutation_implementations(
+        self,
+    ) -> None:
+        forbidden_symbols = {
+            "ManagedToolExecutor",
+            "SQLiteWorkspaceArtifactStore",
+            "SQLiteMemoryStore",
+            "SQLiteMemoryRecallBundleStore",
+            "SQLiteExperienceMetadataStore",
+            "SQLiteDecisionFeedbackStore",
+            "SQLiteLearningInsightStore",
+            "SQLiteContextArchive",
+            "SQLiteTaskGraphStore",
+        }
+        violations: list[str] = []
+        root = Path(__file__).resolve().parents[2] / "applications"
+        for path in root.rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    blocked = sorted(
+                        {alias.name for alias in node.names} & forbidden_symbols
+                    )
+                    if blocked:
+                        violations.append(
+                            f"{path.relative_to(root)} imports {', '.join(blocked)}"
+                        )
+        self.assertEqual(violations, [])
 
 
 if __name__ == "__main__":

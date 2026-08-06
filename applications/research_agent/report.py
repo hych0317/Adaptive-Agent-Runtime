@@ -13,12 +13,20 @@ from adaptive_agent_runtime.context_memory import (
     ContextAssembly,
     ContextUnit,
     MemoryUnit,
+    MemoryRecallBundle,
+    ExperienceMetadata,
 )
+from adaptive_agent_runtime.decision_feedback import DecisionFeedbackRecord
+from adaptive_agent_runtime.experience_learning import LearningInsight
 from adaptive_agent_runtime.evaluation import (
     EvaluationReport,
     FailureAnalysis,
-    OptimizationProposal,
     RootCauseAssessment,
+)
+from adaptive_agent_runtime.optimization import (
+    AutoAdaptationTriggerRecord,
+    OptimizationProposal,
+    RuntimeConfigurationSnapshot,
 )
 from adaptive_agent_runtime.governance import (
     AuthorizationUse,
@@ -99,6 +107,8 @@ class ResearchRunResult:
     evaluation: EvaluationReport
     failure_analysis: FailureAnalysis
     optimization_proposals: tuple[OptimizationProposal, ...]
+    runtime_configuration: RuntimeConfigurationSnapshot
+    auto_adaptation: AutoAdaptationTriggerRecord
     governance_records: tuple[GovernanceRecord, ...]
     authorization_uses: tuple[AuthorizationUse, ...]
     runtime_trace: tuple[TraceEntry, ...]
@@ -107,6 +117,10 @@ class ResearchRunResult:
     context_units: tuple[ContextUnit, ...]
     context_assemblies: tuple[ContextAssembly, ...]
     memories: tuple[MemoryUnit, ...]
+    memory_recall_bundle: MemoryRecallBundle | None
+    experience_metadata: ExperienceMetadata | None
+    decision_feedback: tuple[DecisionFeedbackRecord, ...]
+    learning_insights: tuple[LearningInsight, ...]
     agent_executions: tuple[AutonomousAgentResult, ...]
     llm_judgement: JudgeAssessmentDraft | None
     llm_task_graph_draft: TaskGraphDraft | None
@@ -117,7 +131,6 @@ class ResearchRunResult:
     llm_context_packages: tuple[LLMContextPackage, ...]
     llm_tool_intents: tuple[ResearchToolIntentRecord, ...]
     root_cause_assessments: tuple[RootCauseAssessment, ...]
-    evaluation_history_runs: int
 
 
 def _mapping(value: JsonValue | None) -> Mapping[str, object]:

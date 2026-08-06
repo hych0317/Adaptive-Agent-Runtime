@@ -40,6 +40,7 @@ from adaptive_agent_runtime.governance import (
     GovernanceRequest,
     GovernanceScope,
     GovernanceTarget,
+    RuntimeCommitPermit,
     GovernedOperationExecutor,
     GovernedOperationError,
     GraphMutationGovernanceAdapter,
@@ -91,6 +92,7 @@ from adaptive_agent_runtime.tool_ecosystem import (
     ToolExecutionPolicy,
     ToolExecutionStrategy,
     ToolExecutor,
+    PermitBoundToolExecutor,
     ToolEcosystemError,
     ToolIntegrationError,
     ToolInvocation,
@@ -385,7 +387,7 @@ class GovernedRecordingToolExecutor:
     def __init__(
         self,
         *,
-        delegate: ToolExecutor,
+        delegate: PermitBoundToolExecutor,
         governance: GovernanceEvaluator,
         reviews: HumanReviewService,
         issuer: GovernanceAuthorizationIssuer,
@@ -446,7 +448,18 @@ class GovernedRecordingToolExecutor:
                 f"Governance denied Tool invocation: {final.reason}"
             )
         async def apply() -> ToolObservation:
-            return await self._delegate.execute(invocation, policy)
+            raise RuntimeError("raw Tool execution requires a Runtime Permit")
+
+        async def apply_with_permit(
+            permit: RuntimeCommitPermit,
+        ) -> ToolObservation:
+            return await self._delegate.execute(
+                invocation,
+                policy,
+                permit=permit,
+                target=request.target,
+                subject_fingerprint=governance_fingerprint(invocation),
+            )
 
         observation = await self._operation_executor.execute(
             request=request,
@@ -458,6 +471,7 @@ class GovernedRecordingToolExecutor:
                 target=request.target,
                 subject=invocation,
                 apply=apply,
+                apply_with_permit=apply_with_permit,
             ),
         )
         self._workspace.tool_observations.append(observation)
@@ -955,12 +969,9 @@ class ResearchStrategy(_ContextAwareStrategy):
         output: JsonValue,
         recorded_units: tuple[ContextUnit, ...],
     ) -> tuple[GraphMutation, ...]:
-        planner = self._mutation_planner
-        if planner is None:
-            return self._workspace.definition.discovery_mutations()
-        # The Agent-backed path is handled after Observation consumption by
-        # GraphMutationDecisionHandler. Returning no metadata mutation prevents
-        # the proposal from bypassing unified validation, Governance, and Trace.
+        # Both the Agent-backed and deterministic fallback paths are handled
+        # after Observation consumption by GraphMutationDecisionHandler.
+        # Returning no metadata mutation closes the former mutation bypass.
         del node, state, output, recorded_units
         return ()
 
@@ -1255,6 +1266,19 @@ class ReportStrategy(_ContextAwareStrategy):
         node: TaskNode,
         state: AgentState,
     ) -> NodeExecutionResult:
+        provenance = self._report_provenance()
+        existing = await self._decision_handler.resume_existing(
+            run_id=state.run_id,
+            task_id=state.task.task_id,
+            node_id=node.node_id,
+            provenance=provenance,
+        )
+        if existing is not None:
+            report, receipt, record = existing
+            self._workspace.accept_report_commit(node, report, receipt)
+            if record is not None:
+                self._workspace.governance_records.append(record)
+            return NodeExecutionResult.ok(output=self._artifact_reference(receipt))
         assembly = await self._prepare(node, state)
         llm_generator = self._llm_generator
         if llm_generator is not None:
@@ -1268,7 +1292,11 @@ class ReportStrategy(_ContextAwareStrategy):
         result = await self._tool_strategy.execute(node, state)
         await self._record_tool_observations(start_index, node, state)
         if result.succeeded:
-            await self._commit_report(node, state, result.output)
+            reference = await self._commit_report(node, state, result.output)
+            return NodeExecutionResult.ok(
+                output=reference,
+                mutations=result.mutations,
+            )
         return result
 
     async def _commit_report(
@@ -1276,26 +1304,44 @@ class ReportStrategy(_ContextAwareStrategy):
         node: TaskNode,
         state: AgentState,
         output: JsonValue,
-    ) -> None:
+    ) -> JsonValue:
         report = ResearchReport.model_validate(output)
         accepted, receipt, record = await self._decision_handler.commit(
             run_id=state.run_id,
             task_id=state.task.task_id,
             node_id=node.node_id,
             report=report,
-            provenance=tuple(
-                f"analysis:{role}"
-                for role in (
-                    FINANCIAL_METRICS,
-                    INDUSTRY_ANALYSIS,
-                    COMPETITOR_ANALYSIS,
-                    NEWS_ANALYSIS,
-                    RISK_REVIEW,
-                )
-            ),
+            provenance=self._report_provenance(),
         )
         self._workspace.accept_report_commit(node, accepted, receipt)
-        self._workspace.governance_records.append(record)
+        if record is not None:
+            self._workspace.governance_records.append(record)
+        return self._artifact_reference(receipt)
+
+    @staticmethod
+    def _report_provenance() -> tuple[str, ...]:
+        return tuple(
+            f"analysis:{role}"
+            for role in (
+                FINANCIAL_METRICS,
+                INDUSTRY_ANALYSIS,
+                COMPETITOR_ANALYSIS,
+                NEWS_ANALYSIS,
+                RISK_REVIEW,
+            )
+        )
+
+    @staticmethod
+    def _artifact_reference(
+        receipt: WorkspaceArtifactCommitReceipt,
+    ) -> JsonValue:
+        return {
+            "artifact_type": receipt.artifact_type,
+            "effect_fingerprint": receipt.effect_fingerprint,
+            "artifact_fingerprint": receipt.artifact_fingerprint,
+            "source_decision_request_id": str(receipt.source_decision_request_id),
+            "source_proposal_id": str(receipt.source_proposal_id),
+        }
 
     async def _generate_with_llm(
         self,
@@ -1373,8 +1419,8 @@ class ReportStrategy(_ContextAwareStrategy):
                 error="Report Generator returned an invalid report"
             )
         output = report.model_dump(mode="json")
-        await self._commit_report(node, state, output)
-        return NodeExecutionResult.ok(output=output)
+        reference = await self._commit_report(node, state, output)
+        return NodeExecutionResult.ok(output=reference)
 
 
 def build_tool_execution_strategy(

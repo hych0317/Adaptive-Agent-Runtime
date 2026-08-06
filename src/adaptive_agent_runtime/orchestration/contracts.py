@@ -6,6 +6,7 @@ from typing import Protocol, runtime_checkable
 from uuid import UUID
 
 from adaptive_agent_runtime import AgentState, RuntimeModule
+from adaptive_agent_runtime.governance.models import GovernanceTarget, RuntimeCommitPermit
 from adaptive_agent_runtime.orchestration.checkpoint import TaskGraphCheckpoint
 from adaptive_agent_runtime.orchestration.graph import DynamicTaskGraph
 from adaptive_agent_runtime.orchestration.models import (
@@ -68,7 +69,14 @@ class ReadyTaskNodeSelector(RuntimeModule, Protocol):
 class TaskGraphStore(RuntimeModule, Protocol):
     """Persist the graph plus the planner cursor without storage coupling."""
 
-    async def save(self, checkpoint: TaskGraphCheckpoint) -> None: ...
+    async def save(
+        self,
+        checkpoint: TaskGraphCheckpoint,
+        *,
+        permit: RuntimeCommitPermit | None = None,
+        target: GovernanceTarget | None = None,
+        subject_fingerprint: str | None = None,
+    ) -> None: ...
 
     async def load(self, run_id: UUID) -> TaskGraphCheckpoint | None: ...
 
@@ -84,6 +92,9 @@ class GraphDecisionCommitter(RuntimeModule, Protocol):
         graph: DynamicTaskGraph,
         effect_fingerprint: str,
         recovery_record: RecoveryRecord | None = None,
+        permit: RuntimeCommitPermit | None = None,
+        target: GovernanceTarget | None = None,
+        subject_fingerprint: str | None = None,
     ) -> DynamicTaskGraph: ...
 
     async def load_graph_effect(

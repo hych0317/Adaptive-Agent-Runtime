@@ -26,6 +26,16 @@ from adaptive_agent_runtime.llm import (
     TaskGraphProposalCapability,
     ToolSelectionProposalCapability,
 )
+from applications.research_agent.memory_recall import MemoryRecallProposalCapability
+from applications.research_agent.experience_assessment import (
+    ExperienceAssessmentCapability,
+)
+from applications.research_agent.experience_learning import (
+    LearningAssessmentCapability,
+)
+from applications.research_agent.optimization import (
+    OptimizationAssessmentCapability,
+)
 
 
 @dataclass(frozen=True)
@@ -82,6 +92,10 @@ class ResearchCognitiveCapabilities:
     reasoner: ReasoningCapability | None = None
     context_compressor: SemanticCompressionCapability | None = None
     memory_extractor: MemoryExtractionCapability | None = None
+    memory_recall: MemoryRecallProposalCapability | None = None
+    experience_assessor: ExperienceAssessmentCapability | None = None
+    experience_learner: LearningAssessmentCapability | None = None
+    optimization_assessor: OptimizationAssessmentCapability | None = None
     report_context: ResearchReportContextProjection | None = None
     compression_context: ResearchContextProjection | None = None
     extraction_context: ResearchContextProjection | None = None

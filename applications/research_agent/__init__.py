@@ -24,6 +24,9 @@ from applications.research_agent.progress import (
     ResearchProgressKind,
     ResearchProgressSink,
 )
+from applications.research_agent.optimization_apply import (
+    ResearchOptimizationConfigurationResult,
+)
 from applications.research_agent.llm_deployment import (
     ResearchInferenceTargetDefinition,
     ResearchLLMCapability,
@@ -53,6 +56,7 @@ __all__ = [
     "ResearchProgressEvent",
     "ResearchProgressKind",
     "ResearchProgressSink",
+    "ResearchOptimizationConfigurationResult",
     "ObservableTraceSink",
     "ResearchTaskDefinition",
     "ResearchLLMCapability",

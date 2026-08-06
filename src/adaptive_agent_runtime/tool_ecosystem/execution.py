@@ -35,6 +35,11 @@ from adaptive_agent_runtime.tool_ecosystem.models import (
     ToolTraceEventKind,
     utc_now,
 )
+from adaptive_agent_runtime.governance.contracts import CommitPermitValidation
+from adaptive_agent_runtime.governance.models import (
+    GovernanceTarget,
+    RuntimeCommitPermit,
+)
 
 
 class InMemoryToolTraceSink:
@@ -292,7 +297,6 @@ class ManagedToolExecutor:
             },
         )
         return observation
-
     async def _trace_attempt(
         self,
         invocation: ToolInvocation,
@@ -333,3 +337,52 @@ class ManagedToolExecutor:
             payload=payload or {},
         )
         await self._trace_sink.record(event)
+
+
+class PermitBoundToolExecutor:
+    """Only execute a Tool while a Runtime authorization reservation is active."""
+
+    module_id = "tool.executor.permit_bound"
+
+    def __init__(
+        self,
+        *,
+        delegate: ManagedToolExecutor,
+        permit_verifier: CommitPermitValidation,
+    ) -> None:
+        self._delegate = delegate
+        self._permit_verifier = permit_verifier
+
+    async def execute(
+        self,
+        invocation: ToolInvocation,
+        policy: ToolExecutionPolicy,
+        *,
+        permit: RuntimeCommitPermit,
+        target: GovernanceTarget,
+        subject_fingerprint: str,
+    ) -> ToolObservation:
+        await self._permit_verifier.verify(
+            permit,
+            operation="tool.call",
+            target=target,
+            subject_fingerprint=subject_fingerprint,
+        )
+        return await self._delegate.execute(invocation, policy)
+
+
+def build_permit_bound_tool_executor(
+    *,
+    registry: ToolRegistry,
+    trace_sink: ToolTraceSink,
+    permit_verifier: CommitPermitValidation,
+) -> PermitBoundToolExecutor:
+    """Construct the raw executor inside the Tool kernel boundary."""
+
+    return PermitBoundToolExecutor(
+        delegate=ManagedToolExecutor(
+            registry=registry,
+            trace_sink=trace_sink,
+        ),
+        permit_verifier=permit_verifier,
+    )

@@ -11,12 +11,16 @@ from typing import Iterator
 from adaptive_agent_runtime.persistence.errors import PersistenceSchemaError
 
 
-_SCHEMA_VERSION = 5
+_SCHEMA_VERSION = 13
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runtime_schema (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     version INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_authority_keys (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    secret_hex TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS agent_state_snapshots (
@@ -78,6 +82,14 @@ CREATE TABLE IF NOT EXISTS context_archives (
     context_id TEXT NOT NULL,
     snapshot_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS context_archive_transactions (
+    effect_fingerprint TEXT PRIMARY KEY,
+    archive_id TEXT NOT NULL UNIQUE,
+    context_id TEXT NOT NULL,
+    source_fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'committed')),
+    archive_json TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS memory_snapshots (
     memory_id TEXT NOT NULL,
@@ -97,6 +109,199 @@ CREATE TABLE IF NOT EXISTS memory_applied_candidates (
 CREATE TABLE IF NOT EXISTS memory_applied_effects (
     effect_fingerprint TEXT PRIMARY KEY,
     result_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memory_batch_receipts (
+    effect_fingerprint TEXT PRIMARY KEY,
+    payload_fingerprint TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    receipt_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memory_recall_bundles (
+    effect_fingerprint TEXT PRIMARY KEY,
+    bundle_id TEXT NOT NULL UNIQUE,
+    run_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    payload_fingerprint TEXT NOT NULL,
+    bundle_json TEXT NOT NULL,
+    receipt_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_recall_bundles_run
+    ON memory_recall_bundles (run_id);
+CREATE TABLE IF NOT EXISTS experience_metadata (
+    effect_fingerprint TEXT PRIMARY KEY,
+    experience_id TEXT NOT NULL UNIQUE,
+    source_run_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    payload_fingerprint TEXT NOT NULL,
+    source_memory_refs_json TEXT NOT NULL,
+    metadata_json TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    UNIQUE (source_run_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_experience_metadata_run
+    ON experience_metadata (source_run_id, version);
+CREATE TABLE IF NOT EXISTS experience_memory_links (
+    effect_fingerprint TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    PRIMARY KEY (effect_fingerprint, memory_id),
+    FOREIGN KEY (effect_fingerprint)
+        REFERENCES experience_metadata(effect_fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_experience_memory_links_memory
+    ON experience_memory_links (memory_id);
+
+CREATE TABLE IF NOT EXISTS evaluation_reports (
+    report_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL UNIQUE,
+    task_id TEXT NOT NULL,
+    report_fingerprint TEXT NOT NULL,
+    report_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS decision_feedback (
+    effect_fingerprint TEXT PRIMARY KEY,
+    feedback_id TEXT NOT NULL UNIQUE,
+    source_run_id TEXT NOT NULL,
+    subject_decision_id TEXT NOT NULL,
+    subject_decision_type TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    payload_fingerprint TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    UNIQUE (source_run_id, subject_decision_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_decision_feedback_run
+    ON decision_feedback (source_run_id, subject_decision_id, version);
+CREATE TABLE IF NOT EXISTS learning_insights (
+    effect_fingerprint TEXT PRIMARY KEY,
+    learning_insight_id TEXT NOT NULL UNIQUE,
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    agent_scope TEXT NOT NULL,
+    subject_decision_type TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    evidence_set_fingerprint TEXT NOT NULL,
+    payload_fingerprint TEXT NOT NULL,
+    insight_json TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    UNIQUE (
+        tenant_id,
+        project_id,
+        agent_scope,
+        subject_decision_type,
+        version
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_learning_insights_scope
+    ON learning_insights (
+        tenant_id,
+        project_id,
+        agent_scope,
+        subject_decision_type,
+        version
+    );
+
+CREATE TABLE IF NOT EXISTS optimization_proposals (
+    effect_fingerprint TEXT PRIMARY KEY,
+    proposal_id TEXT NOT NULL UNIQUE,
+    source_decision_request_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    application_id TEXT NOT NULL,
+    decision_type TEXT NOT NULL,
+    target_key TEXT NOT NULL,
+    baseline_fingerprint TEXT NOT NULL,
+    evidence_set_fingerprint TEXT NOT NULL,
+    payload_fingerprint TEXT NOT NULL,
+    proposal_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_optimization_proposals_scope
+    ON optimization_proposals (
+        tenant_id,
+        project_id,
+        application_id,
+        decision_type
+    );
+CREATE TABLE IF NOT EXISTS optimization_proposal_receipts (
+    effect_fingerprint TEXT PRIMARY KEY,
+    proposal_id TEXT NOT NULL UNIQUE,
+    receipt_json TEXT NOT NULL,
+    FOREIGN KEY (effect_fingerprint)
+        REFERENCES optimization_proposals(effect_fingerprint)
+);
+
+CREATE TABLE IF NOT EXISTS governed_runtime_configuration_snapshots (
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    application_id TEXT NOT NULL,
+    decision_type TEXT NOT NULL,
+    target_key TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    snapshot_fingerprint TEXT NOT NULL UNIQUE,
+    snapshot_json TEXT NOT NULL,
+    PRIMARY KEY (
+        tenant_id,
+        project_id,
+        application_id,
+        decision_type,
+        target_key,
+        revision
+    )
+);
+CREATE TABLE IF NOT EXISTS governed_runtime_configuration_active (
+    tenant_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    application_id TEXT NOT NULL,
+    decision_type TEXT NOT NULL,
+    target_key TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    snapshot_fingerprint TEXT NOT NULL,
+    PRIMARY KEY (
+        tenant_id,
+        project_id,
+        application_id,
+        decision_type,
+        target_key
+    ),
+    FOREIGN KEY (
+        tenant_id,
+        project_id,
+        application_id,
+        decision_type,
+        target_key,
+        revision
+    ) REFERENCES governed_runtime_configuration_snapshots (
+        tenant_id,
+        project_id,
+        application_id,
+        decision_type,
+        target_key,
+        revision
+    )
+);
+CREATE TABLE IF NOT EXISTS optimization_configuration_receipts (
+    effect_fingerprint TEXT PRIMARY KEY,
+    operation TEXT NOT NULL,
+    payload_fingerprint TEXT NOT NULL,
+    receipt_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS auto_adaptation_triggers (
+    trigger_run_id TEXT PRIMARY KEY,
+    attempt_id TEXT NOT NULL UNIQUE,
+    revision INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    policy_fingerprint TEXT NOT NULL,
+    selected_proposal_id TEXT UNIQUE,
+    trigger_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS auto_adaptation_trigger_history (
+    trigger_run_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    trigger_json TEXT NOT NULL,
+    PRIMARY KEY (trigger_run_id, revision),
+    FOREIGN KEY (trigger_run_id)
+        REFERENCES auto_adaptation_triggers(trigger_run_id)
 );
 
 CREATE TABLE IF NOT EXISTS governance_reviews (

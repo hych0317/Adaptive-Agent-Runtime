@@ -10,6 +10,7 @@ from adaptive_agent_runtime.orchestration.errors import OrchestrationStateError
 from adaptive_agent_runtime import AgentState
 from adaptive_agent_runtime.orchestration.graph import DynamicTaskGraph
 from adaptive_agent_runtime.orchestration.recovery import RecoveryRecord
+from adaptive_agent_runtime.governance.models import GovernanceTarget, RuntimeCommitPermit
 
 
 class InMemoryTaskGraphStore:
@@ -19,7 +20,15 @@ class InMemoryTaskGraphStore:
         self._current: dict[UUID, TaskGraphCheckpoint] = {}
         self._history: defaultdict[UUID, list[TaskGraphCheckpoint]] = defaultdict(list)
 
-    async def save(self, checkpoint: TaskGraphCheckpoint) -> None:
+    async def save(
+        self,
+        checkpoint: TaskGraphCheckpoint,
+        *,
+        permit: RuntimeCommitPermit | None = None,
+        target: GovernanceTarget | None = None,
+        subject_fingerprint: str | None = None,
+    ) -> None:
+        del permit, target, subject_fingerprint
         current = self._current.get(checkpoint.run_id)
         if current is not None:
             if checkpoint.checkpoint_revision < current.checkpoint_revision:
@@ -57,8 +66,11 @@ class InMemoryGraphDecisionCommitter:
         graph: DynamicTaskGraph,
         effect_fingerprint: str,
         recovery_record: RecoveryRecord | None = None,
+        permit: RuntimeCommitPermit | None = None,
+        target: GovernanceTarget | None = None,
+        subject_fingerprint: str | None = None,
     ) -> DynamicTaskGraph:
-        del recovery_record
+        del recovery_record, permit, target, subject_fingerprint
         key = (state.run_id, effect_fingerprint)
         prior = self._commits.get(key)
         if prior is not None and prior != graph:

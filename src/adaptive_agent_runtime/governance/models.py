@@ -390,6 +390,20 @@ class GovernanceAuthorization(GovernanceModel):
     operation: str = Field(min_length=1)
     target: GovernanceTarget
     issued_at: AwareDatetime
+    integrity_seal: str | None = Field(default=None, min_length=64, max_length=64)
+
+
+class RuntimeCommitPermit(GovernanceModel):
+    """Unforgeable, fingerprint-bound capability for one authoritative commit."""
+
+    authorization_id: UUID
+    request_id: UUID
+    decision_id: UUID
+    operation: str = Field(min_length=1)
+    target: GovernanceTarget
+    subject_fingerprint: str = Field(min_length=64, max_length=64)
+    issued_at: AwareDatetime
+    integrity_seal: str = Field(min_length=64, max_length=64)
 
 
 class AuthorizationUse(GovernanceModel):

@@ -1,4 +1,8 @@
-"""Proposal-only optimization; no Runtime mutation or approval logic."""
+"""Legacy/test-only Phase 5 proposal demo.
+
+This compatibility implementation is not part of Research default composition
+and is not the governed Phase 4-A Optimization Proposal lifecycle.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +17,7 @@ from adaptive_agent_runtime.evaluation.models import (
 
 
 class ConservativeOptimizationAgent:
+    """Legacy deterministic test fixture; never a default Runtime decision."""
     module_id = "evaluation.optimization_agent.conservative"
 
     def propose(

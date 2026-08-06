@@ -17,17 +17,19 @@ from adaptive_agent_runtime.evaluation import (
     OptimizationProposal,
 )
 from adaptive_agent_runtime.evolution import (
-    ConfigurationPatchPlanner,
     DeterministicReplayValidator,
-    InMemoryEvolutionStore,
     OptimizationApplicationStatus,
-    OptimizationDeploymentService,
     ReplayCase,
     ReplayExecutionResult,
     ReplayValidationError,
     RuntimeConfigurationSnapshot,
     RuntimeReplayRunner,
     UnsupportedOptimizationError,
+)
+from adaptive_agent_runtime.evolution.apply import (
+    ConfigurationPatchPlanner,
+    InMemoryEvolutionStore,
+    OptimizationDeploymentService,
 )
 from adaptive_agent_runtime.governance import (
     BoundGovernedOperation,
@@ -36,12 +38,14 @@ from adaptive_agent_runtime.governance import (
     GovernanceAuthorizationIssuer,
     GovernedOperationExecutor,
     HumanReviewDecision,
-    OptimizationGovernanceAdapter,
-    OptimizationRollbackGovernanceAdapter,
     ReviewOutcome,
     RuntimeGovernanceEvaluator,
     StrictAuthorizationVerifier,
     default_governance_policy,
+)
+from adaptive_agent_runtime.legacy.optimization_governance import (
+    LegacyOptimizationApplyGovernanceAdapter,
+    LegacyOptimizationRollbackGovernanceAdapter,
 )
 from adaptive_agent_runtime.orchestration import (
     DynamicTaskGraph,
@@ -52,6 +56,7 @@ from adaptive_agent_runtime.orchestration import (
     TaskNode,
 )
 from adaptive_agent_runtime.persistence import SQLitePersistence
+from adaptive_agent_runtime.persistence.evolution import SQLiteEvolutionStore
 
 
 def proposal(*, recover: bool = True) -> OptimizationProposal:
@@ -149,7 +154,7 @@ def replay_case(*, baseline_score: float = 0.0) -> ReplayCase:
 
 class OptimizationEvolutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_configuration_key_is_rejected_before_replay(self) -> None:
-        store = InMemoryEvolutionStore()
+        store = InMemoryEvolutionStore(allow_legacy_mutations=True)
         await store.initialize(
             RuntimeConfigurationSnapshot(
                 component="orchestration",
@@ -165,13 +170,14 @@ class OptimizationEvolutionTests(unittest.IsolatedAsyncioTestCase):
             change_planner=ConfigurationPatchPlanner(),
             replay_runner=RuntimeReplayRunner(AgentRuntimeReplayExecutor()),
             validator=DeterministicReplayValidator(),
+            allow_legacy_mutations=True,
         )
 
         with self.assertRaises(UnsupportedOptimizationError):
             await service.prepare(unsupported, (replay_case(),))
 
     async def test_replay_regression_blocks_configuration_mutation(self) -> None:
-        store = InMemoryEvolutionStore()
+        store = InMemoryEvolutionStore(allow_legacy_mutations=True)
         baseline = RuntimeConfigurationSnapshot(
             component="orchestration",
             version=0,
@@ -183,6 +189,7 @@ class OptimizationEvolutionTests(unittest.IsolatedAsyncioTestCase):
             change_planner=ConfigurationPatchPlanner(),
             replay_runner=RuntimeReplayRunner(FixedRegressionReplayExecutor()),
             validator=DeterministicReplayValidator(),
+            allow_legacy_mutations=True,
         )
         deployment = await service.prepare(
             proposal(),
@@ -207,17 +214,22 @@ class OptimizationEvolutionTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as directory:
             path = f"{directory}/evolution.sqlite3"
             first = SQLitePersistence(path)
-            await first.evolution_store.initialize(baseline)
-            await first.evolution_store.save(case)
+            first_evolution = SQLiteEvolutionStore(
+                first.database,
+                allow_legacy_mutations=True,
+            )
+            await first_evolution.initialize(baseline)
+            await first_evolution.save(case)
             service = OptimizationDeploymentService(
-                store=first.evolution_store,
+                store=first_evolution,
                 change_planner=ConfigurationPatchPlanner(),
                 replay_runner=RuntimeReplayRunner(AgentRuntimeReplayExecutor()),
                 validator=DeterministicReplayValidator(),
+                allow_legacy_mutations=True,
             )
             deployment = await service.prepare(
                 candidate_proposal,
-                await first.evolution_store.list_all(),
+                await first_evolution.list_all(),
             )
             self.assertTrue(deployment.validation.passed)
             self.assertGreater(
@@ -225,7 +237,7 @@ class OptimizationEvolutionTests(unittest.IsolatedAsyncioTestCase):
                 deployment.validation.baseline_score,
             )
 
-            request = OptimizationGovernanceAdapter().to_request(
+            request = LegacyOptimizationApplyGovernanceAdapter().to_request(
                 candidate_proposal
             )
             evaluator = RuntimeGovernanceEvaluator(
@@ -280,7 +292,11 @@ class OptimizationEvolutionTests(unittest.IsolatedAsyncioTestCase):
             first.close()
 
             reopened = SQLitePersistence(path)
-            active = await reopened.evolution_store.load_active(
+            reopened_evolution = SQLiteEvolutionStore(
+                reopened.database,
+                allow_legacy_mutations=True,
+            )
+            active = await reopened_evolution.load_active(
                 "orchestration"
             )
             self.assertEqual(active, deployment.candidate)
@@ -288,12 +304,12 @@ class OptimizationEvolutionTests(unittest.IsolatedAsyncioTestCase):
             replayed = await AgentRuntimeReplayExecutor().execute(case, active)
             self.assertTrue(replayed.succeeded)
 
-            persisted_application = await reopened.evolution_store.load_application(
+            persisted_application = await reopened_evolution.load_application(
                 application.application_id
             )
             self.assertEqual(persisted_application, application)
             assert persisted_application is not None
-            rollback_request = OptimizationRollbackGovernanceAdapter().to_request(
+            rollback_request = LegacyOptimizationRollbackGovernanceAdapter().to_request(
                 persisted_application
             )
             rollback_evaluator = RuntimeGovernanceEvaluator(
@@ -327,10 +343,11 @@ class OptimizationEvolutionTests(unittest.IsolatedAsyncioTestCase):
                 rollback_final,
             )
             reopened_service = OptimizationDeploymentService(
-                store=reopened.evolution_store,
+                store=reopened_evolution,
                 change_planner=ConfigurationPatchPlanner(),
                 replay_runner=RuntimeReplayRunner(AgentRuntimeReplayExecutor()),
                 validator=DeterministicReplayValidator(),
+                allow_legacy_mutations=True,
             )
 
             async def rollback():  # type: ignore[no-untyped-def]
@@ -357,12 +374,12 @@ class OptimizationEvolutionTests(unittest.IsolatedAsyncioTestCase):
                 OptimizationApplicationStatus.ROLLED_BACK,
             )
             self.assertEqual(
-                await reopened.evolution_store.load_active("orchestration"),
+                await reopened_evolution.load_active("orchestration"),
                 baseline,
             )
             self.assertEqual(
                 len(
-                    await reopened.evolution_store.application_history(
+                    await reopened_evolution.application_history(
                         application.application_id
                     )
                 ),

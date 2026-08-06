@@ -109,6 +109,7 @@ class TaskPlanningRequest(LLMModel):
     available_strategies: tuple[str, ...] = Field(min_length=1)
     available_execution_capability_ids: tuple[str, ...] = ()
     evidence: tuple[EvidenceReference, ...] = ()
+    committed_memory_recall_bundle: ImmutableJsonValue | None = None
 
     @model_validator(mode="after")
     def validate_request(self) -> TaskPlanningRequest:

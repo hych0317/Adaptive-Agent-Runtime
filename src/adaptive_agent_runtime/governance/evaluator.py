@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
+from typing import TYPE_CHECKING
 from uuid import UUID
+
+if TYPE_CHECKING:
+    from adaptive_agent_runtime.governance.enforcement import (
+        HMACCommitPermitAuthority,
+    )
 
 from adaptive_agent_runtime.governance.contracts import (
     ConfidenceEvaluator,
@@ -281,8 +287,10 @@ class GovernanceAuthorizationIssuer:
         self,
         *,
         clock: Callable[[], datetime] = utc_now,
+        authority: HMACCommitPermitAuthority | None = None,
     ) -> None:
         self._clock = clock
+        self._authority = authority
 
     def issue(
         self,
@@ -307,7 +315,7 @@ class GovernanceAuthorizationIssuer:
             request.request_id,
             decision.decision_id,
         )
-        return GovernanceAuthorization(
+        authorization = GovernanceAuthorization(
             authorization_id=authorization_id,
             request_id=request.request_id,
             request_fingerprint=request_fingerprint,
@@ -317,4 +325,9 @@ class GovernanceAuthorizationIssuer:
             operation=request.operation,
             target=request.target,
             issued_at=self._clock(),
+        )
+        return (
+            self._authority.seal_authorization(authorization)
+            if self._authority is not None
+            else authorization
         )

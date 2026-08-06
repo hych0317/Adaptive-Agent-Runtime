@@ -6,6 +6,7 @@ from typing import Protocol, Sequence, runtime_checkable
 from uuid import UUID
 
 from adaptive_agent_runtime import RuntimeModule
+from adaptive_agent_runtime.governance.models import GovernanceTarget, RuntimeCommitPermit
 from adaptive_agent_runtime.context_memory.context_models import (
     ContextArchiveReference,
     ContextAssembly,
@@ -23,6 +24,7 @@ from adaptive_agent_runtime.context_memory.memory_models import (
     MemoryUnit,
     MemoryUpdateResult,
     MemoryBatchWrite,
+    MemoryBatchCommitReceipt,
 )
 
 
@@ -75,6 +77,41 @@ class ContextArchive(RuntimeModule, Protocol):
         self,
         context_id: UUID,
     ) -> ContextArchiveReference | None: ...
+
+
+@runtime_checkable
+class ContextCompressionTransaction(RuntimeModule, Protocol):
+    """Atomic persistence seam for Archive + resident Context transitions."""
+
+    async def stage_compression(
+        self,
+        unit: ContextUnit,
+        *,
+        reference: ContextArchiveReference,
+        effect_fingerprint: str,
+        source_fingerprint: str,
+    ) -> ContextArchiveReference: ...
+
+    async def commit_compression(
+        self,
+        source: ContextUnit,
+        compressed: ContextUnit,
+        *,
+        reference: ContextArchiveReference,
+        effect_fingerprint: str,
+        source_fingerprint: str,
+        permit: RuntimeCommitPermit,
+        target: GovernanceTarget,
+        subject_fingerprint: str,
+    ) -> ContextUnit: ...
+
+    async def verify_compression(
+        self,
+        unit: ContextUnit,
+        *,
+        effect_fingerprint: str,
+        source_fingerprint: str,
+    ) -> bool: ...
 
 
 @runtime_checkable
@@ -156,12 +193,20 @@ class MemoryStore(RuntimeModule, Protocol):
         writes: tuple[MemoryBatchWrite, ...],
         *,
         effect_fingerprint: str,
+        permit: RuntimeCommitPermit | None = None,
+        target: GovernanceTarget | None = None,
+        subject_fingerprint: str | None = None,
     ) -> tuple[MemoryUnit, ...]: ...
 
     async def load_applied_effect(
         self,
         effect_fingerprint: str,
     ) -> tuple[MemoryUnit, ...] | None: ...
+
+    async def load_batch_receipt(
+        self,
+        effect_fingerprint: str,
+    ) -> MemoryBatchCommitReceipt | None: ...
 
 
 @runtime_checkable
@@ -176,6 +221,9 @@ class MemoryConsolidation(RuntimeModule, Protocol):
         candidates: tuple[MemoryCandidate, ...],
         *,
         effect_fingerprint: str,
+        permit: RuntimeCommitPermit | None = None,
+        target: GovernanceTarget | None = None,
+        subject_fingerprint: str | None = None,
     ) -> tuple[MemoryUpdateResult, ...]: ...
 
 

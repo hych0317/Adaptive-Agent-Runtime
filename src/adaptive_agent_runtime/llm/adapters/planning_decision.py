@@ -96,6 +96,9 @@ class PlannerTaskRequestAdapter:
             available_strategies=strategies,
             available_execution_capability_ids=capabilities,
             evidence=evidence,
+            committed_memory_recall_bundle=content.get(
+                "committed_memory_recall_bundle"
+            ),
         )
 
     @staticmethod

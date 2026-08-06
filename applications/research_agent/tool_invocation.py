@@ -24,6 +24,7 @@ from adaptive_agent_runtime.decisioning import (
     DecisionResultStatus,
     DecisionTarget,
     InMemoryDecisionCheckpointStore,
+    NormalizedDecisionEffect,
     PolicyAgentContextBuilder,
     ProjectionSource,
     ProjectionSources,
@@ -35,12 +36,15 @@ from adaptive_agent_runtime.governance import (
     DecisionGovernanceBinding,
     GovernanceAuthorizationIssuer,
     GovernanceEvaluator,
+    GovernanceTarget,
     GovernedDecisionApplier,
     GovernedOperationExecutor,
     HumanReviewDecision,
     HumanReviewService,
     ReviewOutcome,
     RuntimeDecisionGovernanceAdapter,
+    RuntimeCommitPermit,
+    governance_fingerprint,
 )
 from adaptive_agent_runtime.llm import (
     BoundToolInvocationProposalProducer,
@@ -56,7 +60,7 @@ from adaptive_agent_runtime.tool_ecosystem import (
     CapabilityRequest,
     CapabilityRequirement,
     ToolExecutionPolicy,
-    ToolExecutor,
+    PermitBoundToolExecutor,
     ToolIntegrationError,
     ToolInvocation,
     ToolInvocationDecisionOutcome,
@@ -185,7 +189,7 @@ class ResearchToolInvocationDecisionHandler:
         resolver: CapabilityCandidateResolver,
         selector: ToolSelector | None = None,
         selection_handler: ToolSelectionDecisionHandler | None = None,
-        executor: ToolExecutor,
+        executor: PermitBoundToolExecutor,
         governance: GovernanceEvaluator,
         reviews: HumanReviewService,
         issuer: GovernanceAuthorizationIssuer,
@@ -382,9 +386,22 @@ class ResearchToolInvocationDecisionHandler:
         recording_issuer = RecordingAuthorizationIssuer(self._issuer)
 
         async def apply_effect(effect: ToolInvocationEffect) -> JsonValue:
+            raise RuntimeError("raw Tool execution requires a Runtime Permit")
+
+        async def apply_authorized_effect(
+            normalized: NormalizedDecisionEffect[ToolInvocationEffect],
+            permit: RuntimeCommitPermit,
+        ) -> JsonValue:
+            effect = normalized.payload
             observation = await self._executor.execute(
                 effect.invocation,
                 self._execution_policy,
+                permit=permit,
+                target=GovernanceTarget(
+                    target_type=normalized.target.target_type,
+                    target_id=normalized.target.target_id,
+                ),
+                subject_fingerprint=governance_fingerprint(normalized),
             )
             return observation.model_dump(mode="json")
 
@@ -415,6 +432,7 @@ class ResearchToolInvocationDecisionHandler:
             applier=GovernedDecisionApplier(
                 executor=self._operation_executor,
                 apply_effect=apply_effect,
+                apply_authorized_effect=apply_authorized_effect,
             ),
             checkpoint_store=self._checkpoint_store,
             checkpoint_type=DecisionCheckpoint[

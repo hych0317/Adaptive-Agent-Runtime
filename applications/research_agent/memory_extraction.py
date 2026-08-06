@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from collections.abc import Mapping
 from typing import Any, TYPE_CHECKING
 from uuid import UUID
 
@@ -59,12 +60,14 @@ from adaptive_agent_runtime.governance import (
     DecisionGovernanceBinding,
     GovernanceAuthorizationIssuer,
     GovernanceEvaluator,
+    GovernanceTarget,
     GovernedDecisionApplier,
     GovernedOperationExecutor,
     HumanReviewDecision,
     HumanReviewService,
     ReviewOutcome,
     RuntimeDecisionGovernanceAdapter,
+    RuntimeCommitPermit,
     governance_fingerprint,
 )
 from adaptive_agent_runtime.llm import (
@@ -195,11 +198,11 @@ class ResearchMemoryExtractionDecisionHandler:
             if unit.metadata.source is not ContextSource.OBSERVATION:
                 continue
             content = unit.content
-            if not isinstance(content, dict):
+            if not isinstance(content, Mapping):
                 continue
             metadata = content.get("metadata")
-            tool = metadata.get("tool") if isinstance(metadata, dict) else None
-            invocation_id = tool.get("invocation_id") if isinstance(tool, dict) else None
+            tool = metadata.get("tool") if isinstance(metadata, Mapping) else None
+            invocation_id = tool.get("invocation_id") if isinstance(tool, Mapping) else None
             if not isinstance(invocation_id, str) or invocation_id not in successful_ids:
                 continue
             reference = unit.metadata.source_reference or str(unit.context_id)
@@ -399,12 +402,19 @@ class ResearchMemoryExtractionDecisionHandler:
                 "memory_ids": [str(item.memory.memory_id) for item in updates],
             }
 
-        async def apply_normalized_effect(
+        async def apply_authorized_effect(
             normalized: NormalizedDecisionEffect[MemoryExtractionEffect],
+            permit: RuntimeCommitPermit,
         ) -> JsonValue:
             batch = await self._consolidator.consolidate_batch(
                 normalized.payload.candidates,
                 effect_fingerprint=normalized.effect_fingerprint,
+                permit=permit,
+                target=GovernanceTarget(
+                    target_type=normalized.target.target_type,
+                    target_id=normalized.target.target_id,
+                ),
+                subject_fingerprint=governance_fingerprint(normalized),
             )
             updates.clear()
             updates.extend(batch)
@@ -482,7 +492,7 @@ class ResearchMemoryExtractionDecisionHandler:
             applier=GovernedDecisionApplier(
                 executor=self._operation_executor,
                 apply_effect=apply_effect,
-                apply_normalized_effect=apply_normalized_effect,
+                apply_authorized_effect=apply_authorized_effect,
                 reconcile_effect=reconcile_effect,
             ),
             checkpoint_store=self._checkpoint_store,

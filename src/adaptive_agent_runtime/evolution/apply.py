@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from uuid import UUID
 
 from adaptive_agent_runtime.context_memory.json_types import utc_now
-from adaptive_agent_runtime.evaluation import OptimizationProposal
+from adaptive_agent_runtime.evaluation.models import OptimizationProposal
 from adaptive_agent_runtime.evolution.contracts import (
     OptimizationChangePlanner,
     ReplayCaseStore,
@@ -15,6 +15,7 @@ from adaptive_agent_runtime.evolution.contracts import (
     RuntimeConfigurationStore,
 )
 from adaptive_agent_runtime.evolution.errors import (
+    EvolutionBoundaryError,
     EvolutionConflictError,
     ReplayValidationError,
     UnsupportedOptimizationError,
@@ -95,7 +96,8 @@ class ConfigurationPatchPlanner:
 class InMemoryEvolutionStore:
     module_id = "evolution.store.in_memory"
 
-    def __init__(self) -> None:
+    def __init__(self, *, allow_legacy_mutations: bool = False) -> None:
+        self._allow_legacy_mutations = allow_legacy_mutations
         self._configurations: dict[
             tuple[str, int], RuntimeConfigurationSnapshot
         ] = {}
@@ -108,6 +110,7 @@ class InMemoryEvolutionStore:
         self._cases: dict[UUID, ReplayCase] = {}
 
     async def initialize(self, snapshot: RuntimeConfigurationSnapshot) -> None:
+        self._require_legacy_mutation_access()
         existing_version = self._active.get(snapshot.component)
         if existing_version is not None:
             existing = self._configurations[(snapshot.component, existing_version)]
@@ -130,6 +133,7 @@ class InMemoryEvolutionStore:
         self,
         deployment: OptimizationDeployment,
     ) -> OptimizationApplication:
+        self._require_legacy_mutation_access()
         if not deployment.validation.passed:
             raise ReplayValidationError("candidate failed Replay validation")
         current = await self.load_active(deployment.baseline.component)
@@ -162,6 +166,7 @@ class InMemoryEvolutionStore:
         self,
         application_id: UUID,
     ) -> OptimizationApplication:
+        self._require_legacy_mutation_access()
         current = self._applications.get(application_id)
         if current is None:
             raise EvolutionConflictError("Optimization application was not found")
@@ -207,6 +212,12 @@ class InMemoryEvolutionStore:
     ) -> tuple[OptimizationApplication, ...]:
         return tuple(self._application_history.get(application_id, ()))
 
+    def _require_legacy_mutation_access(self) -> None:
+        if not self._allow_legacy_mutations:
+            raise EvolutionBoundaryError(
+                "legacy Evolution mutation is disabled during Phase 4-A"
+            )
+
 
 class OptimizationDeploymentService:
     """Prepare with Replay; mutate configuration only through apply/rollback."""
@@ -220,11 +231,13 @@ class OptimizationDeploymentService:
         change_planner: OptimizationChangePlanner,
         replay_runner: RuntimeReplayRunner,
         validator: ReplayValidationPolicy,
+        allow_legacy_mutations: bool = False,
     ) -> None:
         self._store = store
         self._change_planner = change_planner
         self._replay_runner = replay_runner
         self._validator = validator
+        self._allow_legacy_mutations = allow_legacy_mutations
 
     async def prepare(
         self,
@@ -261,6 +274,7 @@ class OptimizationDeploymentService:
         self,
         deployment: OptimizationDeployment,
     ) -> OptimizationApplication:
+        self._require_legacy_mutation_access()
         if not deployment.validation.passed:
             raise ReplayValidationError(
                 "Optimization candidate cannot apply after failed Replay"
@@ -271,4 +285,11 @@ class OptimizationDeploymentService:
         self,
         application_id: UUID,
     ) -> OptimizationApplication:
+        self._require_legacy_mutation_access()
         return await self._store.rollback(application_id)
+
+    def _require_legacy_mutation_access(self) -> None:
+        if not self._allow_legacy_mutations:
+            raise EvolutionBoundaryError(
+                "legacy Optimization Apply/Rollback is disabled during Phase 4-A"
+            )

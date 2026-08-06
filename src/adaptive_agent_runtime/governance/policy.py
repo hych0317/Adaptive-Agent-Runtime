@@ -127,5 +127,85 @@ def default_governance_policy() -> GovernancePolicy:
                 risk_levels=(RiskLevel.LOW,),
                 priority=100,
             ),
+            GovernanceRule(
+                rule_id="allow.low_risk.memory_recall_commit",
+                description=(
+                    "Allow an immutable, scope-filtered Memory Recall Bundle commit."
+                ),
+                effect=RuleEffect.ALLOW,
+                scopes=(GovernanceScope.STATE,),
+                operations=("memory.recall.commit",),
+                risk_levels=(RiskLevel.LOW,),
+                priority=100,
+            ),
+            GovernanceRule(
+                rule_id="allow.low_risk.experience_metadata_commit",
+                description=(
+                    "Allow append-only, Runtime-evidenced Experience Metadata."
+                ),
+                effect=RuleEffect.ALLOW,
+                scopes=(GovernanceScope.STATE,),
+                operations=("experience.metadata.commit",),
+                risk_levels=(RiskLevel.LOW,),
+                priority=100,
+            ),
+            GovernanceRule(
+                rule_id="allow.low_risk.decision_feedback_commit",
+                description=(
+                    "Allow append-only, non-behavioral Decision outcome feedback."
+                ),
+                effect=RuleEffect.ALLOW,
+                scopes=(GovernanceScope.STATE,),
+                operations=("decision.feedback.commit",),
+                risk_levels=(RiskLevel.LOW,),
+                priority=100,
+            ),
+            GovernanceRule(
+                rule_id="allow.low_risk.learning_insight_commit",
+                description=(
+                    "Allow append-only, non-behavioral cross-run Learning Insights."
+                ),
+                effect=RuleEffect.ALLOW,
+                scopes=(GovernanceScope.STATE,),
+                operations=("learning.insight.commit",),
+                risk_levels=(RiskLevel.LOW,),
+                priority=100,
+            ),
+            GovernanceRule(
+                rule_id="allow.low_risk.optimization_proposal_commit",
+                description=(
+                    "Allow append-only Optimization Proposal storage without "
+                    "configuration activation or Runtime behavior change."
+                ),
+                effect=RuleEffect.ALLOW,
+                scopes=(GovernanceScope.EVOLUTION,),
+                operations=("optimization.proposal.commit",),
+                risk_levels=(RiskLevel.LOW,),
+                priority=100,
+            ),
+            GovernanceRule(
+                rule_id="allow.bounded.optimization_apply_commit",
+                description=(
+                    "Allow an explicit, reversible planner.max_nodes activation "
+                    "whose final Effect is bound to the active baseline."
+                ),
+                effect=RuleEffect.ALLOW,
+                scopes=(GovernanceScope.EVOLUTION,),
+                operations=("optimization.apply.commit",),
+                risk_levels=(RiskLevel.MEDIUM,),
+                priority=100,
+            ),
+            GovernanceRule(
+                rule_id="allow.explicit.optimization_rollback_commit",
+                description=(
+                    "Allow explicit restoration of a prior immutable Runtime "
+                    "configuration snapshot as a new revision."
+                ),
+                effect=RuleEffect.ALLOW,
+                scopes=(GovernanceScope.EVOLUTION,),
+                operations=("optimization.rollback.commit",),
+                risk_levels=(RiskLevel.LOW,),
+                priority=100,
+            ),
         ),
     )

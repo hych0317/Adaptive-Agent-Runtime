@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from adaptive_agent_runtime.evaluation import EvaluationReport, EvaluationSubject
+from adaptive_agent_runtime.evaluation.models import EvaluationReport, EvaluationSubject
 from adaptive_agent_runtime.evolution.models import ReplayCase, stable_evolution_id
 
 
@@ -51,4 +51,3 @@ class EvaluationReplayCaseFactory:
             minimum_score=minimum_score,
             created_at=report.created_at,
         )
-

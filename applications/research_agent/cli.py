@@ -151,12 +151,12 @@ def format_result(result: ResearchRunResult) -> str:
         lines.append(
             f"  - {pattern.pattern_key}: {pattern.root_cause.description}"
         )
-    lines.append(
-        f"- Optimization Proposals: {len(result.optimization_proposals)} "
-        f"(evidence runs={result.evaluation_history_runs})"
-    )
+    lines.append(f"- Stored Optimization Proposals: {len(result.optimization_proposals)}")
     for proposal in result.optimization_proposals:
-        lines.append(f"  - {proposal.change_kind}: {proposal.expected_benefit}")
+        lines.append(
+            f"  - {proposal.target_key.value}: {proposal.current_value} -> "
+            f"{proposal.proposed_value} (proposal only)"
+        )
 
     lines.extend(["", "5. Governance Decisions"])
     for record in result.governance_records:

@@ -13,8 +13,6 @@ from adaptive_agent_runtime.context_memory.memory_models import (
     MemoryCandidate,
     MemoryEvolutionType,
 )
-from adaptive_agent_runtime.evaluation.models import OptimizationProposal
-from adaptive_agent_runtime.evolution.models import OptimizationApplication
 from adaptive_agent_runtime.governance.models import (
     ConfidenceSignals,
     GovernanceCorrelation,
@@ -190,123 +188,6 @@ class MemoryGovernanceAdapter:
                 "evidence_count": len(candidate.evidence),
             },
             requested_at=candidate.created_at,
-        )
-
-
-class OptimizationGovernanceAdapter:
-    module_id = "governance.adapter.optimization"
-
-    def to_request(
-        self,
-        proposal: OptimizationProposal,
-        *,
-        history: GovernanceHistory | None = None,
-    ) -> GovernanceRequest:
-        risk = RiskLevel.HIGH
-        effective_history = history or GovernanceHistory()
-        evidence = tuple(
-            GovernanceEvidence(
-                evidence_id=f"pattern:{pattern_id}",
-                kind="evaluation.failure_pattern",
-                source="agent_evaluation",
-                reliability=proposal.proposal_confidence,
-                summary="Failure Pattern supporting an Optimization Proposal.",
-            )
-            for pattern_id in proposal.source_pattern_ids
-        ) + tuple(
-            GovernanceEvidence(
-                evidence_id=f"candidate:{candidate_id}",
-                kind="evaluation.optimization_candidate",
-                source="agent_evaluation",
-                reliability=proposal.proposal_confidence,
-                summary="Optimization Candidate supporting the Proposal.",
-            )
-            for candidate_id in proposal.source_candidate_ids
-        )
-        return GovernanceRequest(
-            request_id=stable_governance_id(
-                self.module_id,
-                proposal.proposal_id,
-                proposal.model_dump_json(),
-                risk.value,
-                effective_history.successful_similar,
-                effective_history.failed_similar,
-                effective_history.prior_denials,
-            ),
-            scope=GovernanceScope.EVOLUTION,
-            operation="optimization.apply",
-            target=GovernanceTarget(
-                target_type="optimization_proposal",
-                target_id=str(proposal.proposal_id),
-            ),
-            risk=risk,
-            signals=ConfidenceSignals(
-                stated_confidence=proposal.proposal_confidence,
-                evidence=evidence,
-                impact=ImpactAssessment(
-                    score=0.9,
-                    reversible=bool(proposal.rollback_plan),
-                    description="Impact of changing Runtime behavior or policy.",
-                ),
-                history=effective_history,
-            ),
-            attributes={
-                SUBJECT_FINGERPRINT_ATTRIBUTE: governance_fingerprint(proposal),
-                "proposal_id": str(proposal.proposal_id),
-                "target_component": proposal.target_component.value,
-                "change_kind": proposal.change_kind,
-                "source_pattern_ids": [
-                    str(item) for item in proposal.source_pattern_ids
-                ],
-                "source_candidate_ids": [
-                    str(item) for item in proposal.source_candidate_ids
-                ],
-            },
-            requested_at=proposal.created_at,
-        )
-
-
-class OptimizationRollbackGovernanceAdapter:
-    """Govern rollback as a separate, one-shot Evolution mutation."""
-
-    module_id = "governance.adapter.optimization_rollback"
-
-    def to_request(
-        self,
-        application: OptimizationApplication,
-        *,
-        history: GovernanceHistory | None = None,
-    ) -> GovernanceRequest:
-        effective_history = history or GovernanceHistory()
-        return GovernanceRequest(
-            request_id=stable_governance_id(
-                self.module_id,
-                application.application_id,
-                application.revision,
-                governance_fingerprint(application),
-            ),
-            scope=GovernanceScope.EVOLUTION,
-            operation="optimization.rollback",
-            target=GovernanceTarget(
-                target_type="optimization_application",
-                target_id=str(application.application_id),
-            ),
-            risk=RiskLevel.HIGH,
-            signals=ConfidenceSignals(
-                stated_confidence=1.0,
-                impact=ImpactAssessment(
-                    score=0.7,
-                    reversible=True,
-                    description="Restore the replayed configuration baseline.",
-                ),
-                history=effective_history,
-            ),
-            attributes={
-                SUBJECT_FINGERPRINT_ATTRIBUTE: governance_fingerprint(application),
-                "application_id": str(application.application_id),
-                "candidate_version": application.deployment.candidate.version,
-                "baseline_version": application.deployment.baseline.version,
-            },
         )
 
 

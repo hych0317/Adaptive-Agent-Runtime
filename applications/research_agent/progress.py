@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
-from adaptive_agent_runtime import InMemoryTraceSink, RuntimeEvent, TraceEntry
+from adaptive_agent_runtime import RuntimeEvent, TraceEntry, TraceSink
 
 
 def utc_now() -> datetime:
@@ -62,7 +62,7 @@ class ObservableTraceSink:
 
     def __init__(
         self,
-        primary: InMemoryTraceSink,
+        primary: TraceSink,
         progress: ResearchProgressSink,
     ) -> None:
         self._primary = primary
@@ -165,6 +165,18 @@ def progress_events_from_trace(entry: TraceEntry) -> tuple[ResearchProgressEvent
                 progress.extend(
                     _mutation_events(event.run_id, event.occurred_at, entry.sequence, mutations)
                 )
+
+    if event.kind == "orchestration.graph_mutated":
+        mutations = payload.get("mutations")
+        if isinstance(mutations, (tuple, list)):
+            progress.extend(
+                _mutation_events(
+                    event.run_id,
+                    event.occurred_at,
+                    entry.sequence,
+                    mutations,
+                )
+            )
 
     if event.kind == "runtime.completed":
         progress.append(

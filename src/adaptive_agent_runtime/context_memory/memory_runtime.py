@@ -25,7 +25,10 @@ from adaptive_agent_runtime.context_memory.memory_models import (
     MemoryUnit,
     MemoryUpdateResult,
     MemoryBatchWrite,
+    MemoryBatchCommitReceipt,
 )
+from adaptive_agent_runtime.decisioning import decision_fingerprint
+from adaptive_agent_runtime.governance.models import GovernanceTarget, RuntimeCommitPermit
 
 
 _MEMORY_NAMESPACE = uuid5(
@@ -85,6 +88,8 @@ class InMemoryMemoryStore:
         self._history: defaultdict[UUID, list[MemoryUnit]] = defaultdict(list)
         self._applied_candidates: dict[UUID, MemoryUnit] = {}
         self._applied_effects: dict[str, tuple[MemoryUnit, ...]] = {}
+        self._effect_payloads: dict[str, str] = {}
+        self._batch_receipts: dict[str, MemoryBatchCommitReceipt] = {}
 
     async def save(
         self,
@@ -140,9 +145,18 @@ class InMemoryMemoryStore:
         writes: tuple[MemoryBatchWrite, ...],
         *,
         effect_fingerprint: str,
+        permit: RuntimeCommitPermit | None = None,
+        target: GovernanceTarget | None = None,
+        subject_fingerprint: str | None = None,
     ) -> tuple[MemoryUnit, ...]:
+        del permit, target, subject_fingerprint
+        payload_fingerprint = decision_fingerprint(writes)
         applied_effect = self._applied_effects.get(effect_fingerprint)
         if applied_effect is not None:
+            if self._effect_payloads[effect_fingerprint] != payload_fingerprint:
+                raise MemorySnapshotConflictError(
+                    "Memory Effect fingerprint was reused with another batch"
+                )
             return applied_effect
         current = dict(self._current)
         history = {key: list(value) for key, value in self._history.items()}
@@ -178,6 +192,13 @@ class InMemoryMemoryStore:
         self._applied_candidates = applied_candidates
         result = tuple(committed)
         self._applied_effects[effect_fingerprint] = result
+        self._effect_payloads[effect_fingerprint] = payload_fingerprint
+        self._batch_receipts[effect_fingerprint] = MemoryBatchCommitReceipt(
+            effect_fingerprint=effect_fingerprint,
+            payload_fingerprint=payload_fingerprint,
+            result_fingerprint=decision_fingerprint(result),
+            memory_count=len(result),
+        )
         return result
 
     async def load_applied_effect(
@@ -185,6 +206,12 @@ class InMemoryMemoryStore:
         effect_fingerprint: str,
     ) -> tuple[MemoryUnit, ...] | None:
         return self._applied_effects.get(effect_fingerprint)
+
+    async def load_batch_receipt(
+        self,
+        effect_fingerprint: str,
+    ) -> MemoryBatchCommitReceipt | None:
+        return self._batch_receipts.get(effect_fingerprint)
 
     def history_for(self, memory_id: UUID) -> tuple[MemoryUnit, ...]:
         return tuple(self._history.get(memory_id, ()))
@@ -228,6 +255,9 @@ class EvidenceDrivenMemoryConsolidator:
         candidates: tuple[MemoryCandidate, ...],
         *,
         effect_fingerprint: str,
+        permit: RuntimeCommitPermit | None = None,
+        target: GovernanceTarget | None = None,
+        subject_fingerprint: str | None = None,
     ) -> tuple[MemoryUpdateResult, ...]:
         if not candidates:
             raise MemoryConsolidationError("memory batch cannot be empty")
@@ -265,7 +295,11 @@ class EvidenceDrivenMemoryConsolidator:
             )
             results.append(result)
         committed = await self._store.save_batch(
-            tuple(writes), effect_fingerprint=effect_fingerprint
+            tuple(writes),
+            effect_fingerprint=effect_fingerprint,
+            permit=permit,
+            target=target,
+            subject_fingerprint=subject_fingerprint,
         )
         if tuple(item.memory for item in results) != committed:
             raise MemoryConsolidationError("Memory batch failed authoritative read-back")
@@ -286,6 +320,9 @@ class EvidenceDrivenMemoryConsolidator:
                 condition=candidate.condition,
                 evidence=candidate.evidence,
                 confidence=strength,
+                scope=candidate.scope,
+                sensitivity=candidate.sensitivity,
+                expires_at=candidate.expires_at,
                 last_candidate_id=candidate.candidate_id,
                 last_candidate_fingerprint=fingerprint,
                 created_at=candidate.created_at,
@@ -313,6 +350,14 @@ class EvidenceDrivenMemoryConsolidator:
             raise MemoryConsolidationError(
                 "candidate memory_key does not match its target"
             )
+        if (
+            current.scope != candidate.scope
+            or current.sensitivity is not candidate.sensitivity
+            or current.expires_at != candidate.expires_at
+        ):
+            raise MemoryConsolidationError(
+                "candidate cannot change Memory access metadata"
+            )
         additions = _new_evidence(current, candidate)
         if candidate.evolution is MemoryEvolutionType.SUPPORT:
             if current.content != candidate.content or current.condition != candidate.condition:
@@ -335,6 +380,9 @@ class EvidenceDrivenMemoryConsolidator:
                 condition=candidate.condition,
                 evidence=(*current.evidence, *additions),
                 confidence=strength,
+                scope=candidate.scope,
+                sensitivity=candidate.sensitivity,
+                expires_at=candidate.expires_at,
                 last_candidate_id=candidate.candidate_id,
                 last_candidate_fingerprint=fingerprint,
             )
@@ -385,6 +433,9 @@ class EvidenceDrivenMemoryConsolidator:
                 condition=candidate.condition,
                 evidence=candidate.evidence,
                 confidence=strength,
+                scope=candidate.scope,
+                sensitivity=candidate.sensitivity,
+                expires_at=candidate.expires_at,
                 last_candidate_id=candidate.candidate_id,
                 last_candidate_fingerprint=fingerprint,
                 created_at=candidate.created_at,
@@ -410,6 +461,14 @@ class EvidenceDrivenMemoryConsolidator:
         if current.memory_key != candidate.memory_key:
             raise MemoryConsolidationError(
                 "candidate memory_key does not match its target"
+            )
+        if (
+            current.scope != candidate.scope
+            or current.sensitivity is not candidate.sensitivity
+            or current.expires_at != candidate.expires_at
+        ):
+            raise MemoryConsolidationError(
+                "candidate cannot change Memory access metadata"
             )
 
         additions = _new_evidence(current, candidate)

@@ -3,13 +3,34 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from types import MappingProxyType
 from uuid import UUID
 
-from adaptive_agent_runtime.orchestration import DynamicTaskGraph, TaskNode
-from adaptive_agent_runtime.persistence import SQLiteDatabase
+from adaptive_agent_runtime.decisioning import decision_fingerprint
+from adaptive_agent_runtime.orchestration import (
+    DynamicTaskGraph,
+    TaskGraphCheckpoint,
+    TaskNode,
+    TaskNodeStatus,
+)
+from adaptive_agent_runtime.persistence import (
+    SQLiteDatabase,
+    WorkspaceArtifactCommitReceipt,
+)
+from adaptive_agent_runtime.optimization import RuntimeConfigurationSnapshot
 
 from applications.research_agent.tasks import ResearchTaskDefinition
+
+
+@dataclass(frozen=True)
+class ResearchPersistenceIdentity:
+    database_path: str
+    adapter_database_paths: tuple[tuple[str, str], ...]
+
+    @property
+    def is_persistent(self) -> bool:
+        return self.database_path != ":memory:"
 
 
 class SQLiteResearchRunManifestStore:
@@ -25,6 +46,7 @@ class SQLiteResearchRunManifestStore:
         run_id: UUID,
         task: str,
         definition: ResearchTaskDefinition,
+        configuration_snapshot: RuntimeConfigurationSnapshot,
     ) -> None:
         payload = json.dumps(
             {
@@ -35,6 +57,9 @@ class SQLiteResearchRunManifestStore:
                     role: node.model_dump(mode="json")
                     for role, node in definition.nodes.items()
                 },
+                "configuration_snapshot": configuration_snapshot.model_dump(
+                    mode="json"
+                ),
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -56,7 +81,13 @@ class SQLiteResearchRunManifestStore:
                 (self.application_id, str(run_id), payload),
             )
 
-    def load(self, run_id: UUID) -> tuple[str, ResearchTaskDefinition] | None:
+    def load(
+        self, run_id: UUID
+    ) -> tuple[
+        str,
+        ResearchTaskDefinition,
+        RuntimeConfigurationSnapshot | None,
+    ] | None:
         with self._database.reader() as cursor:
             row = cursor.execute(
                 "SELECT manifest_json FROM application_run_manifests "
@@ -77,4 +108,148 @@ class SQLiteResearchRunManifestStore:
                 initial_graph=DynamicTaskGraph.model_validate(payload["initial_graph"]),
                 nodes=MappingProxyType(nodes),
             ),
+            (
+                RuntimeConfigurationSnapshot.model_validate(
+                    payload["configuration_snapshot"]
+                )
+                if payload.get("configuration_snapshot") is not None
+                else None
+            ),
         )
+
+
+class SQLiteReportDispatchReconciler:
+    """Reopen only a report dispatch whose exact Decision Effect is committed."""
+
+    module_id = "research_agent.report_dispatch_reconciler.sqlite"
+
+    def __init__(self, database: SQLiteDatabase) -> None:
+        self._database = database
+
+    async def reconcile(self, run_id: UUID) -> bool:
+        with self._database.transaction() as cursor:
+            row = cursor.execute(
+                "SELECT checkpoint_json FROM task_graph_checkpoints WHERE run_id = ?",
+                (str(run_id),),
+            ).fetchone()
+            if row is None:
+                return False
+            checkpoint = TaskGraphCheckpoint.model_validate_json(
+                row["checkpoint_json"]
+            )
+            reopened_ids: set[UUID] = set()
+            for in_flight in checkpoint.in_flight:
+                artifact_row = cursor.execute(
+                    "SELECT artifact_json, receipt_json FROM workspace_artifacts "
+                    "WHERE run_id = ? AND node_id = ? AND artifact_type = ?",
+                    (str(run_id), str(in_flight.node_id), "research_report"),
+                ).fetchone()
+                if artifact_row is None:
+                    continue
+                artifact = json.loads(artifact_row["artifact_json"])
+                receipt = WorkspaceArtifactCommitReceipt.model_validate_json(
+                    artifact_row["receipt_json"]
+                )
+                request_id = receipt.source_decision_request_id
+                proposal_id = receipt.source_proposal_id
+                if (
+                    request_id is None
+                    or proposal_id is None
+                    or receipt.run_id != run_id
+                    or receipt.node_id != in_flight.node_id
+                    or receipt.artifact_fingerprint != decision_fingerprint(artifact)
+                ):
+                    raise RuntimeError(
+                        "report Artifact receipt is not bound to its persisted content"
+                    )
+                decision_row = cursor.execute(
+                    "SELECT checkpoints.checkpoint_json "
+                    "FROM decision_checkpoint_current AS current "
+                    "JOIN decision_checkpoints AS checkpoints "
+                    "ON checkpoints.request_id = current.request_id "
+                    "AND checkpoints.revision = current.revision "
+                    "WHERE current.request_id = ?",
+                    (str(request_id),),
+                ).fetchone()
+                if decision_row is None:
+                    raise RuntimeError(
+                        "report Artifact has no durable source Decision"
+                    )
+                decision = json.loads(decision_row["checkpoint_json"])
+                validated = decision.get("validated_decision") or {}
+                normalized = validated.get("normalized_effect") or {}
+                request = decision.get("request") or {}
+                proposal = decision.get("proposal") or {}
+                if (
+                    decision.get("stage") not in {"applying", "completed"}
+                    or request.get("decision_type") != "artifact.report_commit"
+                    or request.get("request_id") != str(request_id)
+                    or (request.get("target") or {}).get("target_id")
+                    != f"{run_id}:{in_flight.node_id}"
+                    or proposal.get("proposal_id") != str(proposal_id)
+                    or normalized.get("effect_fingerprint")
+                    != receipt.effect_fingerprint
+                ):
+                    raise RuntimeError(
+                        "report dispatch reconciliation proof is inconsistent"
+                    )
+                reopened_ids.add(in_flight.node_id)
+            if not reopened_ids:
+                return False
+            nodes = tuple(
+                node.model_copy(
+                    update={
+                        "status": TaskNodeStatus.PENDING,
+                        "observation": None,
+                        "failure_reason": None,
+                    }
+                )
+                if node.node_id in reopened_ids
+                else node
+                for node in checkpoint.graph.nodes
+            )
+            graph = DynamicTaskGraph(
+                graph_id=checkpoint.graph.graph_id,
+                version=checkpoint.graph.version,
+                nodes=nodes,
+            )
+            reconciled = checkpoint.model_copy(
+                update={
+                    "graph": graph,
+                    "in_flight": tuple(
+                        item
+                        for item in checkpoint.in_flight
+                        if item.node_id not in reopened_ids
+                    ),
+                    "checkpoint_revision": checkpoint.checkpoint_revision + 1,
+                }
+            )
+            payload = json.dumps(
+                reconciled.model_dump(mode="json"),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            cursor.execute(
+                "INSERT INTO task_graph_checkpoint_journal "
+                "(run_id, checkpoint_revision, graph_version, state_revision, "
+                "checkpoint_json) VALUES (?, ?, ?, ?, ?)",
+                (
+                    str(run_id),
+                    reconciled.checkpoint_revision,
+                    reconciled.graph.version,
+                    reconciled.state_revision,
+                    payload,
+                ),
+            )
+            cursor.execute(
+                "UPDATE task_graph_checkpoints SET graph_version = ?, "
+                "state_revision = ?, checkpoint_json = ? WHERE run_id = ?",
+                (
+                    reconciled.graph.version,
+                    reconciled.state_revision,
+                    payload,
+                    str(run_id),
+                ),
+            )
+        return True

@@ -88,12 +88,16 @@ def _dynamic_node_ids(result: ResearchRunResult) -> set[str]:
     dynamic: set[str] = set()
     for entry in result.runtime_trace:
         payload = entry.event.payload
-        mutations = _nested(
-            payload,
-            "observation",
-            "metadata",
-            "orchestration",
-            "mutations",
+        mutations = (
+            payload.get("mutations")
+            if entry.event.kind == "orchestration.graph_mutated"
+            else _nested(
+                payload,
+                "observation",
+                "metadata",
+                "orchestration",
+                "mutations",
+            )
         )
         if not isinstance(mutations, (tuple, list)):
             continue
@@ -246,15 +250,16 @@ def build_research_view(
         "optimizationProposals": [
             {
                 "id": str(item.proposal_id),
-                "component": item.target_component.value,
-                "changeKind": item.change_kind,
-                "benefit": item.expected_benefit,
-                "confidence": item.proposal_confidence,
-                "status": item.status.value,
+                "scope": _value(item.scope),
+                "targetKey": item.target_key.value,
+                "currentValue": _value(item.current_value),
+                "proposedValue": _value(item.proposed_value),
+                "expectedImpact": item.expected_impact,
+                "risk": item.risk_classification.value,
+                "effectFingerprint": item.effect_fingerprint,
             }
             for item in result.optimization_proposals
         ],
-        "historyRuns": result.evaluation_history_runs,
     }
 
     authorization_uses = {
@@ -523,10 +528,14 @@ class ResearchConsoleApplication:
             )
         )
         if resolved_mode is ResearchInformationMode.FIXTURE_DEMO:
-            result = await ResearchAgent().run_demo(
-                task,
-                progress_sink=progress_sink,
-            )
+            agent = ResearchAgent()
+            try:
+                result = await agent.run_demo(
+                    task,
+                    progress_sink=progress_sink,
+                )
+            finally:
+                agent.close()
             inference_label = "Deterministic Runtime · Fixture Demo"
         else:
             if llm_config is None:
@@ -544,10 +553,14 @@ class ResearchConsoleApplication:
                     f"LLM preflight failed: {probe.availability.value} "
                     f"({diagnostics})"
                 )
-            result = await ResearchAgent(
+            agent = ResearchAgent(
                 cognitive_capabilities=deployment.cognitive_capabilities,
                 information_mode=ResearchInformationMode.LLM_RESEARCH,
-            ).run(task, progress_sink=progress_sink)
+            )
+            try:
+                result = await agent.run(task, progress_sink=progress_sink)
+            finally:
+                agent.close()
             inference_label = self.inference_label
         return build_research_view(
             result,

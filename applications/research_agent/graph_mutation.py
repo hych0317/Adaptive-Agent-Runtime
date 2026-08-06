@@ -8,7 +8,7 @@ from uuid import UUID
 
 from pydantic import JsonValue
 
-from adaptive_agent_runtime import AgentState, Observation, TraceSink
+from adaptive_agent_runtime import AgentState, Observation, RuntimeEvent, TraceSink
 from adaptive_agent_runtime.context_memory import (
     ContextAssembly,
     ContextLayer,
@@ -45,24 +45,32 @@ from adaptive_agent_runtime.governance import (
     DecisionGovernanceBinding,
     GovernanceAuthorizationIssuer,
     GovernanceEvaluator,
+    GovernanceTarget,
     GovernedDecisionApplier,
     GovernedOperationExecutor,
     HumanReviewDecision,
     HumanReviewService,
     ReviewOutcome,
     RuntimeDecisionGovernanceAdapter,
+    RuntimeCommitPermit,
     governance_fingerprint,
 )
 from adaptive_agent_runtime.llm import (
+    CapabilityInvocationMetadata,
+    CapabilityTurnKind,
+    CapabilityTurnResult,
     GRAPH_MUTATION_EVIDENCE_SOURCE_TYPE,
     GRAPH_MUTATION_INPUT_SOURCE_TYPE,
     EvidenceReference,
     GraphMutationEffectNormalizer,
+    GraphMutationOperationDraft,
+    GraphMutationOperationKind,
     GraphMutationProposalCapability,
     GraphMutationProposalDraft,
     GraphMutationProposalProducer,
     GraphMutationProposalRequest,
     InferenceCorrelation,
+    TaskNodeDraft,
 )
 from adaptive_agent_runtime.orchestration import (
     GRAPH_MUTATION_APPLY_OPERATION,
@@ -87,6 +95,7 @@ from applications.research_agent.report import GovernanceRecord
 from applications.research_agent.tasks import (
     COMPANY_RESEARCH,
     NEWS_ANALYSIS,
+    RISK_REVIEW,
     RESEARCH_NODE_ROLES,
     RESEARCH_STRATEGY_ID,
     REVIEW_STRATEGY_ID,
@@ -114,6 +123,63 @@ class _FixedGraphMutationBasisProvider:
         return self._basis
 
 
+class DeterministicResearchGraphMutationCapability:
+    """Provider-neutral fallback that still proposes through Decision Lifecycle."""
+
+    module_id = "research_agent.graph_mutation.deterministic_proposal"
+    capability_id = "research_graph_mutation_deterministic"
+
+    def __init__(self, workspace: ResearchWorkspace) -> None:
+        self._workspace = workspace
+
+    async def propose_mutations(
+        self,
+        request: GraphMutationProposalRequest,
+        *,
+        invocation: CapabilityInvocationMetadata | None = None,
+    ) -> CapabilityTurnResult[GraphMutationProposalDraft]:
+        del invocation
+        if request.trigger_node_key != COMPANY_RESEARCH:
+            raise ValueError("deterministic mutation requires company discovery")
+        if NEWS_ANALYSIS not in request.allowed_new_node_keys:
+            raise ValueError("Runtime did not allow the news_analysis branch")
+        evidence_id = request.evidence[0].reference_id
+        news = self._workspace.definition.node(NEWS_ANALYSIS)
+        return CapabilityTurnResult[GraphMutationProposalDraft](
+            kind=CapabilityTurnKind.COMPLETED,
+            result=GraphMutationProposalDraft(
+                operations=(
+                    GraphMutationOperationDraft(
+                        kind=GraphMutationOperationKind.ADD_NODE,
+                        node=TaskNodeDraft(
+                            node_key=NEWS_ANALYSIS,
+                            goal=news.goal,
+                            dependency_keys=(COMPANY_RESEARCH,),
+                            expected_output=news.expected_output,
+                            requested_strategy_id=RESEARCH_STRATEGY_ID,
+                        ),
+                        reason=(
+                            "Company discovery identified a news-review requirement."
+                        ),
+                        evidence_reference_ids=(evidence_id,),
+                    ),
+                    GraphMutationOperationDraft(
+                        kind=GraphMutationOperationKind.ADD_DEPENDENCY,
+                        node_key=RISK_REVIEW,
+                        dependency_key=NEWS_ANALYSIS,
+                        reason=(
+                            "Risk review must include the newly discovered news evidence."
+                        ),
+                        evidence_reference_ids=(evidence_id,),
+                    ),
+                ),
+                rationale=(
+                    "Apply the documented bounded news branch after company discovery."
+                ),
+            ),
+        )
+
+
 class ResearchGraphMutationDecisionHandler:
     module_id = "research_agent.graph_mutation_decision_handler"
 
@@ -121,7 +187,7 @@ class ResearchGraphMutationDecisionHandler:
         self,
         *,
         capability: GraphMutationProposalCapability,
-        context_projection: ResearchContextProjection,
+        context_projection: ResearchContextProjection | None,
         execution_policy: GraphMutationExecutionPolicy,
         governance: GovernanceEvaluator,
         reviews: HumanReviewService,
@@ -129,6 +195,7 @@ class ResearchGraphMutationDecisionHandler:
         operation_executor: GovernedOperationExecutor,
         trace_sink: TraceSink,
         workspace: ResearchWorkspace,
+        record_agent_proposal: bool = True,
         checkpoint_store: DecisionCheckpointStore[
             GraphMutationDecisionPayload,
             GraphMutationProposalDraft,
@@ -145,6 +212,7 @@ class ResearchGraphMutationDecisionHandler:
         self._operation_executor = operation_executor
         self._trace_sink = trace_sink
         self._workspace = workspace
+        self._record_agent_proposal = record_agent_proposal
         self._checkpoint_store = checkpoint_store or InMemoryDecisionCheckpointStore()
 
     async def handle(
@@ -159,6 +227,11 @@ class ResearchGraphMutationDecisionHandler:
         committer = committer or InMemoryGraphDecisionCommitter()
         source_node = graph.get_node(source_node_id)
         if self._workspace.role_for(source_node) != COMPANY_RESEARCH:
+            return None
+        news_node_id = self._workspace.definition.node(NEWS_ANALYSIS).node_id
+        if news_node_id in {node.node_id for node in graph.nodes}:
+            # A Planner Agent may include the allowlisted branch in its initial
+            # governed graph. Dynamic mutation is then unnecessary.
             return None
         units = tuple(
             unit
@@ -187,26 +260,42 @@ class ResearchGraphMutationDecisionHandler:
             semantic_context=semantic,
             used_tokens=used_tokens,
         )
-        package = self._context_projection.project(assembly)
-        if not package.blocks:
-            raise RuntimeError("Graph Mutation Context policy omitted all evidence")
-        self._workspace.llm_context_packages.append(package)
-        evidence = tuple(
-            EvidenceReference(
-                reference_id=f"context:{block.context_id}",
-                kind="tool.observation",
-                summary="Policy-approved company research observation.",
-                reliability=1.0,
+        if self._context_projection is None:
+            evidence = tuple(
+                EvidenceReference(
+                    reference_id=f"context:{unit.context_id}",
+                    kind="tool.observation",
+                    summary="Runtime-accepted company research observation.",
+                    reliability=1.0,
+                )
+                for unit in ordered
             )
-            for block in package.blocks
-        )
+            projected_trigger: JsonValue = {
+                "accepted_context_ids": [str(unit.context_id) for unit in ordered],
+                "accepted_output_present": observation.output is not None,
+            }
+        else:
+            package = self._context_projection.project(assembly)
+            if not package.blocks:
+                raise RuntimeError("Graph Mutation Context policy omitted all evidence")
+            self._workspace.llm_context_packages.append(package)
+            evidence = tuple(
+                EvidenceReference(
+                    reference_id=f"context:{block.context_id}",
+                    kind="tool.observation",
+                    summary="Policy-approved company research observation.",
+                    reliability=1.0,
+                )
+                for block in package.blocks
+            )
+            projected_trigger = {
+                "context_package": package.model_dump(mode="json"),
+                "accepted_output_present": observation.output is not None,
+            }
         proposal_request = GraphMutationProposalRequest(
             task=state.task.description,
             trigger_node_key=COMPANY_RESEARCH,
-            trigger_observation={
-                "context_package": package.model_dump(mode="json"),
-                "accepted_output_present": observation.output is not None,
-            },
+            trigger_observation=projected_trigger,
             existing_node_keys=tuple(
                 role for role in RESEARCH_NODE_ROLES if role != NEWS_ANALYSIS
             ),
@@ -334,8 +423,9 @@ class ResearchGraphMutationDecisionHandler:
                 "mutation_ids": [str(item.mutation_id) for item in effect.mutations],
             }
 
-        async def apply_normalized_effect(
+        async def apply_authorized_effect(
             normalized: NormalizedDecisionEffect[GraphMutationEffect],
+            permit: RuntimeCommitPermit,
         ) -> JsonValue:
             nonlocal applied_graph
             effect = normalized.payload
@@ -344,6 +434,12 @@ class ResearchGraphMutationDecisionHandler:
                 state=state,
                 graph=candidate,
                 effect_fingerprint=normalized.effect_fingerprint,
+                permit=permit,
+                target=GovernanceTarget(
+                    target_type=normalized.target.target_type,
+                    target_id=normalized.target.target_id,
+                ),
+                subject_fingerprint=governance_fingerprint(normalized),
             )
             return {
                 "graph_id": str(applied_graph.graph_id),
@@ -418,7 +514,7 @@ class ResearchGraphMutationDecisionHandler:
             applier=GovernedDecisionApplier(
                 executor=self._operation_executor,
                 apply_effect=apply_effect,
-                apply_normalized_effect=apply_normalized_effect,
+                apply_authorized_effect=apply_authorized_effect,
                 reconcile_effect=reconcile_effect,
             ),
             checkpoint_store=self._checkpoint_store,
@@ -471,7 +567,10 @@ class ResearchGraphMutationDecisionHandler:
             or recording_evaluator.final is None
         ):
             raise RuntimeError("Graph Mutation Governance record is incomplete")
-        self._workspace.graph_mutation_proposals.append(checkpoint.proposal.payload)
+        if self._record_agent_proposal:
+            self._workspace.graph_mutation_proposals.append(
+                checkpoint.proposal.payload
+            )
         self._workspace.governance_records.append(
             GovernanceRecord(
                 scenario="graph_mutation",
@@ -483,6 +582,22 @@ class ResearchGraphMutationDecisionHandler:
             )
         )
         effect = checkpoint.validated_decision.normalized_effect.payload
+        await self._trace_sink.record(
+            RuntimeEvent(
+                run_id=state.run_id,
+                kind="orchestration.graph_mutated",
+                source=self.module_id,
+                payload={
+                    "request_id": str(request.request_id),
+                    "effect_fingerprint": (
+                        checkpoint.validated_decision.normalized_effect.effect_fingerprint
+                    ),
+                    "mutations": [
+                        item.model_dump(mode="json") for item in effect.mutations
+                    ],
+                },
+            )
+        )
         return GraphMutationDecisionOutcome(
             request_id=request.request_id,
             effect=effect,

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from collections.abc import Callable
 from typing import Any
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import Field, JsonValue
 
@@ -53,6 +54,7 @@ from adaptive_agent_runtime.governance import (
     HumanReviewService,
     ReviewOutcome,
     RuntimeDecisionGovernanceAdapter,
+    RuntimeCommitPermit,
     governance_fingerprint,
 )
 from adaptive_agent_runtime.persistence import (
@@ -92,6 +94,7 @@ class ReportArtifactEffect(DecisionModel):
     provenance: tuple[str, ...] = Field(min_length=1)
     draft_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     basis_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_proposal_id: UUID
 
 
 class _FixedBasisProvider:
@@ -152,6 +155,7 @@ class _EffectNormalizer:
             provenance=proposal.payload.provenance,
             draft_fingerprint=request.payload.draft_fingerprint,
             basis_fingerprint=request.basis.snapshot_fingerprint,
+            source_proposal_id=proposal.proposal_id,
         )
         return NormalizedDecisionEffect.create(
             payload=effect,
@@ -180,6 +184,7 @@ class ResearchReportDecisionHandler:
         checkpoint_store: DecisionCheckpointStore[
             ReportDecisionPayload, ReportDraft, ReportArtifactEffect
         ] | None = None,
+        fault_injector: Callable[..., None] | None = None,
     ) -> None:
         self._committer = committer
         self._governance = governance
@@ -188,6 +193,7 @@ class ResearchReportDecisionHandler:
         self._operation_executor = operation_executor
         self._trace_sink = trace_sink
         self._checkpoint_store = checkpoint_store or InMemoryDecisionCheckpointStore()
+        self._fault_injector = fault_injector
 
     async def commit(
         self,
@@ -197,7 +203,11 @@ class ResearchReportDecisionHandler:
         node_id: UUID,
         report: ResearchReport,
         provenance: tuple[str, ...],
-    ) -> tuple[ResearchReport, WorkspaceArtifactCommitReceipt, GovernanceRecord]:
+    ) -> tuple[
+        ResearchReport,
+        WorkspaceArtifactCommitReceipt,
+        GovernanceRecord | None,
+    ]:
         draft = ReportDraft(report=report, provenance=provenance)
         draft_fingerprint = decision_fingerprint(draft)
         basis = DecisionBasis(
@@ -219,6 +229,10 @@ class ResearchReportDecisionHandler:
             provenance=provenance,
         )
         request = DecisionRequest(
+            request_id=uuid5(
+                NAMESPACE_URL,
+                f"research-report:{run_id}:{node_id}:{draft_fingerprint}",
+            ),
             decision_type=REPORT_COMMIT_DECISION_TYPE,
             target=DecisionTarget(
                 target_type="workspace_report",
@@ -296,18 +310,23 @@ class ResearchReportDecisionHandler:
             nonlocal committed_receipt
             raise RuntimeError("Report Apply requires normalized effect fingerprint")
 
-        async def apply_normalized(
+        async def apply_authorized(
             normalized: NormalizedDecisionEffect[ReportArtifactEffect],
+            permit: RuntimeCommitPermit,
         ) -> JsonValue:
             nonlocal committed_receipt
             effect = normalized.payload
-            committed_receipt = self._committer.commit(
+            committed_receipt = await self._committer.commit(
                 run_id=effect.run_id,
                 node_id=effect.node_id,
                 artifact_type="research_report",
                 effect_fingerprint=normalized.effect_fingerprint,
                 artifact=effect.report.model_dump(mode="json"),
                 provenance=effect.provenance,
+                source_decision_request_id=request.request_id,
+                source_proposal_id=effect.source_proposal_id,
+                permit=permit,
+                subject_fingerprint=governance_fingerprint(normalized),
             )
             readback = self._committer.load_by_effect(normalized.effect_fingerprint)
             if readback is None or readback[1] != committed_receipt:
@@ -327,6 +346,8 @@ class ResearchReportDecisionHandler:
             if (
                 artifact != normalized.payload.report.model_dump(mode="json")
                 or receipt.artifact_fingerprint != decision_fingerprint(artifact)
+                or receipt.source_decision_request_id != request.request_id
+                or receipt.source_proposal_id != normalized.payload.source_proposal_id
             ):
                 return DecisionReconciliation(
                     status=DecisionReconciliationStatus.UNKNOWN,
@@ -361,7 +382,7 @@ class ResearchReportDecisionHandler:
             applier=GovernedDecisionApplier(
                 executor=self._operation_executor,
                 apply_effect=apply_effect,
-                apply_normalized_effect=apply_normalized,
+                apply_authorized_effect=apply_authorized,
                 reconcile_effect=reconcile,
             ),
             checkpoint_store=self._checkpoint_store,
@@ -369,6 +390,7 @@ class ResearchReportDecisionHandler:
                 ReportDecisionPayload, ReportDraft, ReportArtifactEffect
             ],
             trace_writer=RuntimeDecisionTraceWriter(self._trace_sink),
+            fault_injector=self._fault_injector,
         )
         checkpoint = await coordinator.run(request, sources=sources, policy=policy)
         if checkpoint.stage is DecisionCheckpointStage.REVIEW_PENDING:
@@ -401,15 +423,10 @@ class ResearchReportDecisionHandler:
             checkpoint.result is None
             or checkpoint.result.status is not DecisionResultStatus.APPLIED
             or committed_receipt is None
-            or evaluator.request is None
-            or evaluator.preliminary is None
-            or evaluator.final is None
         ):
             reason = checkpoint.result.reason if checkpoint.result else checkpoint.stage
             raise RuntimeError(f"Report Decision did not commit: {reason}")
-        return (
-            report,
-            committed_receipt,
+        governance_record = (
             GovernanceRecord(
                 scenario="report_commit",
                 request=evaluator.request,
@@ -417,5 +434,42 @@ class ResearchReportDecisionHandler:
                 final=evaluator.final,
                 authorization=issuer.authorization,
                 review=evaluator.review,
-            ),
+            )
+            if evaluator.request is not None
+            and evaluator.preliminary is not None
+            and evaluator.final is not None
+            else None
+        )
+        return (
+            report,
+            committed_receipt,
+            governance_record,
+        )
+
+    async def resume_existing(
+        self,
+        *,
+        run_id: UUID,
+        task_id: UUID,
+        node_id: UUID,
+        provenance: tuple[str, ...],
+    ) -> tuple[
+        ResearchReport,
+        WorkspaceArtifactCommitReceipt,
+        GovernanceRecord | None,
+    ] | None:
+        persisted = self._committer.load(
+            run_id=run_id,
+            node_id=node_id,
+            artifact_type="research_report",
+        )
+        if persisted is None:
+            return None
+        report = ResearchReport.model_validate(persisted[0])
+        return await self.commit(
+            run_id=run_id,
+            task_id=task_id,
+            node_id=node_id,
+            report=report,
+            provenance=provenance,
         )

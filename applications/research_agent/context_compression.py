@@ -60,6 +60,7 @@ from adaptive_agent_runtime.governance import (
     GovernanceAuthorizationIssuer,
     GovernanceDecision,
     GovernanceEvaluator,
+    GovernanceTarget,
     GovernanceRequest,
     GovernedDecisionApplier,
     GovernedOperationExecutor,
@@ -68,6 +69,7 @@ from adaptive_agent_runtime.governance import (
     ReviewOutcome,
     ReviewRequest,
     RuntimeDecisionGovernanceAdapter,
+    RuntimeCommitPermit,
     governance_fingerprint,
 )
 from adaptive_agent_runtime.llm import (
@@ -423,8 +425,9 @@ class ResearchContextCompressionDecisionHandler:
                 "estimated_tokens": effect.estimated_tokens,
             }
 
-        async def apply_normalized_effect(
+        async def apply_authorized_effect(
             normalized: NormalizedDecisionEffect[ContextCompressionEffect],
+            permit: RuntimeCommitPermit,
         ) -> JsonValue:
             effect = normalized.payload
             await self._validate_current_effect(effect)
@@ -435,6 +438,12 @@ class ResearchContextCompressionDecisionHandler:
                 current,
                 effect,
                 effect_fingerprint=normalized.effect_fingerprint,
+                permit=permit,
+                target=GovernanceTarget(
+                    target_type=normalized.target.target_type,
+                    target_id=normalized.target.target_id,
+                ),
+                subject_fingerprint=governance_fingerprint(normalized),
             )
             return {
                 "context_id": str(committed.context_id),
@@ -451,12 +460,14 @@ class ResearchContextCompressionDecisionHandler:
             committed = await self._committer.load_effect(
                 effect.context_id,
                 normalized.effect_fingerprint,
+                source_fingerprint=effect.source_snapshot_fingerprint,
             )
             if committed is not None:
                 if (
                     committed.revision != effect.source_revision + 1
                     or committed.metadata.estimated_tokens != effect.estimated_tokens
                     or committed.content != effect.content
+                    or committed.recovery_reference is None
                 ):
                     return DecisionReconciliation(
                         status=DecisionReconciliationStatus.UNKNOWN,
@@ -520,7 +531,7 @@ class ResearchContextCompressionDecisionHandler:
             applier=GovernedDecisionApplier(
                 executor=self._operation_executor,
                 apply_effect=apply_effect,
-                apply_normalized_effect=apply_normalized_effect,
+                apply_authorized_effect=apply_authorized_effect,
                 reconcile_effect=reconcile_effect,
             ),
             checkpoint_store=self._checkpoint_store,

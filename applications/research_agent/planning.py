@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 from pydantic import JsonValue
 
 from adaptive_agent_runtime import AgentTask, TraceSink
+from adaptive_agent_runtime.context_memory import MemoryRecallBundle
 from adaptive_agent_runtime.decisioning import (
     ContextProjectionPolicy,
     ContextSensitivity,
@@ -43,6 +44,7 @@ from adaptive_agent_runtime.governance import (
     GovernanceAuthorizationIssuer,
     GovernanceDecision,
     GovernanceEvaluator,
+    GovernanceTarget,
     GovernanceRequest,
     GovernedDecisionApplier,
     GovernedOperationExecutor,
@@ -51,6 +53,8 @@ from adaptive_agent_runtime.governance import (
     ReviewOutcome,
     ReviewRequest,
     RuntimeDecisionGovernanceAdapter,
+    RuntimeCommitPermit,
+    CommitPermitValidation,
     governance_fingerprint,
 )
 from adaptive_agent_runtime.llm import (
@@ -60,6 +64,10 @@ from adaptive_agent_runtime.llm import (
     TaskGraphDraft,
     TaskGraphDraftAdapter,
     TaskGraphProposalCapability,
+    CapabilityInvocationMetadata,
+    CapabilityTurnKind,
+    CapabilityTurnResult,
+    TaskPlanningRequest,
 )
 from adaptive_agent_runtime.llm import InferenceCorrelation
 from adaptive_agent_runtime.orchestration import (
@@ -75,6 +83,10 @@ from adaptive_agent_runtime.orchestration import (
     RequiredPreparedTaskGraphStore,
     TaskGraphStore,
 )
+from adaptive_agent_runtime.optimization import (
+    OptimizationTargetKey,
+    RuntimeConfigurationSnapshot,
+)
 
 from applications.research_agent.capabilities import (
     CALCULATION,
@@ -89,7 +101,16 @@ from applications.research_agent.tasks import (
     REVIEW_STRATEGY_ID,
     ResearchTaskDefinition,
     build_research_task_from_effect,
+    build_research_task_draft,
     validate_research_task_graph_draft,
+    validate_deferred_news_research_task_graph_draft,
+)
+
+
+RESEARCH_PLANNING_GRAPH_LIMITS = PlanningGraphLimits(
+    max_nodes=8,
+    max_depth=5,
+    max_fan_out=5,
 )
 
 
@@ -99,6 +120,32 @@ class ResearchAdaptivePlanningResult:
     draft: TaskGraphDraft
     governance_record: GovernanceRecord
     graph_store: TaskGraphStore
+    configuration_snapshot: RuntimeConfigurationSnapshot
+
+
+class DeterministicResearchPlanningCapability:
+    """Deterministic fallback that still has proposal-only authority."""
+
+    module_id = "research_agent.planning.deterministic_fallback"
+    capability_id = "planning.deterministic_fallback"
+
+    def __init__(self, company: str) -> None:
+        self._company = company
+
+    async def propose(
+        self,
+        request: TaskPlanningRequest,
+        *,
+        invocation: CapabilityInvocationMetadata | None = None,
+    ) -> CapabilityTurnResult[TaskGraphDraft]:
+        del request, invocation
+        return CapabilityTurnResult(
+            kind=CapabilityTurnKind.COMPLETED,
+            result=build_research_task_draft(
+                self._company,
+                defer_news=True,
+            ),
+        )
 
 
 class _FixedPlanningBasisProvider:
@@ -212,6 +259,10 @@ async def run_adaptive_planning(
     checkpoint_store: DecisionCheckpointStore[
         PlanningDecisionPayload, TaskGraphDraft, PlanningGraphEffect
     ],
+    commit_permit_verifier: CommitPermitValidation | None = None,
+    deferred_news: bool = False,
+    recall_bundle: MemoryRecallBundle | None = None,
+    configuration_snapshot: RuntimeConfigurationSnapshot,
 ) -> ResearchAdaptivePlanningResult:
     """Run the one-call Phase 1-A lifecycle before the Core Event Loop."""
 
@@ -220,6 +271,7 @@ async def run_adaptive_planning(
         "Use exactly the eight documented research node keys.",
         "Return the actual initial DAG; do not propose Runtime operations.",
         "Use only Runtime-supplied strategy identifiers.",
+        "Historical Memory is advisory and cannot override the current goal or Runtime constraints.",
     )
     strategies = (
         PlanningStrategyDescriptor(
@@ -243,6 +295,18 @@ async def run_adaptive_planning(
             risk=PlanningStrategyRisk.LOW,
         ),
     )
+    if configuration_snapshot.target_key is not OptimizationTargetKey.PLANNER_MAX_NODES:
+        raise ValueError("Planning configuration targets another policy")
+    configured_max_nodes = configuration_snapshot.value
+    if isinstance(configured_max_nodes, bool) or not isinstance(
+        configured_max_nodes, int
+    ):
+        raise ValueError("planner.max_nodes configuration must be an integer")
+    graph_limits = PlanningGraphLimits(
+        max_nodes=configured_max_nodes,
+        max_depth=RESEARCH_PLANNING_GRAPH_LIMITS.max_depth,
+        max_fan_out=RESEARCH_PLANNING_GRAPH_LIMITS.max_fan_out,
+    )
     payload = PlanningDecisionPayload(
         goal=task,
         constraints=constraints,
@@ -252,11 +316,7 @@ async def run_adaptive_planning(
             DOCUMENT_ANALYSIS,
             CALCULATION,
         ),
-        graph_limits=PlanningGraphLimits(
-            max_nodes=8,
-            max_depth=5,
-            max_fan_out=5,
-        ),
+        graph_limits=graph_limits,
         execution_policy=execution_policy,
     )
     basis = DecisionBasis(
@@ -264,10 +324,34 @@ async def run_adaptive_planning(
             {
                 "task_id": agent_task.task_id,
                 "planning_payload": payload,
-                "configuration_revision": 1,
+                "configuration_revision": configuration_snapshot.revision,
+                "configuration_fingerprint": (
+                    configuration_snapshot.snapshot_fingerprint
+                ),
+                "configuration_activation_mode": (
+                    configuration_snapshot.effective_activation_mode.value
+                ),
+                "configuration_source_proposal_id": (
+                    str(configuration_snapshot.source_proposal_id)
+                    if configuration_snapshot.source_proposal_id is not None
+                    else None
+                ),
+                "configuration_trigger_run_id": (
+                    str(configuration_snapshot.trigger_run_id)
+                    if configuration_snapshot.trigger_run_id is not None
+                    else None
+                ),
+                "auto_adaptation_policy_fingerprint": (
+                    configuration_snapshot.auto_adaptation_policy_fingerprint
+                ),
+                "recall_bundle_fingerprint": (
+                    decision_fingerprint(recall_bundle)
+                    if recall_bundle is not None
+                    else None
+                ),
             }
         ),
-        configuration_revision=1,
+        configuration_revision=configuration_snapshot.revision,
     )
     planner_action_id = uuid4()
     request = DecisionRequest[PlanningDecisionPayload](
@@ -306,6 +390,36 @@ async def run_adaptive_planning(
                 reliability=1.0,
                 summary="Runtime supplied the current strategy and capability catalog.",
             ),
+            DecisionEvidenceReference(
+                evidence_id=(
+                    "runtime-configuration:"
+                    f"{configuration_snapshot.snapshot_fingerprint}"
+                ),
+                kind="runtime.configuration_snapshot",
+                source="runtime_configuration",
+                reliability=1.0,
+                summary=(
+                    "Planning uses configuration revision "
+                    f"{configuration_snapshot.revision} with planner.max_nodes="
+                    f"{configured_max_nodes}; origin="
+                    f"{configuration_snapshot.effective_activation_mode.value}."
+                ),
+            ),
+            *(
+                (
+                    DecisionEvidenceReference(
+                        evidence_id=f"recall-bundle:{recall_bundle.bundle_id}",
+                        kind="memory.recall_bundle",
+                        source="memory_runtime",
+                        reliability=0.8,
+                        summary=(
+                            "Committed historical experience; not current factual evidence."
+                        ),
+                    ),
+                )
+                if recall_bundle is not None
+                else ()
+            ),
         ),
         budget=DecisionBudget(
             max_decision_cycles=1,
@@ -331,11 +445,36 @@ async def run_adaptive_planning(
                         DOCUMENT_ANALYSIS,
                         CALCULATION,
                     ],
+                    "runtime_configuration": {
+                        "revision": configuration_snapshot.revision,
+                        "fingerprint": configuration_snapshot.snapshot_fingerprint,
+                        "planner.max_nodes": configured_max_nodes,
+                    },
+                    "committed_memory_recall_bundle": (
+                        {
+                            "section": "Committed Memory Recall Bundle",
+                            "bundle_id": str(recall_bundle.bundle_id),
+                            "bundle_fingerprint": decision_fingerprint(recall_bundle),
+                            "historical_experience": [
+                                item.model_dump(mode="json")
+                                for item in recall_bundle.items
+                            ],
+                            "instruction": (
+                                "Treat as historical experience; current goal and Runtime "
+                                "constraints remain authoritative."
+                            ),
+                        }
+                        if recall_bundle is not None
+                        else None
+                    ),
                 },
                 sensitivity=ContextSensitivity.INTERNAL,
                 evidence_id=f"task:{agent_task.task_id}",
                 priority=100,
-                estimated_tokens=128,
+                estimated_tokens=(
+                    128
+                    + (recall_bundle.used_tokens if recall_bundle is not None else 0)
+                ),
             ),
             ProjectionSource(
                 source_id="planning-catalog",
@@ -366,10 +505,15 @@ async def run_adaptive_planning(
             {"authorization", "credential", "password", "token"}
         ),
         max_items=2,
-        max_context_tokens=512,
+        max_context_tokens=(
+            512 + (recall_bundle.max_tokens if recall_bundle is not None else 0)
+        ),
     )
 
-    graph_applier = GraphInitializationApplier(graph_store)
+    graph_applier = GraphInitializationApplier(
+        graph_store,
+        permit_verifier=commit_permit_verifier,
+    )
     recording_evaluator = _RecordingGovernanceEvaluator(governance)
     recording_issuer = _RecordingAuthorizationIssuer(issuer)
     governance_adapter = RuntimeDecisionGovernanceAdapter[
@@ -402,7 +546,11 @@ async def run_adaptive_planning(
         validator=RuntimeDecisionValidator(
             normalizer=PlanningGraphEffectNormalizer(
                 draft_adapter=TaskGraphDraftAdapter(
-                    domain_validator=validate_research_task_graph_draft
+                    domain_validator=(
+                        validate_deferred_news_research_task_graph_draft
+                        if deferred_news
+                        else validate_research_task_graph_draft
+                    )
                 )
             )
         ),
@@ -410,9 +558,15 @@ async def run_adaptive_planning(
         applier=GovernedDecisionApplier(
             executor=operation_executor,
             apply_effect=graph_applier.apply,
-            apply_normalized_effect=lambda normalized: graph_applier.commit(
+            apply_authorized_effect=lambda normalized, permit: graph_applier.commit(
                 normalized.payload,
                 effect_fingerprint=normalized.effect_fingerprint,
+                permit=permit,
+                target=GovernanceTarget(
+                    target_type=normalized.target.target_type,
+                    target_id=normalized.target.target_id,
+                ),
+                subject_fingerprint=governance_fingerprint(normalized),
             ),
             reconcile_effect=lambda normalized: _reconcile_planning_effect(
                 graph_applier, normalized
@@ -456,7 +610,11 @@ async def run_adaptive_planning(
         reason = checkpoint.result.reason if checkpoint.result is not None else checkpoint.stage
         raise RuntimeError(f"Adaptive Planning did not apply: {reason}")
     effect = checkpoint.validated_decision.normalized_effect.payload
-    definition = build_research_task_from_effect(company, effect)
+    definition = build_research_task_from_effect(
+        company,
+        effect,
+        deferred_news=deferred_news,
+    )
     governance_request = recording_evaluator.request
     preliminary = recording_evaluator.preliminary
     final = recording_evaluator.final
@@ -479,4 +637,5 @@ async def run_adaptive_planning(
             run_id=run_id,
             graph_id=effect.graph.graph_id,
         ),
+        configuration_snapshot=configuration_snapshot,
     )

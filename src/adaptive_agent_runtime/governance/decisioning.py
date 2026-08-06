@@ -47,6 +47,7 @@ from adaptive_agent_runtime.governance.models import (
     GovernanceRequest,
     GovernanceScope,
     GovernanceTarget,
+    RuntimeCommitPermit,
     ImpactAssessment,
     RiskLevel,
     governance_fingerprint,
@@ -264,6 +265,11 @@ class GovernedDecisionApplier(Generic[RequestPayloadT, ProposalPayloadT, EffectP
         apply_normalized_effect: Callable[
             [NormalizedDecisionEffect[EffectPayloadT]], Awaitable[JsonValue]
         ] | None = None,
+        apply_authorized_effect: Callable[
+            [NormalizedDecisionEffect[EffectPayloadT], RuntimeCommitPermit],
+            Awaitable[JsonValue],
+        ]
+        | None = None,
         reconcile_effect: Callable[
             [NormalizedDecisionEffect[EffectPayloadT]], Awaitable[DecisionReconciliation]
         ] | None = None,
@@ -272,6 +278,7 @@ class GovernedDecisionApplier(Generic[RequestPayloadT, ProposalPayloadT, EffectP
         self._executor = executor
         self._apply_effect = apply_effect
         self._apply_normalized_effect = apply_normalized_effect
+        self._apply_authorized_effect = apply_authorized_effect
         self._reconcile_effect = reconcile_effect
         self._clock = clock
 
@@ -291,6 +298,11 @@ class GovernedDecisionApplier(Generic[RequestPayloadT, ProposalPayloadT, EffectP
                 return await self._apply_normalized_effect(effect)
             return await self._apply_effect(effect.payload)
 
+        async def apply_with_permit(permit: RuntimeCommitPermit) -> JsonValue:
+            if self._apply_authorized_effect is None:
+                return await apply_bound_effect()
+            return await self._apply_authorized_effect(effect, permit)
+
         result = await self._executor.execute(
             request=approval.request,
             decision=approval.decision,
@@ -304,6 +316,7 @@ class GovernedDecisionApplier(Generic[RequestPayloadT, ProposalPayloadT, EffectP
                 ),
                 subject=effect,
                 apply=apply_bound_effect,
+                apply_with_permit=apply_with_permit,
             ),
         )
         return DecisionApplyReceipt(
@@ -329,6 +342,11 @@ class GovernedDecisionApplier(Generic[RequestPayloadT, ProposalPayloadT, EffectP
                 return await self._apply_normalized_effect(effect)
             return await self._apply_effect(effect.payload)
 
+        async def apply_with_permit(permit: RuntimeCommitPermit) -> JsonValue:
+            if self._apply_authorized_effect is None:
+                return await apply_bound_effect()
+            return await self._apply_authorized_effect(effect, permit)
+
         result = await self._executor.resume_reserved(
             request=approval.request,
             decision=approval.decision,
@@ -342,6 +360,7 @@ class GovernedDecisionApplier(Generic[RequestPayloadT, ProposalPayloadT, EffectP
                 ),
                 subject=effect,
                 apply=apply_bound_effect,
+                apply_with_permit=apply_with_permit,
             ),
         )
         return DecisionApplyReceipt(

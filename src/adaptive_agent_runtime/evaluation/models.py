@@ -576,6 +576,7 @@ class ConservativeOptimizationPolicy(EvaluationModel):
 
 
 class OptimizationProposal(EvaluationModel):
+    """Legacy/test-only proposal used by historical Evaluation/Evolution tests."""
     proposal_id: UUID
     status: ProposalStatus = ProposalStatus.PROPOSED
     source_pattern_ids: tuple[UUID, ...] = Field(min_length=1)

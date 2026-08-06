@@ -22,6 +22,21 @@ class MemoryStatus(StrEnum):
     RETIRED = "retired"
 
 
+class MemorySensitivity(StrEnum):
+    PUBLIC = "public"
+    INTERNAL = "internal"
+    CONFIDENTIAL = "confidential"
+    RESTRICTED = "restricted"
+
+
+class MemoryScope(ContextMemoryModel):
+    """Authority scope used before Memory can enter an Agent projection."""
+
+    tenant_id: str = Field(default="default", min_length=1)
+    project_id: str = Field(default="default", min_length=1)
+    agent_scope: str = Field(default="shared", min_length=1)
+
+
 class MemoryEvolutionType(StrEnum):
     SUPPORT = "support"
     MODIFY = "modify"
@@ -86,6 +101,9 @@ class MemoryCandidate(ContextMemoryModel):
     confidence: float = Field(gt=0.0, le=1.0)
     evolution: MemoryEvolutionType
     target_memory_id: UUID | None = None
+    scope: MemoryScope = Field(default_factory=MemoryScope)
+    sensitivity: MemorySensitivity = MemorySensitivity.INTERNAL
+    expires_at: AwareDatetime | None = None
     created_at: AwareDatetime = Field(default_factory=utc_now)
 
     @model_validator(mode="after")
@@ -110,6 +128,9 @@ class MemoryUnit(ContextMemoryModel):
     condition: MemoryCondition
     evidence: tuple[MemoryEvidence, ...] = Field(min_length=1)
     confidence: float = Field(ge=0.0, le=1.0)
+    scope: MemoryScope = Field(default_factory=MemoryScope)
+    sensitivity: MemorySensitivity = MemorySensitivity.INTERNAL
+    expires_at: AwareDatetime | None = None
     status: MemoryStatus = MemoryStatus.ACTIVE
     conflicts: tuple[MemoryConflict, ...] = ()
     revision: int = Field(default=0, ge=0)
@@ -135,6 +156,8 @@ class MemoryUnit(ContextMemoryModel):
             raise ValueError(
                 "candidate id and candidate fingerprint must be recorded together"
             )
+        if self.expires_at is not None and self.expires_at <= self.created_at:
+            raise ValueError("memory expiry must be later than creation")
         return self
 
 
@@ -148,6 +171,14 @@ class MemoryUpdateResult(ContextMemoryModel):
 class MemoryBatchWrite(ContextMemoryModel):
     memory: MemoryUnit
     expected_revision: int | None = Field(default=None, ge=0)
+
+
+class MemoryBatchCommitReceipt(ContextMemoryModel):
+    effect_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    payload_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    result_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    memory_count: int = Field(ge=0)
+    committed_at: AwareDatetime = Field(default_factory=utc_now)
 
 
 class MemoryRecallQuery(ContextMemoryModel):

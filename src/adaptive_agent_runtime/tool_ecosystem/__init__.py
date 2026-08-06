@@ -27,8 +27,10 @@ from adaptive_agent_runtime.tool_ecosystem.errors import (
     ToolSelectionError,
 )
 from adaptive_agent_runtime.tool_ecosystem.execution import (
+    build_permit_bound_tool_executor,
     InMemoryToolTraceSink,
     ManagedToolExecutor,
+    PermitBoundToolExecutor,
 )
 from adaptive_agent_runtime.tool_ecosystem.governance import (
     OperationalToolGovernor,
@@ -110,6 +112,8 @@ __all__ = [
     "InMemoryToolRegistry",
     "InMemoryToolTraceSink",
     "ManagedToolExecutor",
+    "PermitBoundToolExecutor",
+    "build_permit_bound_tool_executor",
     "MappedTaskCapabilityRequestProvider",
     "OperationalToolGovernor",
     "ProviderAlreadyRegisteredError",

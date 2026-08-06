@@ -1,4 +1,9 @@
-"""Local-only LLM settings for the Research Agent web application."""
+"""Operator-managed LLM settings for the Research Agent web application.
+
+This module is an operational control surface.  It is intentionally outside
+Runtime Optimization, Active Runtime Configuration, and DecisionLifecycle.
+Optimization Proposals cannot target or invoke it.
+"""
 
 from __future__ import annotations
 
@@ -51,11 +56,15 @@ class WebLLMTarget:
 
 
 class WebLLMSettings:
-    """Manage one fixed public config and its sibling private key file.
+    """Manage operator-selected Provider settings and private credentials.
 
     The browser may select only target names already declared in ``llm.toml``.
     It cannot choose paths or mutate non-secret Runtime target definitions.
+    ``activate`` is a human/operator action, never an Optimization Apply port.
     """
+
+    configuration_owner = "operator"
+    configuration_domain = "operator.web_llm"
 
     def __init__(
         self,

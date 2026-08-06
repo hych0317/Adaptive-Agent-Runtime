@@ -11,6 +11,12 @@ from adaptive_agent_runtime.orchestration.contracts import TaskGraphStore
 from adaptive_agent_runtime.orchestration.errors import OrchestrationStateError
 from adaptive_agent_runtime.orchestration.planning import PlanningGraphEffect
 from adaptive_agent_runtime.decisioning import decision_fingerprint
+from adaptive_agent_runtime.governance.errors import AuthorizationVerificationError
+from adaptive_agent_runtime.governance.contracts import CommitPermitValidation
+from adaptive_agent_runtime.governance.models import (
+    GovernanceTarget,
+    RuntimeCommitPermit,
+)
 
 
 class GraphInitializationApplier:
@@ -18,8 +24,14 @@ class GraphInitializationApplier:
 
     module_id = "orchestration.planning.graph_initialization_applier"
 
-    def __init__(self, store: TaskGraphStore) -> None:
+    def __init__(
+        self,
+        store: TaskGraphStore,
+        *,
+        permit_verifier: CommitPermitValidation | None = None,
+    ) -> None:
         self._store = store
+        self._permit_verifier = permit_verifier
 
     async def apply(self, effect: PlanningGraphEffect) -> JsonValue:
         return await self.commit(
@@ -32,7 +44,21 @@ class GraphInitializationApplier:
         effect: PlanningGraphEffect,
         *,
         effect_fingerprint: str,
+        permit: RuntimeCommitPermit | None = None,
+        target: GovernanceTarget | None = None,
+        subject_fingerprint: str | None = None,
     ) -> JsonValue:
+        if self._permit_verifier is not None:
+            if permit is None or target is None or subject_fingerprint is None:
+                raise AuthorizationVerificationError(
+                    "Graph initialization requires a Runtime Permit"
+                )
+            await self._permit_verifier.verify(
+                permit,
+                operation="graph.initialize",
+                target=target,
+                subject_fingerprint=subject_fingerprint,
+            )
         if effect.graph.version != 0:
             raise OrchestrationStateError("initial planning effect must be graph v0")
         existing = await self._store.load(effect.run_id)
@@ -46,7 +72,12 @@ class GraphInitializationApplier:
             raise OrchestrationStateError(
                 "run already has a different task graph checkpoint"
             )
-        await self._store.save(checkpoint)
+        await self._store.save(
+            checkpoint,
+            permit=permit,
+            target=target,
+            subject_fingerprint=subject_fingerprint,
+        )
         persisted = await self._store.load(effect.run_id)
         if persisted != checkpoint:
             raise OrchestrationStateError(
@@ -92,9 +123,21 @@ class RequiredPreparedTaskGraphStore:
         self._run_id = run_id
         self._graph_id = graph_id
 
-    async def save(self, checkpoint: TaskGraphCheckpoint) -> None:
+    async def save(
+        self,
+        checkpoint: TaskGraphCheckpoint,
+        *,
+        permit: RuntimeCommitPermit | None = None,
+        target: GovernanceTarget | None = None,
+        subject_fingerprint: str | None = None,
+    ) -> None:
         self._validate(checkpoint)
-        await self._delegate.save(checkpoint)
+        await self._delegate.save(
+            checkpoint,
+            permit=permit,
+            target=target,
+            subject_fingerprint=subject_fingerprint,
+        )
 
     async def load(self, run_id: UUID) -> TaskGraphCheckpoint | None:
         if run_id != self._run_id:

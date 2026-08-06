@@ -28,6 +28,7 @@ from adaptive_agent_runtime.context_memory.compression_decision import (
 from adaptive_agent_runtime.context_memory.contracts import (
     ContextArchive,
     ContextCompressor,
+    ContextCompressionTransaction,
     ContextLifecycleActionExecutor,
     ContextLifecyclePlanning,
     ContextPressureMonitoring,
@@ -41,6 +42,7 @@ from adaptive_agent_runtime.context_memory.errors import (
     ContextTransitionError,
 )
 from adaptive_agent_runtime.context_memory.json_types import utc_now
+from adaptive_agent_runtime.governance.models import GovernanceTarget, RuntimeCommitPermit
 
 
 def _evolve_metadata(metadata: ContextMetadata, **changes: Any) -> ContextMetadata:
@@ -483,6 +485,9 @@ class ContextCompressionCommitter:
         effect: ContextCompressionEffect,
         *,
         effect_fingerprint: str,
+        permit: RuntimeCommitPermit | None = None,
+        target: GovernanceTarget | None = None,
+        subject_fingerprint: str | None = None,
     ) -> ContextUnit:
         current = await self._store.load(source.context_id)
         if current is not None and current.last_effect_fingerprint == effect_fingerprint:
@@ -495,9 +500,26 @@ class ContextCompressionCommitter:
             archive_id=uuid5(source.context_id, effect_fingerprint),
             context_id=source.context_id,
         )
-        reference = await self._archive.archive(
-            source,
-            reference=archive_reference,
+        transactional_archive = (
+            self._archive
+            if isinstance(self._archive, ContextCompressionTransaction)
+            else None
+        )
+        if transactional_archive is not None and (
+            permit is None or target is None or subject_fingerprint is None
+        ):
+            raise ContextSnapshotConflictError(
+                "transactional compression requires a Runtime Permit"
+            )
+        reference = (
+            await transactional_archive.stage_compression(
+                source,
+                reference=archive_reference,
+                effect_fingerprint=effect_fingerprint,
+                source_fingerprint=effect.source_snapshot_fingerprint,
+            )
+            if transactional_archive is not None
+            else await self._archive.archive(source, reference=archive_reference)
         )
         if reference.context_id != source.context_id:
             await self._archive.discard(reference)
@@ -515,6 +537,20 @@ class ContextCompressionCommitter:
             recovery_reference=reference,
             last_effect_fingerprint=effect_fingerprint,
         )
+        if transactional_archive is not None:
+            assert permit is not None
+            assert target is not None
+            assert subject_fingerprint is not None
+            return await transactional_archive.commit_compression(
+                source,
+                compressed,
+                reference=reference,
+                effect_fingerprint=effect_fingerprint,
+                source_fingerprint=effect.source_snapshot_fingerprint,
+                permit=permit,
+                target=target,
+                subject_fingerprint=subject_fingerprint,
+            )
         try:
             await self._store.save(compressed, expected_revision=source.revision)
         except Exception:
@@ -531,10 +567,19 @@ class ContextCompressionCommitter:
         self,
         context_id: UUID,
         effect_fingerprint: str,
+        *,
+        source_fingerprint: str | None = None,
     ) -> ContextUnit | None:
         unit = await self._store.load(context_id)
         if unit is None or unit.last_effect_fingerprint != effect_fingerprint:
             return None
+        if isinstance(self._archive, ContextCompressionTransaction):
+            if source_fingerprint is None or not await self._archive.verify_compression(
+                unit,
+                effect_fingerprint=effect_fingerprint,
+                source_fingerprint=source_fingerprint,
+            ):
+                return None
         return unit
 
 

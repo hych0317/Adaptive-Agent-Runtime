@@ -40,13 +40,21 @@ from adaptive_agent_runtime.orchestration.recovery import (
     RecoveryRecord,
 )
 from adaptive_agent_runtime.orchestration.recovery_decision import (
+    RECOVERY_APPLY_OPERATION,
     RecoveryDecisionHandler,
 )
 from adaptive_agent_runtime.orchestration.mutation_decision import (
+    GRAPH_MUTATION_APPLY_OPERATION,
     GraphMutationDecisionHandler,
 )
 from adaptive_agent_runtime.orchestration.selection import (
     FirstReadyTaskNodeSelector,
+)
+from adaptive_agent_runtime.governance.errors import AuthorizationVerificationError
+from adaptive_agent_runtime.governance.contracts import CommitPermitValidation
+from adaptive_agent_runtime.governance.models import (
+    GovernanceTarget,
+    RuntimeCommitPermit,
 )
 
 
@@ -67,6 +75,7 @@ class DynamicTaskGraphPlanner:
         recovery_applier: RecoveryPlanApplier | None = None,
         recovery_decision_handler: RecoveryDecisionHandler | None = None,
         mutation_decision_handler: GraphMutationDecisionHandler | None = None,
+        commit_permit_verifier: CommitPermitValidation | None = None,
     ) -> None:
         if any(
             node.status is not TaskNodeStatus.PENDING
@@ -90,6 +99,7 @@ class DynamicTaskGraphPlanner:
         self._recovery_applier = recovery_applier
         self._recovery_decision_handler = recovery_decision_handler
         self._mutation_decision_handler = mutation_decision_handler
+        self._commit_permit_verifier = commit_permit_verifier
         self._graphs: dict[UUID, DynamicTaskGraph] = {}
         self._in_flight: defaultdict[UUID, dict[UUID, UUID]] = defaultdict(dict)
         self._processed_actions: defaultdict[UUID, set[UUID]] = defaultdict(set)
@@ -234,6 +244,10 @@ class DynamicTaskGraphPlanner:
         self,
         state: AgentState,
         graph: DynamicTaskGraph,
+        *,
+        permit: RuntimeCommitPermit | None = None,
+        target: GovernanceTarget | None = None,
+        subject_fingerprint: str | None = None,
     ) -> None:
         if self._graph_store is None:
             return
@@ -265,7 +279,12 @@ class DynamicTaskGraphPlanner:
             checkpoint_revision=next_revision,
             last_effect_fingerprint=self._last_effect_fingerprints.get(state.run_id),
         )
-        await self._graph_store.save(checkpoint)
+        await self._graph_store.save(
+            checkpoint,
+            permit=permit,
+            target=target,
+            subject_fingerprint=subject_fingerprint,
+        )
         self._checkpoint_revisions[state.run_id] = next_revision
 
     async def commit_graph_effect(
@@ -275,8 +294,28 @@ class DynamicTaskGraphPlanner:
         graph: DynamicTaskGraph,
         effect_fingerprint: str,
         recovery_record: RecoveryRecord | None = None,
+        permit: RuntimeCommitPermit | None = None,
+        target: GovernanceTarget | None = None,
+        subject_fingerprint: str | None = None,
     ) -> DynamicTaskGraph:
         """Commit and read back the exact governed Graph effect before APPLIED."""
+
+        if self._commit_permit_verifier is not None:
+            if permit is None or target is None or subject_fingerprint is None:
+                raise AuthorizationVerificationError(
+                    "Graph Effect commit requires a Runtime Permit"
+                )
+            await self._commit_permit_verifier.verify(
+                permit,
+                operation=(
+                    permit.operation
+                    if permit.operation
+                    in {GRAPH_MUTATION_APPLY_OPERATION, RECOVERY_APPLY_OPERATION}
+                    else "graph.invalid_operation"
+                ),
+                target=target,
+                subject_fingerprint=subject_fingerprint,
+            )
 
         if recovery_record is not None:
             node_id = recovery_record.plan.analysis.node_id
@@ -287,7 +326,13 @@ class DynamicTaskGraphPlanner:
                 self._recovery_records[state.run_id].append(recovery_record)
         self._graphs[state.run_id] = graph
         self._last_effect_fingerprints[state.run_id] = effect_fingerprint
-        await self._save_checkpoint(state, graph)
+        await self._save_checkpoint(
+            state,
+            graph,
+            permit=permit,
+            target=target,
+            subject_fingerprint=subject_fingerprint,
+        )
         if self._graph_store is None:
             return graph
         committed = await self._graph_store.load(state.run_id)

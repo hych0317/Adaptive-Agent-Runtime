@@ -11,6 +11,7 @@ from adaptive_agent_runtime.llm import (
     GraphMutationOperationKind,
     GraphMutationProposalDraft,
     TaskGraphDraft,
+    TaskNodeDraft,
 )
 from adaptive_agent_runtime.orchestration import (
     DynamicTaskGraph,
@@ -185,6 +186,44 @@ def build_research_task(company: str) -> ResearchTaskDefinition:
     )
 
 
+def build_research_task_draft(
+    company: str,
+    *,
+    defer_news: bool = False,
+) -> TaskGraphDraft:
+    """Return the deterministic fallback through the same planning contract."""
+
+    definition = build_research_task(company)
+    order = {role: index for index, role in enumerate(RESEARCH_NODE_ROLES)}
+    return TaskGraphDraft(
+        nodes=tuple(
+            TaskNodeDraft(
+                node_key=role,
+                goal=definition.node(role).goal,
+                dependency_keys=tuple(
+                    sorted(
+                        (
+                            dependency
+                            for dependency in _REQUIRED_DEPENDENCIES.get(role, ())
+                            if not (
+                                defer_news and dependency == NEWS_ANALYSIS
+                            )
+                        ),
+                        key=order.__getitem__,
+                    )
+                ),
+                expected_output=definition.node(role).expected_output,
+                requested_strategy_id=_STRATEGY_BY_ROLE[role],
+            )
+            for role in RESEARCH_NODE_ROLES
+            if not (defer_news and role == NEWS_ANALYSIS)
+        ),
+        rationale=(
+            "Deterministic fallback proposal using the documented Research DAG."
+        ),
+    )
+
+
 def build_research_task_from_draft(
     company: str,
     draft: TaskGraphDraft,
@@ -259,21 +298,53 @@ def validate_research_task_graph_draft(draft: TaskGraphDraft) -> None:
 def build_research_task_from_effect(
     company: str,
     effect: PlanningGraphEffect,
+    *,
+    deferred_news: bool = False,
 ) -> ResearchTaskDefinition:
     """Adopt the exact Runtime-owned graph effect after Governance Apply."""
 
     bindings = {item.node_key: item.node_id for item in effect.node_bindings}
-    if set(bindings) != set(RESEARCH_NODE_ROLES):
+    expected_roles = set(RESEARCH_NODE_ROLES)
+    if deferred_news:
+        expected_roles.remove(NEWS_ANALYSIS)
+    if set(bindings) != expected_roles:
         raise ValueError("planning graph effect does not cover Research roles")
     graph_nodes = {node.node_id: node for node in effect.graph.nodes}
     nodes_by_role = {
         role: graph_nodes[node_id] for role, node_id in bindings.items()
     }
+    if deferred_news:
+        canonical = build_research_task(company).node(NEWS_ANALYSIS)
+        nodes_by_role[NEWS_ANALYSIS] = TaskNode(
+            goal=canonical.goal,
+            dependencies=(nodes_by_role[COMPANY_RESEARCH].node_id,),
+            expected_output=canonical.expected_output,
+            strategy_id=canonical.strategy_id,
+        )
     return ResearchTaskDefinition(
         company=company,
         initial_graph=effect.graph,
         nodes=MappingProxyType(nodes_by_role),
     )
+
+
+def validate_deferred_news_research_task_graph_draft(
+    draft: TaskGraphDraft,
+) -> None:
+    """Validate the deterministic initial graph before dynamic news discovery."""
+
+    by_role = {node.node_key: node for node in draft.nodes}
+    expected = set(RESEARCH_NODE_ROLES) - {NEWS_ANALYSIS}
+    if set(by_role) != expected:
+        raise ValueError("deferred-news graph must contain the seven initial roles")
+    for role, node in by_role.items():
+        if node.requested_strategy_id != _STRATEGY_BY_ROLE[role]:
+            raise ValueError(f"research role '{role}' has the wrong strategy")
+        required = set(_REQUIRED_DEPENDENCIES.get(role, ())) - {NEWS_ANALYSIS}
+        if not required.issubset(node.dependency_keys):
+            raise ValueError(f"research role '{role}' lacks required dependencies")
+    if by_role[COMPANY_RESEARCH].dependency_keys:
+        raise ValueError("company_research must be a root node")
 
 
 def build_research_mutations_from_draft(

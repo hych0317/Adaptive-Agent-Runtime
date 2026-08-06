@@ -42,6 +42,7 @@ from adaptive_agent_runtime.decisioning.models import (
     DecisionApplyReceipt,
     DecisionCheckpoint,
     DecisionCheckpointStage,
+    DecisionFaultPoint,
     DecisionGovernanceOutcome,
     DecisionGovernanceReceipt,
     DecisionRequest,
@@ -56,6 +57,7 @@ from adaptive_agent_runtime.decisioning.models import (
     ProposalPayloadT,
     RequestPayloadT,
     ValidatedDecision,
+    decision_fingerprint,
 )
 
 
@@ -107,6 +109,11 @@ class DecisionLifecycleCoordinator(
         trace_writer: DecisionTraceWriter,
         clock: Callable[[], datetime] = utc_now,
         monotonic_clock: Callable[[], float] = monotonic,
+        fault_injector: Callable[
+            [DecisionFaultPoint, DecisionCheckpoint[RequestPayloadT, ProposalPayloadT, EffectPayloadT]],
+            None,
+        ]
+        | None = None,
     ) -> None:
         self._context_builder = context_builder
         self._proposal_producer = proposal_producer
@@ -119,6 +126,7 @@ class DecisionLifecycleCoordinator(
         self._trace_writer = trace_writer
         self._clock = clock
         self._monotonic_clock = monotonic_clock
+        self._fault_injector = fault_injector
 
     async def run(
         self,
@@ -133,10 +141,12 @@ class DecisionLifecycleCoordinator(
     ]:
         existing = await self._checkpoint_store.load(request.request_id)
         if existing is not None:
-            comparable_request = request.model_copy(
-                update={"created_at": existing.request.created_at}
-            )
-            if existing.request != comparable_request:
+            persisted_request = existing.request.model_dump(mode="json")
+            comparable_request = request.model_dump(mode="json")
+            comparable_request["created_at"] = persisted_request["created_at"]
+            if decision_fingerprint(persisted_request) != decision_fingerprint(
+                comparable_request
+            ):
                 raise DecisionInvariantError(
                     "decision request identity was reused with another snapshot"
                 )
@@ -439,6 +449,7 @@ class DecisionLifecycleCoordinator(
                 status=DecisionResultStatus.FAILED,
                 reason=("Apply reconciliation failed closed: " + reconciliation.reason),
                 trace_kind=DecisionTraceKind.FAILED,
+                reconciliation_status=DecisionReconciliationStatus.UNKNOWN,
             )
         try:
             stale_or_expired = await self._is_stale_or_expired(checkpoint)
@@ -496,6 +507,7 @@ class DecisionLifecycleCoordinator(
                 review_request_id=receipt.review_request_id,
                 payload={"reason": receipt.reason},
             )
+            self._inject_fault(DecisionFaultPoint.REVIEW_PENDING, checkpoint)
             return checkpoint
         if resolution.approval is None:
             return await self._fail(
@@ -518,6 +530,7 @@ class DecisionLifecycleCoordinator(
             authorization_id=receipt.authorization_id,
             payload={"reason": receipt.reason},
         )
+        self._inject_fault(DecisionFaultPoint.AUTHORIZED, checkpoint)
         return await self._apply(checkpoint, resolution.approval)
 
     async def _apply(
@@ -563,6 +576,7 @@ class DecisionLifecycleCoordinator(
                 )
             },
         )
+        self._inject_fault(DecisionFaultPoint.APPLYING, checkpoint)
         try:
             apply_receipt = await self._applier.apply(validated, approval)
         except Exception as exc:
@@ -576,6 +590,7 @@ class DecisionLifecycleCoordinator(
                 "Decision apply",
                 DecisionInvariantError("Apply receipt belongs to another effect"),
             )
+        self._inject_fault(DecisionFaultPoint.EFFECT_COMMITTED, checkpoint)
         return await self._complete_applied(checkpoint, apply_receipt)
 
     async def _complete_applied(
@@ -694,6 +709,7 @@ class DecisionLifecycleCoordinator(
         trace_kind: DecisionTraceKind,
         validation: DecisionValidation | None = None,
         governance_receipt: DecisionGovernanceReceipt | None = None,
+        reconciliation_status: DecisionReconciliationStatus | None = None,
     ) -> DecisionCheckpoint[
         RequestPayloadT,
         ProposalPayloadT,
@@ -705,6 +721,7 @@ class DecisionLifecycleCoordinator(
             proposal_id=proposal.proposal_id if proposal is not None else None,
             status=status,
             reason=reason,
+            reconciliation_status=reconciliation_status,
             completed_at=self._clock(),
         )
         update: dict[str, object] = {"result": result}
@@ -729,6 +746,18 @@ class DecisionLifecycleCoordinator(
             payload={"status": status.value, "reason": reason},
         )
         return checkpoint
+
+    def _inject_fault(
+        self,
+        point: DecisionFaultPoint,
+        checkpoint: DecisionCheckpoint[
+            RequestPayloadT,
+            ProposalPayloadT,
+            EffectPayloadT,
+        ],
+    ) -> None:
+        if self._fault_injector is not None:
+            self._fault_injector(point, checkpoint)
 
     async def _advance(
         self,

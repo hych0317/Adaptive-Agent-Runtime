@@ -17,12 +17,14 @@ from adaptive_agent_runtime.tool_ecosystem import (
     InMemoryCapabilityCatalog,
     InMemoryToolRegistry,
     InMemoryToolTraceSink,
-    ManagedToolExecutor,
+    PermitBoundToolExecutor,
+    build_permit_bound_tool_executor,
     ToolProvider,
     ToolInvocation,
     ToolProviderMetadata,
     ToolProviderResult,
 )
+from adaptive_agent_runtime.governance import CommitPermitValidation
 from adaptive_agent_runtime.llm import (
     ArtifactGenerationCapability,
     CapabilityInvocationMetadata,
@@ -163,7 +165,7 @@ class ResearchToolStack:
     resolver: CapabilityResolver
     selector: DeterministicToolSelector
     trace_sink: InMemoryToolTraceSink
-    executor: ManagedToolExecutor
+    executor: PermitBoundToolExecutor
     providers: Mapping[str, ToolProvider]
 
 
@@ -419,6 +421,7 @@ _LLM_INFORMATION_SPECS: tuple[
 def build_research_tool_stack(
     *,
     llm_information_generator: ArtifactGenerationCapability | None = None,
+    permit_verifier: CommitPermitValidation,
 ) -> ResearchToolStack:
     """Register fixture and optional LLM Providers in the Runtime ecosystem."""
 
@@ -539,7 +542,11 @@ def build_research_tool_stack(
         registry=registry,
         matcher=ExactCapabilityMatcher(),
     )
-    executor = ManagedToolExecutor(registry=registry, trace_sink=trace_sink)
+    executor = build_permit_bound_tool_executor(
+        registry=registry,
+        trace_sink=trace_sink,
+        permit_verifier=permit_verifier,
+    )
     return ResearchToolStack(
         catalog=catalog,
         registry=registry,
