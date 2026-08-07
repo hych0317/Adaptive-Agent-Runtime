@@ -27,6 +27,7 @@ from applications.terminal_bench.contracts import TerminalTrialJournal
 from applications.terminal_bench.models import (
     TERMINAL_COMMAND_ACTION,
     TERMINAL_COMMAND_CAPABILITY,
+    TERMINAL_COMPLETION_REJECTION_ACTION,
     TerminalCommandIntent,
     TerminalExecResult,
     TerminalExecutionState,
@@ -55,6 +56,15 @@ class TerminalActionExecutor:
         action: ActionRequest,
         state: AgentState,
     ) -> Observation:
+        if action.name == TERMINAL_COMPLETION_REJECTION_ACTION:
+            return Observation.ok(
+                action.action_id,
+                output={
+                    "completion_rejected": True,
+                    "reason": action.arguments.get("reason"),
+                },
+                control=ObservationControl(progress_kind=ProgressKind.NO_PROGRESS),
+            )
         if action.name != TERMINAL_COMMAND_ACTION:
             return Observation.failed(
                 action.action_id,

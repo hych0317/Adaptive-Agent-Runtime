@@ -17,6 +17,7 @@ from adaptive_agent_runtime.llm import InferenceUsage
 
 AAR_TERMINAL_SEQUENTIAL_PROFILE = "AAR Terminal Sequential Profile"
 TERMINAL_COMMAND_ACTION = "terminal.command"
+TERMINAL_COMPLETION_REJECTION_ACTION = "terminal.completion_rejection"
 TERMINAL_COMMAND_CAPABILITY = "terminal.command.execute"
 TERMINAL_COMMAND_PROVIDER = "harbor.environment.exec"
 
@@ -55,6 +56,13 @@ class TerminalExecutionState(StrEnum):
 class TerminalTurnDecision(StrEnum):
     EXECUTE = "execute"
     COMPLETE = "complete"
+
+
+class TerminalCommandRole(StrEnum):
+    """Planner-declared role used by the Runtime completion gate."""
+
+    WORK = "work"
+    VERIFY = "verify"
 
 
 class TerminalProcessReference(TerminalModel):
@@ -123,6 +131,7 @@ class TerminalExecutionPolicy(TerminalModel):
     repeated_invocation_limit: int | None = Field(default=3, ge=2)
     max_no_progress_steps: int | None = Field(default=5, ge=1)
     max_no_progress_seconds: float | None = Field(default=300.0, gt=0.0)
+    max_completion_rejections: int = Field(default=2, ge=0, le=10)
 
     @model_validator(mode="after")
     def validate_timeouts(self) -> TerminalExecutionPolicy:
@@ -140,6 +149,8 @@ class TerminalSessionSnapshot(TerminalModel):
     denied_commands: int = Field(default=0, ge=0)
     timed_out_commands: int = Field(default=0, ge=0)
     in_doubt_commands: int = Field(default=0, ge=0)
+    completion_rejections: int = Field(default=0, ge=0)
+    completion_blocker: str | None = Field(default=None, min_length=1)
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     total_tokens: int = Field(default=0, ge=0)
@@ -150,6 +161,7 @@ class TerminalHistoryItem(TerminalModel):
     action_id: UUID
     call_key: str = Field(min_length=1)
     command: str = Field(min_length=1)
+    command_role: TerminalCommandRole = TerminalCommandRole.WORK
     cwd: str | None = None
     environment_keys: tuple[str, ...] = ()
     timeout_sec: int = Field(ge=1)
@@ -180,6 +192,7 @@ class TerminalTurnDraft(TerminalModel):
     decision: TerminalTurnDecision
     call_key: str | None = Field(default=None, min_length=1, max_length=256)
     command: str | None = Field(default=None, min_length=1)
+    command_role: TerminalCommandRole | None = None
     cwd: str | None = Field(default=None, min_length=1, max_length=4096)
     env: dict[str, str] | None = None
     timeout_sec: int | None = Field(default=None, ge=1)
@@ -193,6 +206,8 @@ class TerminalTurnDraft(TerminalModel):
         if self.decision is TerminalTurnDecision.EXECUTE:
             if any(item is None for item in execution_fields):
                 raise ValueError("execute draft requires call_key and command")
+            if self.command_role is None:
+                raise ValueError("execute draft requires command_role")
             if self.summary is not None:
                 raise ValueError("execute draft cannot contain completion summary")
         else:
@@ -205,6 +220,7 @@ class TerminalTurnDraft(TerminalModel):
                     self.env,
                     self.timeout_sec,
                     self.process_reference,
+                    self.command_role,
                 )
             ):
                 raise ValueError("complete draft cannot contain execution settings")
@@ -228,12 +244,14 @@ class TerminalCommandIntent(TerminalModel):
     cwd: str | None = Field(default=None, min_length=1, max_length=4096)
     env: dict[str, str] = Field(default_factory=dict)
     timeout_sec: int = Field(ge=1)
+    command_role: TerminalCommandRole = TerminalCommandRole.WORK
     process_reference: TerminalProcessReference | None = None
 
     def tool_arguments(self) -> dict[str, Any]:
         return {
             "trial_id": self.trial_id,
             "command": self.command,
+            "command_role": self.command_role.value,
             "cwd": self.cwd,
             "env": dict(self.env),
             "timeout_sec": self.timeout_sec,
@@ -278,6 +296,7 @@ class TerminalCommandRecord(TerminalModel):
             action_id=self.action_id,
             call_key=self.intent.call_key,
             command=self.intent.command,
+            command_role=self.intent.command_role,
             cwd=self.intent.cwd,
             environment_keys=tuple(sorted(self.intent.env)),
             timeout_sec=self.intent.timeout_sec,

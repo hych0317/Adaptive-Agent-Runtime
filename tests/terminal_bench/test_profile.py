@@ -26,6 +26,7 @@ from tests.terminal_bench.fakes import (
     complete_draft,
     completed_result,
     execute_draft,
+    verify_draft,
 )
 
 
@@ -34,13 +35,17 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            environment = FakeTerminalEnvironment(completed_result(stdout="ok"))
+            environment = FakeTerminalEnvironment(
+                completed_result(stdout="ok"),
+                completed_result(stdout="verified"),
+            )
             app = build_terminal_application(
                 trial_id="trial-lifecycle",
                 logs_dir=directory,
                 environment=environment,
                 proposal_capability=ScriptedTerminalTurnCapability(
                     execute_draft("printf ok", cwd="/app", env={}),
+                    verify_draft("test -n ok"),
                     complete_draft(),
                 ),
             )
@@ -50,7 +55,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     artifacts.summary.run_id,
                     "tool.invocation",
                 )
-                self.assertEqual(len(proofs), 1)
+                self.assertEqual(len(proofs), 2)
                 proof = proofs[0]
                 self.assertEqual(proof.result_status, "applied")
                 self.assertIsNotNone(proof.authorization_id)
@@ -69,7 +74,10 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_governed_effect_is_same_effect_executed_by_provider(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            environment = FakeTerminalEnvironment(completed_result(stdout="ok"))
+            environment = FakeTerminalEnvironment(
+                completed_result(stdout="ok"),
+                completed_result(stdout="verified"),
+            )
             app = build_terminal_application(
                 trial_id="trial-effect",
                 logs_dir=directory,
@@ -81,6 +89,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                         env={"MODE": "test"},
                         timeout_sec=41,
                     ),
+                    verify_draft("python -V", call_key="verification-1"),
                     complete_draft(),
                 ),
             )
@@ -102,6 +111,26 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(arguments["env"], call.env)
                 self.assertEqual(arguments["timeout_sec"], call.timeout_sec)
                 self.assertEqual(arguments["trial_id"], "trial-effect")
+                self.assertEqual(arguments["command_role"], "work")
+                verify_proof = app.persistence.decision_records.find_completed_decisions(
+                    artifacts.summary.run_id,
+                    "tool.invocation",
+                )[1]
+                assert verify_proof.effect_fingerprint is not None
+                verify_effect = app.persistence.decision_records.load_effect(
+                    verify_proof.effect_fingerprint
+                )
+                assert verify_effect is not None
+                self.assertEqual(
+                    verify_effect["payload"]["invocation"]["arguments"][
+                        "command_role"
+                    ],
+                    "verify",
+                )
+                self.assertNotEqual(
+                    proof.effect_fingerprint,
+                    verify_proof.effect_fingerprint,
+                )
             finally:
                 app.close()
 
@@ -147,7 +176,8 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
     async def test_nonzero_return_code_is_normal_observation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             environment = FakeTerminalEnvironment(
-                completed_result(return_code=7, stderr="not found")
+                completed_result(return_code=7, stderr="not found"),
+                completed_result(stdout="handled"),
             )
             app = build_terminal_application(
                 trial_id="trial-nonzero",
@@ -155,6 +185,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 environment=environment,
                 proposal_capability=ScriptedTerminalTurnCapability(
                     execute_draft("test -f /app/missing"),
+                    verify_draft("test ! -f /app/missing"),
                     complete_draft("handled nonzero"),
                 ),
             )
@@ -248,10 +279,12 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             environment = FakeTerminalEnvironment(
                 completed_result(stdout="one"),
                 completed_result(stdout="two"),
+                completed_result(stdout="verified"),
             )
             capability = ScriptedTerminalTurnCapability(
                 execute_draft("first", cwd="/app/work", env={"MODE": "test"}),
                 execute_draft("second", call_key="command-2"),
+                verify_draft(call_key="verification-1"),
                 complete_draft(),
             )
             app = build_terminal_application(
@@ -276,6 +309,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             environment = FakeTerminalEnvironment(
                 completed_result(),
                 completed_result(),
+                completed_result(),
             )
             app = build_terminal_application(
                 trial_id="trial-shell-state",
@@ -288,6 +322,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                         env={},
                     ),
                     execute_draft("pwd; env", call_key="command-2"),
+                    verify_draft(call_key="verification-1"),
                     complete_draft(),
                 ),
             )
@@ -295,6 +330,115 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 await app.run("test shell state")
                 self.assertEqual(environment.calls[1].cwd, "/app")
                 self.assertEqual(environment.calls[1].env, {})
+            finally:
+                app.close()
+
+    async def test_premature_complete_is_rejected_and_replanned(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft("create-artifact"),
+                complete_draft("premature"),
+                verify_draft("assert-artifact"),
+                complete_draft(),
+            )
+            app = build_terminal_application(
+                trial_id="trial-complete-gate",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(),
+                    completed_result(),
+                ),
+                proposal_capability=capability,
+            )
+            try:
+                artifacts = await app.run("create and validate an artifact")
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertTrue(artifacts.summary.agent_complete)
+                self.assertIn(
+                    "last committed command is not marked verify",
+                    capability.requests[2].session.completion_blocker or "",
+                )
+            finally:
+                app.close()
+
+    async def test_successful_verification_allows_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = build_terminal_application(
+                trial_id="trial-verified-complete",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(),
+                    completed_result(stdout="9 dates"),
+                ),
+                proposal_capability=ScriptedTerminalTurnCapability(
+                    execute_draft("create-artifact"),
+                    verify_draft("assert-artifact"),
+                    complete_draft(),
+                ),
+                policy=TerminalExecutionPolicy(max_completion_rejections=0),
+            )
+            try:
+                artifacts = await app.run("create and validate an artifact")
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertTrue(artifacts.summary.agent_complete)
+            finally:
+                app.close()
+
+    async def test_failed_verification_does_not_allow_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = build_terminal_application(
+                trial_id="trial-failed-verification",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(),
+                    completed_result(return_code=1, stderr="assertion failed"),
+                ),
+                proposal_capability=ScriptedTerminalTurnCapability(
+                    execute_draft("create-artifact"),
+                    verify_draft("assert-artifact"),
+                    complete_draft(),
+                ),
+                policy=TerminalExecutionPolicy(max_completion_rejections=0),
+            )
+            try:
+                artifacts = await app.run("create and validate an artifact")
+                self.assertFalse(artifacts.runtime_result.succeeded)
+                self.assertFalse(artifacts.summary.agent_complete)
+                self.assertIn(
+                    "verification command returned a non-zero status",
+                    artifacts.runtime_result.final_state.error or "",
+                )
+            finally:
+                app.close()
+
+    async def test_work_after_verification_invalidates_completion_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = build_terminal_application(
+                trial_id="trial-stale-verification",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(),
+                    completed_result(),
+                    completed_result(),
+                ),
+                proposal_capability=ScriptedTerminalTurnCapability(
+                    execute_draft("create-artifact"),
+                    verify_draft("assert-artifact"),
+                    execute_draft("change-artifact", call_key="command-2"),
+                    complete_draft(),
+                ),
+                policy=TerminalExecutionPolicy(max_completion_rejections=0),
+            )
+            try:
+                artifacts = await app.run("create and validate an artifact")
+                self.assertFalse(artifacts.runtime_result.succeeded)
+                self.assertFalse(artifacts.summary.agent_complete)
+                self.assertIn(
+                    "last committed command is not marked verify",
+                    artifacts.runtime_result.final_state.error or "",
+                )
             finally:
                 app.close()
 

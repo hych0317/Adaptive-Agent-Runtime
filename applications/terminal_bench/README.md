@@ -32,6 +32,30 @@ services must be detached explicitly and record a PID file, log path, and
 status-check command. This profile does not expose tmux or an interactive
 terminal capability.
 
+## Completion gate
+
+Each execute draft labels its command as `work` or `verify`. This role is part
+of the governed Effect fingerprint. A command that creates or changes a task
+artifact is `work`. Before declaring `complete`, the Agent must run an
+independent `verify` command that encodes its checks in the process exit status.
+The Runtime accepts completion only when the last committed command is `verify`,
+has a known `COMPLETED` result, returns zero, and has no timeout or transport
+failure. The verification must follow at least one `work` command, and any later
+`work` command invalidates that evidence.
+
+A premature `complete` draft is not immediately treated as a successful stop or
+as a terminal Runtime failure. Its blocker is persisted in the trial-local
+session and returned to the model for a bounded correction attempt. These
+attempts remain subject to the same inference token, cost, and elapsed-time
+budgets; exhausting the configured correction limit fails closed.
+
+This is self-attested Agent-side validation evidence, not a semantic proof or
+the benchmark oracle. The Runtime can bind the declared role to the exact
+executed Effect and require a successful exit status, but it cannot infer from
+an arbitrary shell command whether the check is sufficient for the task. AAR
+does not invoke or inspect the Harbor verifier, and `agent_complete` still does
+not imply a benchmark pass.
+
 ## Harbor boundary
 
 AAR provides no verifier or oracle API. It restricts the Agent to the current

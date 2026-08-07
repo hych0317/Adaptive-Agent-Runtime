@@ -2,6 +2,7 @@
 
 from applications.terminal_bench.models import (
     AAR_TERMINAL_SEQUENTIAL_PROFILE,
+    TerminalCommandRole,
     TerminalExecResult,
     TerminalExecutionPolicy,
     TerminalExecutionState,
@@ -12,6 +13,7 @@ from applications.terminal_bench.models import (
 
 __all__ = [
     "AAR_TERMINAL_SEQUENTIAL_PROFILE",
+    "TerminalCommandRole",
     "TerminalExecResult",
     "TerminalExecutionPolicy",
     "TerminalExecutionState",

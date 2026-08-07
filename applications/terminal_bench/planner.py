@@ -33,6 +33,8 @@ from applications.terminal_bench.contracts import (
 from applications.terminal_bench.models import (
     AAR_TERMINAL_SEQUENTIAL_PROFILE,
     TERMINAL_COMMAND_ACTION,
+    TERMINAL_COMPLETION_REJECTION_ACTION,
+    TerminalCommandRole,
     TerminalCommandIntent,
     TerminalCommandRecord,
     TerminalExecResult,
@@ -63,6 +65,9 @@ _EXECUTION_SEMANTICS = (
     "A non-zero return code is an observed completed command, not a transport failure.",
     "IN_DOUBT means the command may have started; never repeat it. Use a new inspection command.",
     "Start background services in detached form and supply PID file, log path, and status command.",
+    "Label commands that create or change task artifacts as work.",
+    "Before complete, run an independent verify command whose exit status encodes the task checks; printing or inspecting output alone is not verification.",
+    "The last committed command must be verify, complete with return code 0, and have no timeout or transport failure.",
     "No tmux, interactive terminal, verifier API, oracle API, sidecar execution, or host access is available.",
 )
 
@@ -218,7 +223,47 @@ class JsonlTerminalTrialJournal:
             },
         )
 
+    def completion_gate_error(self) -> str | None:
+        if not self._records:
+            return "no committed verification command exists"
+        record = self._records[-1]
+        if record.intent.command_role is not TerminalCommandRole.VERIFY:
+            return "the last committed command is not marked verify"
+        if not any(
+            item.intent.command_role is TerminalCommandRole.WORK
+            for item in self._records[:-1]
+        ):
+            return "the verification command has no preceding work command"
+        result = record.result
+        if result.execution_state is not TerminalExecutionState.COMPLETED:
+            return "the verification command did not complete with a known result"
+        if result.return_code != 0:
+            return "the verification command returned a non-zero status"
+        if result.timed_out or result.transport_failed:
+            return "the verification command timed out or had a transport failure"
+        return None
+
+    def record_completion_rejection(self, reason: str) -> None:
+        if not reason:
+            raise ValueError("completion rejection reason is required")
+        self._session = self._session.model_copy(
+            update={
+                "completion_rejections": self._session.completion_rejections + 1,
+                "completion_blocker": reason,
+            }
+        )
+        self._append(
+            "agent.completion_rejected",
+            {
+                "reason": reason,
+                "session": self._session.model_dump(mode="json"),
+            },
+        )
+
     def mark_complete(self, summary: str) -> None:
+        gate_error = self.completion_gate_error()
+        if gate_error is not None:
+            raise RuntimeError(f"terminal completion rejected: {gate_error}")
         self._agent_summary = summary
         self._append("agent.completed", {"summary": summary})
 
@@ -258,6 +303,7 @@ class JsonlTerminalTrialJournal:
             "in_doubt_commands": session.in_doubt_commands
             + int(result.execution_state is TerminalExecutionState.IN_DOUBT),
             "process_references": tuple(references),
+            "completion_blocker": None,
         }
         if record.governance_status != "applied":
             update["denied_commands"] = session.denied_commands + 1
@@ -298,7 +344,16 @@ class JsonlTerminalTrialJournal:
 
     def _replay_event(self, kind: str, payload: Any) -> None:
         if kind == "pending.saved":
-            self._pending = TerminalPendingCommand.model_validate(payload)
+            pending_payload = dict(payload)
+            proposal_payload = pending_payload.get("proposal")
+            if isinstance(proposal_payload, Mapping):
+                proposal_payload = dict(proposal_payload)
+                proposal_payload.setdefault(
+                    "command_role",
+                    TerminalCommandRole.WORK.value,
+                )
+                pending_payload["proposal"] = proposal_payload
+            self._pending = TerminalPendingCommand.model_validate(pending_payload)
         elif kind == "execution.recorded":
             self._executions[UUID(str(payload["invocation_id"]))] = (
                 TerminalExecResult.model_validate(payload["result"])
@@ -310,6 +365,8 @@ class JsonlTerminalTrialJournal:
             self._session = TerminalSessionSnapshot.model_validate(payload["session"])
             self._pending = None
         elif kind == "inference.usage":
+            self._session = TerminalSessionSnapshot.model_validate(payload["session"])
+        elif kind == "agent.completion_rejected":
             self._session = TerminalSessionSnapshot.model_validate(payload["session"])
         elif kind == "agent.completed":
             self._agent_summary = str(payload["summary"])
@@ -344,7 +401,10 @@ class GatewayTerminalTurnProposalCapability:
                     "Solve the terminal task one bounded command at a time. "
                     "Return exactly one execute or complete draft. The Runtime, "
                     "not you, owns execution authority. Respect every execution "
-                    "semantic supplied in the payload."
+                    "semantic supplied in the payload. Reserve a command for "
+                    "independent verification after changing task artifacts. "
+                    "Do not complete unless the last committed command is a "
+                    "successful verify command."
                 ),
                 "payload": request.model_dump(mode="json"),
             },
@@ -421,7 +481,7 @@ class TerminalSequentialPlanner:
                 reason="Resume the original persisted terminal proposal.",
             )
         session = self._journal.snapshot()
-        budget_error = self._budget_error(session)
+        budget_error = self._budget_error(session, allow_command_limit=False)
         if budget_error is not None:
             return PlanDecision.fail(error=budget_error)
         request = self._turn_request(state, session)
@@ -434,14 +494,58 @@ class TerminalSequentialPlanner:
         draft = proposal.draft
         if draft.decision is TerminalTurnDecision.COMPLETE:
             assert draft.summary is not None
-            self._journal.mark_complete(draft.summary)
-            return PlanDecision.complete(
-                output={
-                    "profile": AAR_TERMINAL_SEQUENTIAL_PROFILE,
-                    "agent_complete": True,
-                    "summary": draft.summary,
+            gate_error = self._journal.completion_gate_error()
+            if gate_error is None:
+                self._journal.mark_complete(draft.summary)
+                return PlanDecision.complete(
+                    output={
+                        "profile": AAR_TERMINAL_SEQUENTIAL_PROFILE,
+                        "agent_complete": True,
+                        "summary": draft.summary,
+                    },
+                    reason=draft.rationale,
+                )
+            if (
+                session.completion_rejections
+                >= self._policy.max_completion_rejections
+            ):
+                return PlanDecision.fail(
+                    error=f"terminal completion rejected: {gate_error}",
+                    reason=(
+                        "Agent exhausted bounded completion correction attempts."
+                    ),
+                )
+            self._journal.record_completion_rejection(gate_error)
+            session = self._journal.snapshot()
+            rejection_action = ActionRequest(
+                action_id=uuid5(
+                    _TERMINAL_ACTION_NAMESPACE,
+                    "|".join(
+                        (
+                            str(state.run_id),
+                            str(state.revision),
+                            "completion-rejected",
+                            str(session.completion_rejections),
+                        )
+                    ),
+                ),
+                name=TERMINAL_COMPLETION_REJECTION_ACTION,
+                arguments={
+                    "reason": gate_error,
+                    "completion_rejections": session.completion_rejections,
                 },
-                reason=draft.rationale,
+                repeat_detection_exempt=True,
+            )
+            return PlanDecision.execute(
+                rejection_action,
+                reason="Persist completion blocker and return it to the Planner.",
+            )
+        if session.committed_commands >= self._policy.max_commands:
+            return PlanDecision.fail(
+                error=(
+                    "terminal command budget exhausted "
+                    f"({self._policy.max_commands})"
+                )
             )
         try:
             intent = self._resolve_intent(draft, session)
@@ -527,7 +631,11 @@ class TerminalSequentialPlanner:
         draft: TerminalTurnDraft,
         session: TerminalSessionSnapshot,
     ) -> TerminalCommandIntent:
-        assert draft.call_key is not None and draft.command is not None
+        assert (
+            draft.call_key is not None
+            and draft.command is not None
+            and draft.command_role is not None
+        )
         cwd = draft.cwd if draft.cwd is not None else session.current_cwd
         environment = (
             dict(draft.env)
@@ -542,6 +650,7 @@ class TerminalSequentialPlanner:
             cwd=cwd,
             env=environment,
             timeout_sec=timeout_sec,
+            command_role=draft.command_role,
             process_reference=draft.process_reference,
         )
 

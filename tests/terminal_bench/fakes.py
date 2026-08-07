@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from adaptive_agent_runtime.llm import InferenceUsage
 
 from applications.terminal_bench.models import (
+    TerminalCommandRole,
     TerminalExecResult,
     TerminalExecutionState,
     TerminalTurnDraft,
@@ -82,15 +83,35 @@ def execute_draft(
     cwd: str | None = None,
     env: dict[str, str] | None = None,
     timeout_sec: int | None = None,
+    command_role: TerminalCommandRole = TerminalCommandRole.WORK,
 ) -> TerminalTurnDraft:
     return TerminalTurnDraft(
         decision="execute",
         call_key=call_key,
         command=command,
+        command_role=command_role,
         cwd=cwd,
         env=env,
         timeout_sec=timeout_sec,
         rationale=f"run {call_key}",
+    )
+
+
+def verify_draft(
+    command: str = "true",
+    *,
+    call_key: str = "verification-1",
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    timeout_sec: int | None = None,
+) -> TerminalTurnDraft:
+    return execute_draft(
+        command,
+        call_key=call_key,
+        cwd=cwd,
+        env=env,
+        timeout_sec=timeout_sec,
+        command_role=TerminalCommandRole.VERIFY,
     )
 
 

@@ -72,6 +72,10 @@ def terminal_provider_metadata(
                 "minLength": 1,
                 "maxLength": policy.max_command_characters,
             },
+            "command_role": {
+                "type": "string",
+                "enum": ["work", "verify"],
+            },
             "cwd": {
                 "type": ["string", "null"],
                 "minLength": 1,
@@ -95,6 +99,7 @@ def terminal_provider_metadata(
         "required": [
             "trial_id",
             "command",
+            "command_role",
             "cwd",
             "env",
             "timeout_sec",

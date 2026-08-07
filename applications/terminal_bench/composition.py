@@ -255,7 +255,10 @@ def build_terminal_application(
         state_store=persistence.state_store,
         trace_sink=persistence.trace_sink,
         stop_policy=RunStopPolicy(
-            max_action_steps=execution_policy.max_commands,
+            max_action_steps=(
+                execution_policy.max_commands
+                + execution_policy.max_completion_rejections
+            ),
             max_wall_clock_seconds=execution_policy.max_wall_clock_seconds,
             max_active_execution_seconds=(
                 execution_policy.max_active_execution_seconds
