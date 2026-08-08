@@ -145,6 +145,7 @@ class OpenAICompatibleTargetDefinition(LLMModel):
                 ReasoningEffort.XHIGH,
             },
             OpenAICompatibleService.DEEPSEEK: {
+                ReasoningEffort.LOW,
                 ReasoningEffort.HIGH,
                 ReasoningEffort.MAX,
             },

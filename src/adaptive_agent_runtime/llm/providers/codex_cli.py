@@ -21,7 +21,7 @@ from adaptive_agent_runtime.llm.errors import (
     MalformedModelOutputError,
     UnsupportedFeatureError,
 )
-from adaptive_agent_runtime.llm.json_types import LLMModel
+from adaptive_agent_runtime.llm.json_types import JsonValue, LLMModel
 from adaptive_agent_runtime.llm.models import (
     BackendAuthentication,
     BackendAvailability,
@@ -292,7 +292,14 @@ class CodexCLIInferenceBackend:
             if _looks_unauthenticated(result):
                 raise AuthenticationRequiredError(self.target_id)
             raise BackendProcessFailedError(self.target_id, result.exit_code)
-        return _normalize_jsonl(self.profile, request, result.stdout)
+        response = _normalize_jsonl(self.profile, request, result.stdout)
+        return response.model_copy(
+            update={
+                "output": _remove_ephemeral_workspace_cwd(
+                    response.output, workspace
+                )
+            }
+        )
 
     def _ensure_supported(self, request: InferenceRequest) -> None:
         if request.requirements.tool_intent is not ToolIntentMode.DISABLED:
@@ -586,6 +593,27 @@ def _normalize_jsonl(
         finish_reason=NormalizedFinishReason.COMPLETED,
         remote_request_id=remote_request_id,
     )
+
+
+def _remove_ephemeral_workspace_cwd(
+    output: JsonValue,
+    workspace: str,
+) -> JsonValue:
+    if not isinstance(output, Mapping):
+        return output
+    cwd = output.get("cwd")
+    if not isinstance(cwd, str):
+        return output
+    try:
+        candidate = Path(cwd).resolve()
+        internal_workspace = Path(workspace).resolve()
+        if not candidate.is_relative_to(internal_workspace):
+            return output
+    except (OSError, RuntimeError, ValueError):
+        return output
+    sanitized = dict(output)
+    sanitized["cwd"] = None
+    return cast(JsonValue, sanitized)
 
 
 def _normalize_usage(value: Any, target_id: str) -> InferenceUsage:

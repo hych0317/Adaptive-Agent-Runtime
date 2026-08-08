@@ -17,6 +17,7 @@ from adaptive_agent_runtime.llm import (
     OpenAICompatibleService,
     OpenAICompatibleProbeMode,
     OpenAICompatibleTargetDefinition,
+    ReasoningEffort,
     StructuredOutputLevel,
 )
 
@@ -147,6 +148,21 @@ class ProviderCatalogTests(unittest.IsolatedAsyncioTestCase):
             StructuredOutputLevel.NONE,
         )
         self.assertFalse(item.build_profile().features.tool_intent)
+
+    def test_deepseek_accepts_low_reasoning_effort(self) -> None:
+        item = OpenAICompatibleTargetDefinition(
+            service=OpenAICompatibleService.DEEPSEEK,
+            target_id="deepseek/low-effort",
+            model_id="deepseek-model",
+            features=BackendTransportFeatures(),
+            supported_cognitive_capability_ids=("reasoning",),
+            reasoning_effort=ReasoningEffort.LOW,
+        )
+
+        self.assertEqual(
+            item.build_config().reasoning_effort,
+            ReasoningEffort.LOW,
+        )
 
     def test_catalog_definitions_register_independent_targets(self) -> None:
         registry = InMemoryInferenceBackendRegistry()

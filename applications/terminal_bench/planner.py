@@ -385,11 +385,15 @@ class GatewayTerminalTurnProposalCapability:
         gateway_policy: InferenceGatewayPolicy,
         target_id: str,
         max_output_tokens: int | None = 2048,
+        required_structured_output: StructuredOutputLevel = StructuredOutputLevel.JSON_SCHEMA,
+        strict_json_schema: bool = False,
     ) -> None:
         self._gateway = gateway
         self._gateway_policy = gateway_policy
         self._target_id = target_id
         self._max_output_tokens = max_output_tokens
+        self._required_structured_output = required_structured_output
+        self._strict_json_schema = strict_json_schema
 
     async def propose(self, request: TerminalTurnRequest) -> TerminalTurnProposal:
         inference = InferenceRequest(
@@ -404,16 +408,19 @@ class GatewayTerminalTurnProposalCapability:
                     "semantic supplied in the payload. Reserve a command for "
                     "independent verification after changing task artifacts. "
                     "Do not complete unless the last committed command is a "
-                    "successful verify command."
+                    "successful verify command. For execute, include a stable "
+                    "call_key and command, and set summary to null. For complete, "
+                    "include summary and set call_key, command, command_role, cwd, "
+                    "env, timeout_sec, and process_reference to null. Never return rationale; "
+                    "the Runtime supplies its local audit reason."
                 ),
                 "payload": request.model_dump(mode="json"),
             },
-            response_schema=cast(
-                dict[str, JsonValue],
-                TerminalTurnDraft.model_json_schema(mode="validation"),
+            response_schema=_terminal_turn_response_schema(
+                strict=self._strict_json_schema
             ),
             requirements=InferenceRequirements(
-                required_structured_output=StructuredOutputLevel.JSON_SCHEMA,
+                required_structured_output=self._required_structured_output,
                 max_output_tokens=self._max_output_tokens,
             ),
             correlation=InferenceCorrelation(
@@ -454,6 +461,81 @@ class GatewayTerminalTurnProposalCapability:
             usage=response.usage,
             model_id=response.model_id,
         )
+
+
+def _terminal_turn_response_schema(
+    *, strict: bool = False
+) -> dict[str, JsonValue]:
+    schema = cast(
+        dict[str, JsonValue],
+        TerminalTurnDraft.model_json_schema(mode="validation"),
+    )
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        properties.pop("rationale", None)
+    required = schema.get("required")
+    if isinstance(required, list):
+        schema["required"] = [item for item in required if item != "rationale"]
+    schema["allOf"] = [
+        {
+            "if": {
+                "properties": {"decision": {"const": "execute"}},
+                "required": ["decision"],
+            },
+            "then": {
+                "required": ["call_key", "command"],
+                "properties": {"summary": {"type": "null"}},
+            },
+        },
+        {
+            "if": {
+                "properties": {"decision": {"const": "complete"}},
+                "required": ["decision"],
+            },
+            "then": {
+                "required": ["summary"],
+                "properties": {
+                    "call_key": {"type": "null"},
+                    "command": {"type": "null"},
+                    "cwd": {"type": "null"},
+                    "env": {"type": "null"},
+                    "timeout_sec": {"type": "null"},
+                    "process_reference": {"type": "null"},
+                },
+            },
+        },
+    ]
+    if strict:
+        schema.pop("allOf", None)
+        _normalize_strict_terminal_schema(schema)
+    return schema
+
+
+def _normalize_strict_terminal_schema(node: object) -> None:
+    if isinstance(node, list):
+        for item in node:
+            _normalize_strict_terminal_schema(item)
+        return
+    if not isinstance(node, dict):
+        return
+    properties = node.get("properties")
+    if isinstance(properties, dict):
+        node["required"] = list(properties)
+        node["additionalProperties"] = False
+        env_schema = properties.get("env")
+        if isinstance(env_schema, dict):
+            variants = env_schema.get("anyOf")
+            if isinstance(variants, list):
+                for variant in variants:
+                    if (
+                        isinstance(variant, dict)
+                        and variant.get("type") == "object"
+                    ):
+                        variant["properties"] = {}
+                        variant["required"] = []
+                        variant["additionalProperties"] = False
+    for value in tuple(node.values()):
+        _normalize_strict_terminal_schema(value)
 
 
 class TerminalSequentialPlanner:

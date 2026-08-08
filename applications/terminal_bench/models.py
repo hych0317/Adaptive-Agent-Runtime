@@ -198,7 +198,10 @@ class TerminalTurnDraft(TerminalModel):
     timeout_sec: int | None = Field(default=None, ge=1)
     process_reference: TerminalProcessReference | None = None
     summary: str | None = Field(default=None, min_length=1)
-    rationale: str = Field(min_length=1)
+    rationale: str = Field(
+        default="Model-proposed terminal turn.",
+        min_length=1,
+    )
 
     @model_validator(mode="after")
     def validate_turn(self) -> TerminalTurnDraft:

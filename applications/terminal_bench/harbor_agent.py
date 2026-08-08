@@ -236,6 +236,16 @@ class AdaptiveRuntimeHarborAgent(BaseAgent):  # type: ignore[misc]
         self._application_factory = application_factory or build_terminal_application
         self._execution_policy = execution_policy or TerminalExecutionPolicy()
 
+    def _get_env(self, key: str, *alternatives: str) -> str | None:
+        import os
+
+        for name in (key, *alternatives):
+            if name in self._extra_env:
+                return self._extra_env[name]
+            if name in os.environ:
+                return os.environ[name]
+        return None
+
     @staticmethod
     def name() -> str:
         return "adaptive-agent-runtime-terminal-sequential"

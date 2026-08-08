@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
-from typing import cast
+from typing import Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import JsonValue, SecretStr
@@ -25,9 +27,16 @@ from adaptive_agent_runtime.governance import (
 )
 from adaptive_agent_runtime.llm import (
     AnthropicAPITargetDefinition,
+    AsyncJSONTransport,
+    AsyncProcessTransport,
     AnthropicMessagesConfig,
+    BackendLimits,
     BackendMetering,
     BackendTransportFeatures,
+    CodexCLIAuthProbeMode,
+    CodexCLIInferenceConfig,
+    CodexCLIInferenceTargetDefinition,
+    HTTPJSONResponse,
     InferenceExecutionBudget,
     InferenceGatewayPolicy,
     InferenceRoutingPolicy,
@@ -35,7 +44,9 @@ from adaptive_agent_runtime.llm import (
     ManagedInferenceComposition,
     OpenAICompatibleService,
     OpenAICompatibleTargetDefinition,
+    ReasoningEffort,
     StructuredOutputLevel,
+    SubprocessTransport,
     compose_managed_inference,
 )
 from adaptive_agent_runtime.persistence import SQLitePersistence
@@ -83,13 +94,219 @@ _TERMINAL_TRIAL_NAMESPACE = uuid5(
 )
 
 
+class _RequestBodyOverrideJSONTransport:
+    """Apply explicit provider request extensions before transport."""
+
+    module_id = "terminal_bench.transport.request_body_override"
+
+    def __init__(
+        self,
+        delegate: AsyncJSONTransport,
+        overrides: Mapping[str, object],
+    ) -> None:
+        self._delegate = delegate
+        self._overrides = dict(overrides)
+
+    async def get_json(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+    ) -> HTTPJSONResponse:
+        return await self._delegate.get_json(
+            url,
+            headers=headers,
+            timeout_seconds=timeout_seconds,
+        )
+
+    async def post_json(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        body: Mapping[str, object],
+        timeout_seconds: float,
+    ) -> HTTPJSONResponse:
+        extended_body = dict(body)
+        extended_body.update(self._overrides)
+        return await self._delegate.post_json(
+            url,
+            headers=headers,
+            body=extended_body,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+class _TrailingJSONDelimiterRepairTransport:
+    """Remove only redundant JSON closing delimiters after one valid object."""
+
+    module_id = "terminal_bench.transport.trailing_json_delimiter_repair"
+    _allowed_trailing_characters = frozenset(' \t\r\n"}]')
+
+    def __init__(self, delegate: AsyncJSONTransport) -> None:
+        self._delegate = delegate
+
+    async def get_json(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+    ) -> HTTPJSONResponse:
+        return await self._delegate.get_json(
+            url,
+            headers=headers,
+            timeout_seconds=timeout_seconds,
+        )
+
+    async def post_json(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        body: Mapping[str, object],
+        timeout_seconds: float,
+    ) -> HTTPJSONResponse:
+        response = await self._delegate.post_json(
+            url,
+            headers=headers,
+            body=body,
+            timeout_seconds=timeout_seconds,
+        )
+        return self._repair(response)
+
+    def _repair(self, response: HTTPJSONResponse) -> HTTPJSONResponse:
+        response_body = response.body
+        if not isinstance(response_body, Mapping):
+            return response
+        choices = response_body.get("choices")
+        if not isinstance(choices, (list, tuple)) or not choices:
+            return response
+        first_choice = choices[0]
+        if not isinstance(first_choice, Mapping):
+            return response
+        message = first_choice.get("message")
+        if not isinstance(message, Mapping):
+            return response
+        content = message.get("content")
+        if not isinstance(content, str):
+            return response
+        try:
+            json.loads(content)
+            return response
+        except json.JSONDecodeError:
+            pass
+        try:
+            parsed, end = json.JSONDecoder().raw_decode(content)
+        except json.JSONDecodeError:
+            return response
+        trailing = content[end:]
+        if (
+            not isinstance(parsed, dict)
+            or not trailing
+            or any(
+                character not in self._allowed_trailing_characters
+                for character in trailing
+            )
+        ):
+            return response
+        normalized_body = response.model_dump(mode="json")["body"]
+        assert isinstance(normalized_body, dict)
+        normalized_choices = list(normalized_body["choices"])
+        normalized_choice = dict(normalized_choices[0])
+        normalized_message = dict(normalized_choice["message"])
+        normalized_message["content"] = json.dumps(
+            parsed,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        normalized_choice["message"] = normalized_message
+        normalized_choices[0] = normalized_choice
+        normalized_body["choices"] = normalized_choices
+        return HTTPJSONResponse(
+            status_code=response.status_code,
+            headers=response.headers,
+            body=normalized_body,
+        )
+
+
+class _CapturingJSONTransport:
+    """Persist provider responses without recording request-side secrets."""
+
+    module_id = "terminal_bench.transport.response_capture"
+
+    def __init__(
+        self,
+        delegate: AsyncJSONTransport,
+        capture_path: str | Path,
+    ) -> None:
+        self._delegate = delegate
+        self._capture_path = Path(capture_path)
+
+    async def get_json(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        timeout_seconds: float,
+    ) -> HTTPJSONResponse:
+        response = await self._delegate.get_json(
+            url,
+            headers=headers,
+            timeout_seconds=timeout_seconds,
+        )
+        self._append_response(response)
+        return response
+
+    async def post_json(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        body: Mapping[str, object],
+        timeout_seconds: float,
+    ) -> HTTPJSONResponse:
+        response = await self._delegate.post_json(
+            url,
+            headers=headers,
+            body=body,
+            timeout_seconds=timeout_seconds,
+        )
+        self._append_response(response)
+        return response
+
+    def _append_response(self, response: HTTPJSONResponse) -> None:
+        record = {
+            "status_code": response.status_code,
+            "body": response.model_dump(mode="json")["body"],
+        }
+        encoded = (
+            json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        fd = os.open(
+            self._capture_path,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o600,
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, encoded)
+        finally:
+            os.close(fd)
+
+
 @dataclass(frozen=True)
 class TerminalModelConfig:
     model_name: str
     api_key: str | None = None
     base_url: str | None = None
-    max_output_tokens: int | None = 2048
-    inference_timeout_sec: float = 180.0
+    max_output_tokens: int | None = 32768
+    inference_timeout_sec: float = 300.0
+    deepseek_reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH
+    deepseek_thinking: Literal["enabled", "disabled"] = "enabled"
+    codex_executable: str = "codex"
+    codex_reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH
 
 
 @dataclass(frozen=True)
@@ -192,7 +409,13 @@ def build_terminal_application(
         if model_config is None:
             persistence.close()
             raise ValueError("model_config or proposal_capability is required")
-        capability, _ = build_terminal_model_capability(model_config)
+        capability, _ = build_terminal_model_capability(
+            model_config,
+            transport=_CapturingJSONTransport(
+                HttpxJSONTransport(),
+                root / "aar-model-responses.jsonl",
+            ),
+        )
 
     catalog = InMemoryCapabilityCatalog()
     catalog.register(
@@ -293,10 +516,18 @@ def build_terminal_application(
 
 def build_terminal_model_capability(
     config: TerminalModelConfig,
+    *,
+    transport: AsyncJSONTransport | None = None,
+    process_transport: AsyncProcessTransport | None = None,
 ) -> tuple[GatewayTerminalTurnProposalCapability, ManagedInferenceComposition]:
     provider, model_id = _split_model_name(config.model_name)
+    structured_output = (
+        StructuredOutputLevel.JSON_OBJECT
+        if provider == "deepseek"
+        else StructuredOutputLevel.JSON_SCHEMA
+    )
     features = BackendTransportFeatures(
-        structured_output=StructuredOutputLevel.JSON_SCHEMA,
+        structured_output=structured_output,
         tool_intent=False,
         multimodal=False,
     )
@@ -306,8 +537,27 @@ def build_terminal_model_capability(
     )
     secret = SecretStr(config.api_key) if config.api_key else None
     target_id = f"terminal-bench:{provider}:{model_id}"
-    definition: AnthropicAPITargetDefinition | OpenAICompatibleTargetDefinition
-    if provider == "anthropic":
+    if provider == "codex-cli":
+        codex_definition = CodexCLIInferenceTargetDefinition(
+            target_id=target_id,
+            model_id=model_id,
+            features=features,
+            supported_cognitive_capability_ids=("terminal_turn_proposal",),
+            config=CodexCLIInferenceConfig(
+                executable=config.codex_executable,
+                auth_probe_mode=CodexCLIAuthProbeMode.REQUIRED,
+                reasoning_effort=config.codex_reasoning_effort,
+            ),
+            metering=metering,
+            limits=BackendLimits(
+                default_timeout_seconds=config.inference_timeout_sec,
+            ),
+        )
+        backend = codex_definition.build_backend(
+            process_transport or SubprocessTransport()
+        )
+    elif provider == "anthropic":
+        definition: AnthropicAPITargetDefinition | OpenAICompatibleTargetDefinition
         definition = AnthropicAPITargetDefinition(
             target_id=target_id,
             model_id=model_id,
@@ -319,6 +569,7 @@ def build_terminal_model_capability(
             ),
             metering=metering,
         )
+        backend = definition.build_backend(transport or HttpxJSONTransport())
     else:
         service = {
             "openai": OpenAICompatibleService.OPENAI,
@@ -330,7 +581,7 @@ def build_terminal_model_capability(
         if service is None:
             raise ValueError(
                 "unsupported Harbor model provider; expected openai, anthropic, "
-                "deepseek, qwen, qwen-international, or local"
+                "deepseek, qwen, qwen-international, local, or codex-cli"
             )
         definition = OpenAICompatibleTargetDefinition(
             service=service,
@@ -341,8 +592,26 @@ def build_terminal_model_capability(
             base_url=config.base_url,
             api_key=secret,
             metering=metering,
+            reasoning_effort=(
+                config.deepseek_reasoning_effort
+                if provider == "deepseek"
+                else None
+            ),
         )
-    backend = definition.build_backend(HttpxJSONTransport())
+        selected_transport = transport or HttpxJSONTransport()
+        if provider == "deepseek":
+            selected_transport = _RequestBodyOverrideJSONTransport(
+                selected_transport,
+                {
+                    "thinking": {
+                        "type": config.deepseek_thinking,
+                    }
+                },
+            )
+            selected_transport = _TrailingJSONDelimiterRepairTransport(
+                selected_transport
+            )
+        backend = definition.build_backend(selected_transport)
     inference = compose_managed_inference((backend,))
     gateway_policy = InferenceGatewayPolicy(
         routing=InferenceRoutingPolicy(
@@ -359,7 +628,13 @@ def build_terminal_model_capability(
         gateway=inference.gateway,
         gateway_policy=gateway_policy,
         target_id=target_id,
-        max_output_tokens=config.max_output_tokens,
+        required_structured_output=structured_output,
+        max_output_tokens=(
+            None
+            if provider == "codex-cli"
+            else config.max_output_tokens
+        ),
+        strict_json_schema=(provider == "codex-cli"),
     )
     return capability, inference
 

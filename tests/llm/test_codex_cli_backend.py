@@ -46,6 +46,9 @@ from adaptive_agent_runtime.llm import (
 from adaptive_agent_runtime.llm.providers.cli_integration import (
     resolve_codex_native_binary,
 )
+from adaptive_agent_runtime.llm.providers.codex_cli import (
+    _remove_ephemeral_workspace_cwd,
+)
 
 
 class RecordingProcessTransport:
@@ -211,6 +214,25 @@ class CodexCLIInferenceBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.protocol_version, "codex-exec-jsonl-v1")
         self.assertEqual(result.available_model_ids, ("default", "gpt-test"))
         self.assertEqual(len(transport.calls), 3)
+
+    def test_ephemeral_workspace_cwd_is_removed_at_backend_boundary(self) -> None:
+        workspace = "/tmp/aar-codex-inference-test"
+        self.assertEqual(
+            _remove_ephemeral_workspace_cwd(
+                {
+                    "execute": True,
+                    "command": "pwd",
+                    "cwd": workspace + "/nested",
+                },
+                workspace,
+            ),
+            {"execute": True, "command": "pwd", "cwd": None},
+        )
+        external = {"execute": True, "command": "pwd", "cwd": "/app"}
+        self.assertIs(
+            _remove_ephemeral_workspace_cwd(external, workspace),
+            external,
+        )
 
     async def test_open_design_version_probe_failure_semantics_are_preserved(
         self,
