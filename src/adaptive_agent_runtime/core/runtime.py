@@ -10,6 +10,7 @@ from pydantic import JsonValue
 
 from adaptive_agent_runtime.core.contracts import (
     ActionExecutor,
+    ObservationReconciler,
     Planner,
     StateStore,
     TraceSink,
@@ -185,6 +186,14 @@ class AgentRuntime:
     ) -> RunResult:
         """Drive one Run while its aggregate budget ledger is context-bound."""
 
+        reconciliation_error = await self._reconcile_observation(state)
+        if reconciliation_error is not None:
+            return await self._fail_run(
+                state,
+                reconciliation_error,
+                source=self._planner.module_id,
+                control=control,
+            )
         while True:
             usage = await ledger.snapshot()
             control = self._termination.with_usage(control, usage)
@@ -500,6 +509,15 @@ class AgentRuntime:
             await self._save_state(state)
             await self._emit_state_update(previous, state)
 
+            reconciliation_error = await self._reconcile_observation(state)
+            if reconciliation_error is not None:
+                return await self._fail_run(
+                    state,
+                    reconciliation_error,
+                    source=self._planner.module_id,
+                    control=control,
+                )
+
             if execution_error is not None:
                 return await self._fail_run(
                     state,
@@ -596,6 +614,22 @@ class AgentRuntime:
             raise RuntimeInfrastructureError(
                 f"state store '{self._state_store.module_id}' failed"
             ) from exc
+
+    async def _reconcile_observation(self, state: AgentState) -> str | None:
+        if state.last_observation is None or not isinstance(
+            self._planner,
+            ObservationReconciler,
+        ):
+            return None
+        try:
+            await self._planner.reconcile_observation(state)
+        except Exception as exc:
+            return self._module_error(
+                "observation reconciliation",
+                self._planner.module_id,
+                exc,
+            )
+        return None
 
     async def _load_state(self, run_id: UUID) -> AgentState | None:
         try:

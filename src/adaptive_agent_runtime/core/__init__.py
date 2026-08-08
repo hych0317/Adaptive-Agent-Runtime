@@ -2,6 +2,7 @@
 
 from adaptive_agent_runtime.core.contracts import (
     ActionExecutor,
+    ObservationReconciler,
     Planner,
     RuntimeModule,
     StateStore,
@@ -61,6 +62,7 @@ __all__ = [
     "InMemoryTraceSink",
     "Observation",
     "ObservationControl",
+    "ObservationReconciler",
     "OutcomeCertainty",
     "PlanDecision",
     "PlanDecisionType",

@@ -568,7 +568,7 @@ class TerminalSequentialPlanner:
         self._policy = policy or TerminalExecutionPolicy()
 
     async def plan(self, state: AgentState) -> PlanDecision:
-        self._commit_core_observation(state)
+        await self.reconcile_observation(state)
         pending = self._journal.pending()
         if pending is not None:
             return PlanDecision.execute(
@@ -674,6 +674,11 @@ class TerminalSequentialPlanner:
             )
         )
         return PlanDecision.execute(action, reason=draft.rationale)
+
+    async def reconcile_observation(self, state: AgentState) -> None:
+        """Commit Core's persisted observation without starting another turn."""
+
+        self._commit_core_observation(state)
 
     def _commit_core_observation(self, state: AgentState) -> None:
         pending = self._journal.pending()
