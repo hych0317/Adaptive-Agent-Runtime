@@ -52,6 +52,15 @@ class FeedbackPlanner:
         )
 
 
+class ReconcilingPlanner(FeedbackPlanner):
+    def __init__(self, target_steps: int = 1) -> None:
+        super().__init__(target_steps)
+        self.reconciled_states: list[AgentState] = []
+
+    async def reconcile_observation(self, state: AgentState) -> None:
+        self.reconciled_states.append(state)
+
+
 class CountingExecutor:
     module_id = "test.counting_executor"
 
@@ -423,6 +432,32 @@ class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             result.final_state.termination.primary_reason,
             RunTerminationReason.NO_PROGRESS_STEPS,
+        )
+
+    async def test_observation_is_reconciled_before_after_action_termination(
+        self,
+    ) -> None:
+        planner = ReconcilingPlanner(target_steps=10)
+        result = await AgentRuntime(
+            planner=planner,
+            executor=NoProgressExecutor(),
+            state_store=InMemoryStateStore(),
+            trace_sink=InMemoryTraceSink(),
+            stop_policy=RunStopPolicy(
+                max_action_steps=10,
+                repeated_invocation_limit=None,
+                max_no_progress_steps=1,
+                max_no_progress_seconds=None,
+            ),
+        ).run(AgentTask(description="reconcile the terminal observation"))
+
+        self.assertEqual(result.final_state.status, RunStatus.TERMINATED)
+        self.assertEqual(len(planner.reconciled_states), 1)
+        reconciled = planner.reconciled_states[0]
+        self.assertEqual(reconciled.step_count, 1)
+        self.assertEqual(
+            reconciled.last_observation,
+            result.final_state.last_observation,
         )
 
     async def test_critical_nonrecoverable_failure_is_structured_failure(self) -> None:

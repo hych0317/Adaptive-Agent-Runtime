@@ -198,6 +198,36 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
+    async def test_no_progress_termination_commits_last_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = build_terminal_application(
+                trial_id="trial-no-progress-termination",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(return_code=1, stderr="unchanged")
+                ),
+                proposal_capability=ScriptedTerminalTurnCapability(
+                    execute_draft("false")
+                ),
+                policy=TerminalExecutionPolicy(
+                    max_no_progress_steps=1,
+                    max_no_progress_seconds=None,
+                ),
+            )
+            try:
+                artifacts = await app.run("stop after no progress")
+
+                self.assertEqual(
+                    artifacts.runtime_result.final_state.status,
+                    RunStatus.TERMINATED,
+                )
+                self.assertEqual(artifacts.summary.command_count, 1)
+                self.assertTrue(artifacts.summary.trace_consistent)
+                self.assertIsNone(app.journal.pending())
+                self.assertEqual(len(app.journal.records()), 1)
+            finally:
+                app.close()
+
     async def test_failed_to_start_is_provider_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             environment = FakeTerminalEnvironment(

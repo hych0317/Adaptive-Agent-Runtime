@@ -37,6 +37,16 @@ class Planner(RuntimeModule, Protocol):
 
 
 @runtime_checkable
+class ObservationReconciler(RuntimeModule, Protocol):
+    """Idempotently consume the latest observation persisted by Core."""
+
+    async def reconcile_observation(self, state: AgentState) -> None:
+        """Commit application state derived from Core's latest observation."""
+
+        ...
+
+
+@runtime_checkable
 class ActionExecutor(RuntimeModule, Protocol):
     """Execute a generic action and return its observation."""
 
@@ -73,4 +83,3 @@ class TraceSink(RuntimeModule, Protocol):
         """Persist an event and assign its per-run sequence number."""
 
         ...
-
