@@ -27,11 +27,13 @@ from applications.terminal_bench.composition import (
     build_terminal_model_capability,
 )
 from applications.terminal_bench.models import (
+    TerminalExecutionPolicy,
     TerminalSessionSnapshot,
     TerminalTurnRequest,
 )
 from applications.terminal_bench.planner import (
     GatewayTerminalTurnProposalCapability,
+    _resolve_terminal_cwd,
     _terminal_turn_response_schema,
 )
 
@@ -118,6 +120,13 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             ReasoningEffort.HIGH,
         )
         self.assertEqual(config.deepseek_thinking, "enabled")
+
+    def test_terminal_context_is_bounded_within_total_token_budget(self) -> None:
+        policy = TerminalExecutionPolicy()
+
+        self.assertEqual(policy.max_total_tokens, 200_000)
+        self.assertEqual(policy.max_context_output_characters, 6_000)
+        self.assertEqual(policy.max_context_records, 8)
 
     def test_deepseek_uses_json_object_without_changing_other_providers(self) -> None:
         deepseek_capability, deepseek_inference = build_terminal_model_capability(
@@ -321,9 +330,28 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             ("call_key", "command"),
         )
         instruction = valid_gateway.request.input["instruction"]
-        self.assertIn("For execute, include a stable call_key", instruction)
+        self.assertIn("unique across payload.recent_history", instruction)
+        self.assertIn("never '.' or another relative path", instruction)
+        self.assertIn("not a copy of the production algorithm", instruction)
+        self.assertIn("complete reported set", instruction)
         self.assertIn("Never return rationale", instruction)
 
+    def test_terminal_cwd_is_normalized_before_docker_execution(self) -> None:
+        self.assertIsNone(_resolve_terminal_cwd(".", None))
+        self.assertIsNone(_resolve_terminal_cwd(None, "."))
+        self.assertEqual(_resolve_terminal_cwd(".", "/app"), "/app")
+        self.assertEqual(
+            _resolve_terminal_cwd("generated", "/app"),
+            "/app/generated",
+        )
+        self.assertEqual(
+            _resolve_terminal_cwd("/app/../tmp", "/app"),
+            "/tmp",
+        )
+        with self.assertRaisesRegex(ValueError, "absolute POSIX path"):
+            _resolve_terminal_cwd("generated", None)
+
+    async def test_invalid_json_object_turn_is_rejected_locally(self) -> None:
         invalid_gateway = _RecordingGateway(
             {
                 "decision": "complete",

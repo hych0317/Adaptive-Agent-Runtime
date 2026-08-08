@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import posixpath
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
@@ -62,6 +63,7 @@ _EXECUTION_SEMANTICS = (
     "Every exec call is an independent, non-interactive shell; shell-local state is not persistent.",
     "Do not rely on a previous cd, export, alias, shell variable, or interactive session.",
     "Use cwd for the working directory and env for the complete explicit environment map.",
+    "cwd must be null or an absolute POSIX path; never pass '.' or another relative path.",
     "A non-zero return code is an observed completed command, not a transport failure.",
     "IN_DOUBT means the command may have started; never repeat it. Use a new inspection command.",
     "Start background services in detached form and supply PID file, log path, and status command.",
@@ -405,14 +407,25 @@ class GatewayTerminalTurnProposalCapability:
                     "Solve the terminal task one bounded command at a time. "
                     "Return exactly one execute or complete draft. The Runtime, "
                     "not you, owns execution authority. Respect every execution "
-                    "semantic supplied in the payload. Reserve a command for "
-                    "independent verification after changing task artifacts. "
+                    "semantic supplied in the payload. Inspect representative "
+                    "authoritative inputs before editing; do not infer record "
+                    "semantics solely from filenames. Derive every output field "
+                    "from task artifacts instead of fabricating expected data. "
+                    "If an installer reports missing or conflicting dependencies, "
+                    "address the complete reported set before verification. "
+                    "Reserve a command for independent verification after changing "
+                    "task artifacts. Verification must use separately derived "
+                    "evidence or official tests, not a copy of the production "
+                    "algorithm. "
                     "Do not complete unless the last committed command is a "
-                    "successful verify command. For execute, include a stable "
-                    "call_key and command, and set summary to null. For complete, "
-                    "include summary and set call_key, command, command_role, cwd, "
-                    "env, timeout_sec, and process_reference to null. Never return rationale; "
-                    "the Runtime supplies its local audit reason."
+                    "successful verify command. For execute, include a call_key "
+                    "that is unique across payload.recent_history; retries need a "
+                    "new attempt suffix. Set cwd to null or an absolute POSIX path, "
+                    "never '.' or another relative path, and set summary to null. "
+                    "For complete, include summary and set call_key, command, "
+                    "command_role, cwd, env, timeout_sec, and process_reference to "
+                    "null. Never return rationale; the Runtime supplies its local "
+                    "audit reason."
                 ),
                 "payload": request.model_dump(mode="json"),
             },
@@ -718,7 +731,7 @@ class TerminalSequentialPlanner:
             and draft.command is not None
             and draft.command_role is not None
         )
-        cwd = draft.cwd if draft.cwd is not None else session.current_cwd
+        cwd = _resolve_terminal_cwd(draft.cwd, session.current_cwd)
         environment = (
             dict(draft.env)
             if draft.env is not None
@@ -786,6 +799,28 @@ class TerminalSequentialPlanner:
         ):
             return "terminal model cost budget exhausted"
         return None
+
+
+def _resolve_terminal_cwd(
+    proposed_cwd: str | None,
+    current_cwd: str | None,
+) -> str | None:
+    if proposed_cwd in (None, ".", "./"):
+        candidate = current_cwd
+    else:
+        candidate = proposed_cwd
+    if candidate in (None, ".", "./"):
+        return None
+    if candidate.startswith("/"):
+        return posixpath.normpath(candidate)
+    if current_cwd is not None and current_cwd.startswith("/"):
+        resolved = posixpath.normpath(posixpath.join(current_cwd, candidate))
+        if resolved.startswith("/"):
+            return resolved
+    raise ValueError(
+        "cwd must be an absolute POSIX path when no absolute current cwd "
+        "is available"
+    )
 
 
 def process_reference(
