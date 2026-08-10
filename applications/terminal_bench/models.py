@@ -131,10 +131,21 @@ class TerminalVerificationContract(TerminalModel):
 class TerminalExecutionLimits(TerminalModel):
     default_timeout_sec: int = Field(default=120, ge=1)
     max_timeout_sec: int = Field(default=300, ge=1)
+    max_verification_timeout_sec: int = Field(default=120, ge=1)
     cleanup_grace_seconds: float = Field(default=10.0, ge=0.0)
     max_command_characters: int = Field(default=20_000, ge=1)
     max_environment_variables: int = Field(default=64, ge=0)
     max_environment_value_characters: int = Field(default=4096, ge=1)
+
+    @model_validator(mode="after")
+    def validate_timeouts(self) -> TerminalExecutionLimits:
+        if self.default_timeout_sec > self.max_timeout_sec:
+            raise ValueError("default timeout cannot exceed maximum timeout")
+        if self.max_verification_timeout_sec > self.max_timeout_sec:
+            raise ValueError(
+                "verification timeout cannot exceed maximum timeout"
+            )
+        return self
 
 
 class TerminalToolCapabilities(TerminalModel):
@@ -228,6 +239,7 @@ class TerminalExecutionPolicy(TerminalModel):
     max_commands: int = Field(default=64, ge=1, le=512)
     default_timeout_sec: int = Field(default=120, ge=1)
     max_timeout_sec: int = Field(default=300, ge=1)
+    max_verification_timeout_sec: int = Field(default=120, ge=1)
     provider_grace_sec: int = Field(default=10, ge=1, le=120)
     max_command_characters: int = Field(default=20_000, ge=1)
     max_output_characters: int = Field(default=64_000, ge=1)
@@ -329,6 +341,7 @@ class TerminalTurnRequest(TerminalModel):
     elapsed_seconds: float = Field(default=0.0, ge=0.0)
     remaining_wall_clock_seconds: float | None = Field(default=None, ge=0.0)
     delivery_mode: bool = False
+    emergency_mode: bool = False
     recovery_mode: bool = False
     artifact_first_mode: bool = False
     repair_mode: bool = False

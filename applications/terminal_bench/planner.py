@@ -509,6 +509,7 @@ class GatewayTerminalTurnProposalCapability:
         required_structured_output: StructuredOutputLevel = StructuredOutputLevel.JSON_SCHEMA,
         strict_json_schema: bool = False,
         delivery_timeout_seconds: float = 120.0,
+        emergency_timeout_seconds: float = 90.0,
         minimum_timeout_seconds: float = 120.0,
         minimum_delivery_timeout_seconds: float = 60.0,
     ) -> None:
@@ -521,6 +522,9 @@ class GatewayTerminalTurnProposalCapability:
         if delivery_timeout_seconds <= 0:
             raise ValueError("delivery inference timeout must be positive")
         self._delivery_timeout_seconds = delivery_timeout_seconds
+        if emergency_timeout_seconds <= 0:
+            raise ValueError("emergency inference timeout must be positive")
+        self._emergency_timeout_seconds = emergency_timeout_seconds
         if minimum_timeout_seconds <= 0:
             raise ValueError("minimum inference timeout must be positive")
         self._minimum_timeout_seconds = minimum_timeout_seconds
@@ -534,6 +538,11 @@ class GatewayTerminalTurnProposalCapability:
         if delivery_timeout_seconds < minimum_delivery_timeout_seconds:
             raise ValueError(
                 "delivery inference timeout cannot be below the minimum "
+                "delivery timeout"
+            )
+        if emergency_timeout_seconds < minimum_delivery_timeout_seconds:
+            raise ValueError(
+                "emergency inference timeout cannot be below the minimum "
                 "delivery timeout"
             )
 
@@ -584,6 +593,11 @@ class GatewayTerminalTurnProposalCapability:
                     "or repair command. Keep that command focused enough to preserve "
                     "time for one final verification. Treat "
                     "payload.remaining_wall_clock_seconds as a hard budget. "
+                    "If payload.emergency_mode is true, this is the single compact "
+                    "recovery turn after a delivery inference timeout: return only "
+                    "complete, the shortest sufficient independent verification, "
+                    "or one bounded recovery command that fits the advertised "
+                    "dynamic timeout. Do not perform broad analysis. "
                     "If payload.repair_mode is true, issue one work command that "
                     "addresses the complete exact failure set from the latest "
                     "verification; do not inspect, verify, or complete first. If "
@@ -629,6 +643,8 @@ class GatewayTerminalTurnProposalCapability:
                     "never request a value above max_timeout_sec. The only execution "
                     "tool is shell_exec. apply_patch is explicitly unavailable; use "
                     "a portable file edit method listed in payload.tool_capabilities. "
+                    "For verify, also keep timeout_sec at or below "
+                    "payload.execution_limits.max_verification_timeout_sec. "
                     "For inspect or work, set verification to null. For verify, provide a "
                     "verification object naming official tests or an independently "
                     "derived check, its evidence sources, affected artifact paths, "
@@ -720,10 +736,16 @@ class GatewayTerminalTurnProposalCapability:
                 bounded = min(bounded, configured)
             if (
                 request.delivery_mode
+                or request.emergency_mode
                 or request.repair_mode
                 or request.verification_due
             ):
-                bounded = min(bounded, self._delivery_timeout_seconds)
+                timeout_cap = (
+                    self._emergency_timeout_seconds
+                    if request.emergency_mode
+                    else self._delivery_timeout_seconds
+                )
+                bounded = min(bounded, timeout_cap)
             gateway_policy = gateway_policy.model_copy(
                 update={
                     "budget": gateway_policy.budget.model_copy(
@@ -733,11 +755,16 @@ class GatewayTerminalTurnProposalCapability:
             )
         elif (
             request.delivery_mode
+            or request.emergency_mode
             or request.repair_mode
             or request.verification_due
         ):
             configured = gateway_policy.budget.max_elapsed_seconds
-            bounded = self._delivery_timeout_seconds
+            bounded = (
+                self._emergency_timeout_seconds
+                if request.emergency_mode
+                else self._delivery_timeout_seconds
+            )
             if configured is not None:
                 bounded = min(bounded, configured)
             gateway_policy = gateway_policy.model_copy(
@@ -752,6 +779,7 @@ class GatewayTerminalTurnProposalCapability:
             self._minimum_delivery_timeout_seconds
             if (
                 request.delivery_mode
+                or request.emergency_mode
                 or request.repair_mode
                 or request.verification_due
             )
@@ -1068,25 +1096,43 @@ class TerminalSequentialPlanner:
         try:
             proposal = await self._capability.propose(request)
         except InferenceExecutionBudgetError as exc:
-            if request.delivery_mode:
+            if request.emergency_mode:
                 raise RunBudgetExhaustedError(
                     "active_execution",
-                    "terminal delivery inference budget exhausted: " + exc.reason,
+                    "terminal emergency inference budget exhausted: "
+                    + exc.reason,
                 ) from exc
-            retry_request = self._turn_request(
-                state,
-                session,
-                force_delivery=True,
-            )
-            try:
-                proposal = await self._capability.propose(retry_request)
-            except InferenceExecutionBudgetError as retry_exc:
-                raise RunBudgetExhaustedError(
-                    "active_execution",
-                    "terminal inference recovery budget exhausted: "
-                    + retry_exc.reason,
-                ) from retry_exc
-            request = retry_request
+            if request.delivery_mode:
+                retry_request = self._turn_request(
+                    state,
+                    session,
+                    force_delivery=True,
+                    force_emergency=True,
+                )
+                try:
+                    proposal = await self._capability.propose(retry_request)
+                except InferenceExecutionBudgetError as retry_exc:
+                    raise RunBudgetExhaustedError(
+                        "active_execution",
+                        "terminal emergency inference budget exhausted: "
+                        + retry_exc.reason,
+                    ) from retry_exc
+                request = retry_request
+            else:
+                retry_request = self._turn_request(
+                    state,
+                    session,
+                    force_delivery=True,
+                )
+                try:
+                    proposal = await self._capability.propose(retry_request)
+                except InferenceExecutionBudgetError as retry_exc:
+                    raise RunBudgetExhaustedError(
+                        "active_execution",
+                        "terminal inference recovery budget exhausted: "
+                        + retry_exc.reason,
+                    ) from retry_exc
+                request = retry_request
         self._journal.record_usage(proposal)
         session = self._journal.snapshot()
         budget_error = self._budget_error(
@@ -1160,6 +1206,7 @@ class TerminalSequentialPlanner:
                 recovery_mode=request.recovery_mode,
                 repair_mode=request.repair_mode,
                 verification_due=request.verification_due,
+                deadline_timeout_sec=self._deadline_timeout_limit(session),
                 required_requirements=_task_requirements(
                     state.task.description
                 ),
@@ -1293,16 +1340,22 @@ class TerminalSequentialPlanner:
         session: TerminalSessionSnapshot,
         *,
         force_delivery: bool = False,
+        force_emergency: bool = False,
     ) -> TerminalTurnRequest:
         requirements = _task_requirements(state.task.description)
         elapsed_seconds = max(
             0.0,
             (utc_now() - session.started_at).total_seconds(),
         )
-        remaining_wall_clock_seconds = (
-            None
-            if self._policy.max_wall_clock_seconds is None
-            else max(0.0, self._policy.max_wall_clock_seconds - elapsed_seconds)
+        remaining_wall_clock_seconds = self._remaining_wall_clock_seconds(
+            session,
+        )
+        dynamic_timeout_sec = self._dynamic_timeout_limit(
+            remaining_wall_clock_seconds
+        )
+        dynamic_verification_timeout_sec = min(
+            dynamic_timeout_sec,
+            self._policy.max_verification_timeout_sec,
         )
         delivery_mode = force_delivery or bool(
             self._policy.max_wall_clock_seconds is not None
@@ -1380,8 +1433,14 @@ class TerminalSequentialPlanner:
             recent_history=history,
             used_call_keys=used_call_keys,
             execution_limits=TerminalExecutionLimits(
-                default_timeout_sec=self._policy.default_timeout_sec,
-                max_timeout_sec=self._policy.max_timeout_sec,
+                default_timeout_sec=min(
+                    self._policy.default_timeout_sec,
+                    dynamic_timeout_sec,
+                ),
+                max_timeout_sec=dynamic_timeout_sec,
+                max_verification_timeout_sec=(
+                    dynamic_verification_timeout_sec
+                ),
                 cleanup_grace_seconds=self._policy.cleanup_grace_seconds,
                 max_command_characters=self._policy.max_command_characters,
                 max_environment_variables=(
@@ -1401,12 +1460,52 @@ class TerminalSequentialPlanner:
             elapsed_seconds=elapsed_seconds,
             remaining_wall_clock_seconds=remaining_wall_clock_seconds,
             delivery_mode=delivery_mode,
+            emergency_mode=force_emergency,
             recovery_mode=recovery_mode,
             artifact_first_mode=artifact_first_mode,
             repair_mode=repair_mode,
             verification_due=verification_due,
             execution_semantics=_EXECUTION_SEMANTICS,
         )
+
+    def _remaining_wall_clock_seconds(
+        self,
+        session: TerminalSessionSnapshot,
+    ) -> float | None:
+        if self._policy.max_wall_clock_seconds is None:
+            return None
+        elapsed_seconds = max(
+            0.0,
+            (utc_now() - session.started_at).total_seconds(),
+        )
+        return max(
+            0.0,
+            self._policy.max_wall_clock_seconds - elapsed_seconds,
+        )
+
+    def _dynamic_timeout_limit(
+        self,
+        remaining_wall_clock_seconds: float | None,
+    ) -> int:
+        if remaining_wall_clock_seconds is None:
+            return self._policy.max_timeout_sec
+        deadline_capacity = int(
+            max(
+                1.0,
+                remaining_wall_clock_seconds
+                - self._policy.cleanup_grace_seconds,
+            )
+        )
+        return min(self._policy.max_timeout_sec, deadline_capacity)
+
+    def _deadline_timeout_limit(
+        self,
+        session: TerminalSessionSnapshot,
+    ) -> int | None:
+        remaining = self._remaining_wall_clock_seconds(session)
+        if remaining is None:
+            return None
+        return max(0, int(remaining - self._policy.cleanup_grace_seconds))
 
     def _resolve_intent(
         self,
@@ -1424,7 +1523,13 @@ class TerminalSequentialPlanner:
             if draft.env is not None
             else dict(session.environment)
         )
-        timeout_sec = draft.timeout_sec or self._policy.default_timeout_sec
+        default_timeout_sec = self._policy.default_timeout_sec
+        if draft.command_role is TerminalCommandRole.VERIFY:
+            default_timeout_sec = min(
+                default_timeout_sec,
+                self._policy.max_verification_timeout_sec,
+            )
+        timeout_sec = draft.timeout_sec or default_timeout_sec
         return TerminalCommandIntent(
             trial_id=session.trial_id,
             call_key=draft.call_key,
@@ -1445,6 +1550,7 @@ class TerminalSequentialPlanner:
         recovery_mode: bool = False,
         repair_mode: bool = False,
         verification_due: bool = False,
+        deadline_timeout_sec: int | None = None,
         required_requirements: tuple[TerminalRequirement, ...],
     ) -> None:
         if session.verified_checkpoint is not None:
@@ -1528,6 +1634,40 @@ class TerminalSequentialPlanner:
                 field="timeout_sec",
                 rejected_value=intent.timeout_sec,
                 expected=f"an integer from 1 through {self._policy.max_timeout_sec}",
+            )
+        if (
+            intent.command_role is TerminalCommandRole.VERIFY
+            and intent.timeout_sec > self._policy.max_verification_timeout_sec
+        ):
+            raise _TerminalProposalValidationError(
+                code="terminal.verification.timeout_above_maximum",
+                message=(
+                    "verification timeout exceeds the bounded verification "
+                    "maximum"
+                ),
+                field="timeout_sec",
+                rejected_value=intent.timeout_sec,
+                expected=(
+                    "an integer from 1 through "
+                    f"{self._policy.max_verification_timeout_sec} for verify"
+                ),
+            )
+        if (
+            deadline_timeout_sec is not None
+            and intent.timeout_sec > deadline_timeout_sec
+        ):
+            raise _TerminalProposalValidationError(
+                code="terminal.timeout.insufficient_deadline",
+                message=(
+                    "timeout no longer fits the remaining Run wall-clock "
+                    "budget and cleanup grace"
+                ),
+                field="timeout_sec",
+                rejected_value=intent.timeout_sec,
+                expected=(
+                    "an integer from 1 through "
+                    f"{deadline_timeout_sec}; use the shortest viable command"
+                ),
             )
         if len(intent.env) > self._policy.max_environment_variables:
             raise _TerminalProposalValidationError(

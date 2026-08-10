@@ -304,6 +304,7 @@ class TerminalModelConfig:
     max_output_tokens: int | None = 32768
     inference_timeout_sec: float = 300.0
     delivery_inference_timeout_sec: float = 180.0
+    emergency_inference_timeout_sec: float = 90.0
     minimum_inference_timeout_sec: float = 120.0
     minimum_delivery_inference_timeout_sec: float = 60.0
     deepseek_reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH
@@ -641,6 +642,7 @@ def build_terminal_model_capability(
         ),
         strict_json_schema=(provider == "codex-cli"),
         delivery_timeout_seconds=config.delivery_inference_timeout_sec,
+        emergency_timeout_seconds=config.emergency_inference_timeout_sec,
         minimum_timeout_seconds=config.minimum_inference_timeout_sec,
         minimum_delivery_timeout_seconds=(
             config.minimum_delivery_inference_timeout_sec

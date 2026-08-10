@@ -168,6 +168,7 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(config.inference_timeout_sec, 300.0)
         self.assertEqual(config.delivery_inference_timeout_sec, 180.0)
+        self.assertEqual(config.emergency_inference_timeout_sec, 90.0)
         self.assertEqual(config.minimum_inference_timeout_sec, 120.0)
         self.assertEqual(
             config.minimum_delivery_inference_timeout_sec,
@@ -518,6 +519,31 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         payload = gateway.request.input["payload"]
         assert isinstance(payload, Mapping)
         self.assertTrue(payload["delivery_mode"])
+
+    async def test_emergency_mode_uses_compact_inference_timeout(self) -> None:
+        gateway = _RecordingGateway(
+            {"decision": "complete", "summary": "Task complete"}
+        )
+        capability = GatewayTerminalTurnProposalCapability(
+            gateway=gateway,
+            gateway_policy=InferenceGatewayPolicy(),
+            target_id="terminal-bench:deepseek:test-model",
+            required_structured_output=StructuredOutputLevel.JSON_OBJECT,
+            delivery_timeout_seconds=180.0,
+            emergency_timeout_seconds=90.0,
+        )
+        request = _turn_request().model_copy(
+            update={
+                "remaining_wall_clock_seconds": 480.0,
+                "delivery_mode": True,
+                "emergency_mode": True,
+            }
+        )
+
+        await capability.propose(request)
+
+        assert gateway.policy is not None
+        self.assertEqual(gateway.policy.budget.max_elapsed_seconds, 90.0)
 
     async def test_normal_inference_preserves_future_correction_slot(
         self,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -25,6 +26,7 @@ from applications.terminal_bench.models import (
     TerminalTurnProposal,
     TerminalTurnRequest,
     TerminalVerificationContract,
+    utc_now,
 )
 from applications.terminal_bench.planner import _identifies_official_test_source
 from tests.terminal_bench.fakes import (
@@ -304,20 +306,33 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
-    async def test_before_action_deadline_abandons_pending_trace(self) -> None:
+    async def test_deadline_is_corrected_before_pending_save(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            environment = FakeTerminalEnvironment()
+            environment = FakeTerminalEnvironment(
+                completed_result(stdout="corrected"),
+                completed_result(stdout="verified"),
+            )
             app = build_terminal_application(
                 trial_id="trial-action-abandoned",
                 logs_dir=directory,
                 environment=environment,
                 proposal_capability=ScriptedTerminalTurnCapability(
-                    execute_draft("sleep 1", timeout_sec=10)
+                    execute_draft(
+                        "sleep 1",
+                        call_key="too-wide",
+                        timeout_sec=30,
+                    ),
+                    execute_draft(
+                        "printf corrected",
+                        call_key="corrected",
+                        timeout_sec=1,
+                    ),
+                    verify_draft("true", timeout_sec=1),
                 ),
                 policy=TerminalExecutionPolicy(
                     default_timeout_sec=10,
-                    max_timeout_sec=10,
-                    max_wall_clock_seconds=5.0,
+                    max_timeout_sec=30,
+                    max_wall_clock_seconds=20.0,
                     cleanup_grace_seconds=1.0,
                     max_no_progress_steps=None,
                     max_no_progress_seconds=None,
@@ -326,17 +341,18 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             try:
                 artifacts = await app.run("run a command only when admitted")
 
-                self.assertEqual(
-                    artifacts.runtime_result.final_state.status,
-                    RunStatus.TERMINATED,
-                )
-                self.assertEqual(environment.calls, [])
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertEqual(len(environment.calls), 2)
                 self.assertIsNone(app.journal.pending())
                 self.assertTrue(artifacts.summary.trace_consistent)
                 transcript = Path(directory, "aar-transcript.jsonl").read_text(
                     encoding="utf-8"
                 )
-                self.assertIn('"kind": "pending.abandoned"', transcript)
+                self.assertIn(
+                    '"code": "terminal.timeout.insufficient_deadline"',
+                    transcript,
+                )
+                self.assertNotIn('"kind": "pending.abandoned"', transcript)
             finally:
                 app.close()
 
@@ -1023,6 +1039,93 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(capability.requests), 2)
                 self.assertFalse(capability.requests[0].delivery_mode)
                 self.assertTrue(capability.requests[1].delivery_mode)
+                self.assertTrue(artifacts.summary.trace_consistent)
+            finally:
+                app.close()
+
+    async def test_delivery_timeout_retries_once_in_emergency_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = TimeoutThenScriptedCapability(
+                execute_draft("create-artifact", timeout_sec=60),
+                verify_draft("test -e /app", timeout_sec=60),
+            )
+            app = build_terminal_application(
+                trial_id="trial-inference-emergency-retry",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(),
+                    completed_result(),
+                ),
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(
+                    max_wall_clock_seconds=840,
+                    max_no_progress_seconds=None,
+                ),
+            )
+            app.journal._session = app.journal.snapshot().model_copy(
+                update={"started_at": utc_now() - timedelta(seconds=400)}
+            )
+            try:
+                artifacts = await app.run("create and verify an artifact")
+
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertEqual(len(capability.requests), 3)
+                self.assertTrue(capability.requests[0].delivery_mode)
+                self.assertFalse(capability.requests[0].emergency_mode)
+                self.assertTrue(capability.requests[1].delivery_mode)
+                self.assertTrue(capability.requests[1].emergency_mode)
+                self.assertTrue(artifacts.summary.trace_consistent)
+            finally:
+                app.close()
+
+    async def test_deadline_timeout_is_corrected_before_core_termination(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft(
+                    "slow-repair",
+                    call_key="work-too-wide",
+                    timeout_sec=300,
+                ),
+                execute_draft(
+                    "quick-repair",
+                    call_key="work-corrected",
+                    timeout_sec=60,
+                ),
+                verify_draft("test -e /app", timeout_sec=60),
+            )
+            environment = FakeTerminalEnvironment(
+                completed_result(stdout="repaired"),
+                completed_result(stdout="verified"),
+            )
+            app = build_terminal_application(
+                trial_id="trial-deadline-timeout-correction",
+                logs_dir=directory,
+                environment=environment,
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(
+                    max_wall_clock_seconds=840,
+                    max_no_progress_seconds=None,
+                ),
+            )
+            app.journal._session = app.journal.snapshot().model_copy(
+                update={"started_at": utc_now() - timedelta(seconds=650)}
+            )
+            try:
+                artifacts = await app.run("repair and verify the artifact")
+                session = app.journal.snapshot()
+
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertEqual(len(environment.calls), 2)
+                self.assertEqual(session.proposal_rejections, 1)
+                transcript = Path(directory, "aar-transcript.jsonl").read_text(
+                    encoding="utf-8"
+                )
+                self.assertIn(
+                    '"code": "terminal.timeout.insufficient_deadline"',
+                    transcript,
+                )
                 self.assertTrue(artifacts.summary.trace_consistent)
             finally:
                 app.close()
