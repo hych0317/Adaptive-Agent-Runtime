@@ -13,6 +13,9 @@ from adaptive_agent_runtime.core import (
     RunStatus,
 )
 from adaptive_agent_runtime.llm import InferenceExecutionBudgetError, InferenceUsage
+from adaptive_agent_runtime.tool_ecosystem.invocation_decision import (
+    _validate_arguments,
+)
 
 from applications.terminal_bench.composition import build_terminal_application
 from applications.terminal_bench.contracts import TerminalExecutionError
@@ -29,6 +32,7 @@ from applications.terminal_bench.models import (
     utc_now,
 )
 from applications.terminal_bench.planner import _identifies_official_test_source
+from applications.terminal_bench.tools import terminal_provider_metadata
 from tests.terminal_bench.fakes import (
     FakeTerminalEnvironment,
     ScriptedTerminalTurnCapability,
@@ -65,6 +69,32 @@ class AlwaysTimeoutCapability:
 
 
 class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
+    def test_provider_schema_accepts_the_full_verification_contract(self) -> None:
+        policy = TerminalExecutionPolicy()
+        metadata = terminal_provider_metadata(policy)
+        intent = TerminalCommandIntent(
+            trial_id="trial-provider-verification-contract",
+            call_key="verification-1",
+            command="true",
+            command_role=TerminalCommandRole.VERIFY,
+            timeout_sec=policy.default_timeout_sec,
+            verification=TerminalVerificationContract(
+                evidence_kind="independent_check",
+                evidence_sources=("independent oracle",),
+                artifact_paths=("/app",),
+                requirement_coverage=("req-001",),
+                coverage_dimensions=(
+                    "artifact",
+                    "format",
+                    "semantic",
+                    "end_to_end",
+                ),
+                validation_methods=("fresh-process assertion",),
+            ),
+        )
+
+        _validate_arguments(metadata, intent.tool_arguments())
+
     def test_eval_py_is_recognized_as_an_official_test_source(self) -> None:
         self.assertTrue(_identifies_official_test_source("/app/eval.py"))
         self.assertTrue(
@@ -438,6 +468,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     execute_draft("long-job", timeout_sec=2),
                     complete_draft("stopped after uncertainty"),
                 ),
+                policy=TerminalExecutionPolicy(max_proposal_rejections=0),
             )
             try:
                 await app.run("run a bounded job")
@@ -470,6 +501,49 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(artifacts.runtime_result.succeeded)
                 self.assertIn("IN_DOUBT", artifacts.runtime_result.final_state.error or "")
                 self.assertEqual(len(environment.calls), 1)
+            finally:
+                app.close()
+
+    async def test_in_doubt_requires_read_only_reconciliation_before_work(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment = FakeTerminalEnvironment(
+                TerminalExecutionError(
+                    "connection lost",
+                    command_started=True,
+                ),
+                completed_result(stdout="process stopped; artifacts known"),
+                completed_result(stdout="repaired"),
+                completed_result(stdout="verified"),
+            )
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft("mutate-state", call_key="attempt-1"),
+                execute_draft(
+                    "test ! -e /tmp/worker.pid && test -e /app",
+                    call_key="reconcile-1",
+                    command_role=TerminalCommandRole.INSPECT,
+                ),
+                execute_draft("repair-known-state", call_key="attempt-2"),
+                verify_draft("true", call_key="verification-1"),
+            )
+            app = build_terminal_application(
+                trial_id="trial-in-doubt-reconciliation",
+                logs_dir=directory,
+                environment=environment,
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(max_no_progress_seconds=None),
+            )
+            try:
+                artifacts = await app.run("repair and verify the artifact")
+
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertEqual(len(environment.calls), 4)
+                self.assertTrue(capability.requests[1].reconciliation_mode)
+                self.assertFalse(capability.requests[2].reconciliation_mode)
+                self.assertFalse(
+                    app.journal.snapshot().in_doubt_reconciliation_required
+                )
             finally:
                 app.close()
 
@@ -989,7 +1063,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
-    async def test_inference_timeout_retries_once_in_delivery_mode(self) -> None:
+    async def test_inference_timeout_retries_once_in_emergency_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             capability = TimeoutThenScriptedCapability(
                 execute_draft("create-artifact"),
@@ -1010,6 +1084,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(artifacts.runtime_result.succeeded)
                 self.assertFalse(capability.requests[0].delivery_mode)
                 self.assertTrue(capability.requests[1].delivery_mode)
+                self.assertTrue(capability.requests[1].emergency_mode)
                 self.assertTrue(capability.requests[1].recovery_mode)
                 self.assertEqual(len(app.journal.records()), 2)
             finally:
@@ -1039,6 +1114,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(capability.requests), 2)
                 self.assertFalse(capability.requests[0].delivery_mode)
                 self.assertTrue(capability.requests[1].delivery_mode)
+                self.assertTrue(capability.requests[1].emergency_mode)
                 self.assertTrue(artifacts.summary.trace_consistent)
             finally:
                 app.close()
@@ -1119,6 +1195,15 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(artifacts.runtime_result.succeeded)
                 self.assertEqual(len(environment.calls), 2)
                 self.assertEqual(session.proposal_rejections, 1)
+                self.assertEqual(
+                    capability.requests[0]
+                    .execution_limits.timeout_admission_margin_seconds,
+                    8.0,
+                )
+                self.assertLessEqual(
+                    capability.requests[0].execution_limits.max_timeout_sec,
+                    172,
+                )
                 transcript = Path(directory, "aar-transcript.jsonl").read_text(
                     encoding="utf-8"
                 )
@@ -1127,6 +1212,184 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     transcript,
                 )
                 self.assertTrue(artifacts.summary.trace_consistent)
+            finally:
+                app.close()
+
+    async def test_finalization_forces_verification_after_successful_work(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft("create-artifact", call_key="work-1"),
+                execute_draft("explore-more", call_key="work-2"),
+                verify_draft("test -e /app", call_key="verification-1"),
+            )
+            app = build_terminal_application(
+                trial_id="trial-finalization-verification",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(),
+                    completed_result(),
+                ),
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(
+                    max_wall_clock_seconds=840,
+                    max_no_progress_seconds=None,
+                ),
+            )
+            app.journal._session = app.journal.snapshot().model_copy(
+                update={"started_at": utc_now() - timedelta(seconds=600)}
+            )
+            try:
+                artifacts = await app.run("create and verify the artifact")
+
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertEqual(len(app.journal.records()), 2)
+                self.assertEqual(app.journal.snapshot().proposal_rejections, 1)
+                self.assertTrue(capability.requests[1].finalization_mode)
+                self.assertTrue(capability.requests[1].verification_due)
+                self.assertTrue(capability.requests[2].verification_due)
+            finally:
+                app.close()
+
+    async def test_late_work_preserves_finalization_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft("create-artifact", call_key="work-1"),
+                execute_draft(
+                    "wide-repair",
+                    call_key="work-too-wide",
+                    timeout_sec=180,
+                ),
+                execute_draft(
+                    "bounded-repair",
+                    call_key="work-bounded",
+                    timeout_sec=60,
+                ),
+                verify_draft(
+                    "test -e /app",
+                    call_key="verification-1",
+                    timeout_sec=60,
+                ),
+            )
+            app = build_terminal_application(
+                trial_id="trial-finalization-reserve",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(),
+                    completed_result(),
+                    completed_result(),
+                ),
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(
+                    max_wall_clock_seconds=840,
+                    max_no_progress_seconds=None,
+                ),
+            )
+            app.journal._session = app.journal.snapshot().model_copy(
+                update={"started_at": utc_now() - timedelta(seconds=500)}
+            )
+            try:
+                artifacts = await app.run("repair and verify the artifact")
+
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertEqual(len(app.journal.records()), 3)
+                self.assertEqual(app.journal.snapshot().proposal_rejections, 1)
+                transcript = Path(directory, "aar-transcript.jsonl").read_text(
+                    encoding="utf-8"
+                )
+                self.assertIn(
+                    '"code": "terminal.timeout.insufficient_deadline"',
+                    transcript,
+                )
+            finally:
+                app.close()
+
+    async def test_failed_verification_signatures_are_structured_for_repair(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft("create-artifact", call_key="work-1"),
+                verify_draft("check-all", call_key="verification-1"),
+                execute_draft("repair-all", call_key="work-2"),
+                verify_draft("check-all", call_key="verification-2"),
+            )
+            app = build_terminal_application(
+                trial_id="trial-failure-signatures",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(),
+                    completed_result(
+                        return_code=1,
+                        stdout="FAIL: np.int alias remains\nERROR: np.float alias remains",
+                    ),
+                    completed_result(),
+                    completed_result(),
+                ),
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(max_no_progress_seconds=None),
+            )
+            try:
+                artifacts = await app.run("create and verify the artifact")
+
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                signatures = capability.requests[2].session.latest_failure_signatures
+                self.assertEqual(len(signatures), 2)
+                self.assertTrue(any("np.int" in item for item in signatures))
+                self.assertTrue(any("np.float" in item for item in signatures))
+                self.assertEqual(
+                    app.journal.snapshot().latest_failure_signatures,
+                    (),
+                )
+            finally:
+                app.close()
+
+    async def test_performance_verification_requires_cold_unique_inputs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            verification = TerminalVerificationContract(
+                evidence_kind="independent_check",
+                evidence_sources=("fresh benchmark process",),
+                artifact_paths=("/app/eigen.py",),
+                requirement_coverage=("req-001",),
+                coverage_dimensions=(
+                    "artifact",
+                    "format",
+                    "semantic",
+                    "end_to_end",
+                ),
+                validation_methods=("time repeated warmed input",),
+            )
+            environment = FakeTerminalEnvironment(completed_result())
+            app = build_terminal_application(
+                trial_id="trial-performance-protocol",
+                logs_dir=directory,
+                environment=environment,
+                proposal_capability=ScriptedTerminalTurnCapability(
+                    execute_draft("create-eigen-implementation"),
+                    verify_draft("benchmark", verification=verification),
+                ),
+                policy=TerminalExecutionPolicy(
+                    max_proposal_rejections=0,
+                    max_no_progress_seconds=None,
+                ),
+            )
+            try:
+                artifacts = await app.run(
+                    "Make the implementation consistently faster than the reference benchmark."
+                )
+
+                self.assertEqual(
+                    artifacts.runtime_result.final_state.status,
+                    RunStatus.FAILED,
+                )
+                self.assertEqual(len(environment.calls), 1)
+                self.assertIn(
+                    "cold, unique inputs",
+                    artifacts.runtime_result.final_state.error or "",
+                )
             finally:
                 app.close()
 

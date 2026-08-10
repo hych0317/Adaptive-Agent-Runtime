@@ -76,6 +76,28 @@ class TerminalVerificationStatePolicy(StrEnum):
     READ_ONLY = "read_only"
 
 
+class TerminalVerificationIndependence(StrEnum):
+    """How verification avoids reusing the implementation's own oracle."""
+
+    INDEPENDENT_ORACLE = "independent_oracle"
+    CROSS_IMPLEMENTATION = "cross_implementation"
+    PROPERTY_BASED = "property_based"
+    ALTERNATE_EVIDENCE = "alternate_evidence"
+    OFFICIAL_TESTS = "official_tests"
+
+
+class TerminalVerificationIsolation(StrEnum):
+    """Process-state isolation promised by a verification command."""
+
+    FRESH_PROCESS = "fresh_process"
+    EPHEMERAL_FIXTURE = "ephemeral_fixture"
+
+
+class TerminalPerformanceProtocol(StrEnum):
+    NOT_APPLICABLE = "not_applicable"
+    COLD_UNIQUE_INPUTS = "cold_unique_inputs"
+
+
 class TerminalVerificationDimension(StrEnum):
     """Minimum independent dimensions needed before a task can complete."""
 
@@ -103,6 +125,15 @@ class TerminalVerificationContract(TerminalModel):
     validation_methods: tuple[str, ...] = Field(min_length=1)
     state_policy: TerminalVerificationStatePolicy = (
         TerminalVerificationStatePolicy.READ_ONLY
+    )
+    independence_method: TerminalVerificationIndependence = (
+        TerminalVerificationIndependence.INDEPENDENT_ORACLE
+    )
+    process_isolation: TerminalVerificationIsolation = (
+        TerminalVerificationIsolation.FRESH_PROCESS
+    )
+    performance_protocol: TerminalPerformanceProtocol = (
+        TerminalPerformanceProtocol.NOT_APPLICABLE
     )
 
     @model_validator(mode="after")
@@ -132,7 +163,9 @@ class TerminalExecutionLimits(TerminalModel):
     default_timeout_sec: int = Field(default=120, ge=1)
     max_timeout_sec: int = Field(default=300, ge=1)
     max_verification_timeout_sec: int = Field(default=120, ge=1)
+    final_repair_timeout_sec: int = Field(default=60, ge=1)
     cleanup_grace_seconds: float = Field(default=10.0, ge=0.0)
+    timeout_admission_margin_seconds: float = Field(default=8.0, ge=0.0)
     max_command_characters: int = Field(default=20_000, ge=1)
     max_environment_variables: int = Field(default=64, ge=0)
     max_environment_value_characters: int = Field(default=4096, ge=1)
@@ -144,6 +177,10 @@ class TerminalExecutionLimits(TerminalModel):
         if self.max_verification_timeout_sec > self.max_timeout_sec:
             raise ValueError(
                 "verification timeout cannot exceed maximum timeout"
+            )
+        if self.final_repair_timeout_sec > self.max_timeout_sec:
+            raise ValueError(
+                "final repair timeout cannot exceed maximum timeout"
             )
         return self
 
@@ -255,11 +292,15 @@ class TerminalExecutionPolicy(TerminalModel):
     max_active_execution_seconds: float | None = Field(default=None, gt=0.0)
     external_job_deadline_seconds: float | None = Field(default=None, gt=0.0)
     cleanup_grace_seconds: float = Field(default=10.0, ge=0.0)
+    timeout_admission_margin_seconds: float = Field(default=8.0, ge=0.0)
     repeated_invocation_limit: int | None = Field(default=3, ge=2)
     max_no_progress_steps: int | None = Field(default=5, ge=1)
     max_no_progress_seconds: float | None = Field(default=480.0, gt=0.0)
     deadline_reserve_seconds: float = Field(default=60.0, ge=0.0)
     delivery_mode_fraction: float = Field(default=0.40, gt=0.0, lt=1.0)
+    finalization_mode_threshold_seconds: float = Field(default=300.0, gt=0.0)
+    finalization_reserve_seconds: float = Field(default=190.0, ge=0.0)
+    final_repair_timeout_sec: int = Field(default=60, ge=1)
     max_artifact_first_inspections: int | None = Field(
         default=1,
         ge=1,
@@ -269,11 +310,19 @@ class TerminalExecutionPolicy(TerminalModel):
     max_total_inspections: int | None = Field(default=5, ge=1, le=64)
     max_completion_rejections: int = Field(default=2, ge=0, le=10)
     max_proposal_rejections: int = Field(default=2, ge=0, le=10)
+    max_in_doubt_reconciliation_attempts: int = Field(default=2, ge=1, le=8)
 
     @model_validator(mode="after")
     def validate_timeouts(self) -> TerminalExecutionPolicy:
         if self.default_timeout_sec > self.max_timeout_sec:
             raise ValueError("default timeout cannot exceed maximum timeout")
+        if (
+            self.finalization_mode_threshold_seconds
+            < self.finalization_reserve_seconds
+        ):
+            raise ValueError(
+                "finalization threshold cannot be below its reserved budget"
+            )
         return self
 
 
@@ -286,6 +335,7 @@ class TerminalSessionSnapshot(TerminalModel):
     denied_commands: int = Field(default=0, ge=0)
     timed_out_commands: int = Field(default=0, ge=0)
     in_doubt_commands: int = Field(default=0, ge=0)
+    in_doubt_reconciliation_required: bool = False
     completion_rejections: int = Field(default=0, ge=0)
     completion_blocker: str | None = Field(default=None, min_length=1)
     proposal_rejections: int = Field(default=0, ge=0)
@@ -295,6 +345,7 @@ class TerminalSessionSnapshot(TerminalModel):
     inspection_commands: int = Field(default=0, ge=0)
     failed_verification_attempts: int = Field(default=0, ge=0)
     verification_corrections: int = Field(default=0, ge=0)
+    latest_failure_signatures: tuple[str, ...] = ()
     started_at: AwareDatetime = Field(default_factory=utc_now)
     verified_checkpoint: TerminalVerifiedCheckpoint | None = None
     input_tokens: int = Field(default=0, ge=0)
@@ -342,6 +393,8 @@ class TerminalTurnRequest(TerminalModel):
     remaining_wall_clock_seconds: float | None = Field(default=None, ge=0.0)
     delivery_mode: bool = False
     emergency_mode: bool = False
+    finalization_mode: bool = False
+    reconciliation_mode: bool = False
     recovery_mode: bool = False
     artifact_first_mode: bool = False
     repair_mode: bool = False

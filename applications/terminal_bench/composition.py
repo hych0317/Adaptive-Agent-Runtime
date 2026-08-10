@@ -302,9 +302,11 @@ class TerminalModelConfig:
     api_key: str | None = None
     base_url: str | None = None
     max_output_tokens: int | None = 32768
+    compact_max_output_tokens: int | None = 8192
+    emergency_max_output_tokens: int | None = 4096
     inference_timeout_sec: float = 300.0
     delivery_inference_timeout_sec: float = 180.0
-    emergency_inference_timeout_sec: float = 90.0
+    emergency_inference_timeout_sec: float = 120.0
     minimum_inference_timeout_sec: float = 120.0
     minimum_delivery_inference_timeout_sec: float = 60.0
     deepseek_reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH
@@ -639,6 +641,16 @@ def build_terminal_model_capability(
             None
             if provider == "codex-cli"
             else config.max_output_tokens
+        ),
+        compact_max_output_tokens=(
+            None
+            if provider == "codex-cli"
+            else config.compact_max_output_tokens
+        ),
+        emergency_max_output_tokens=(
+            None
+            if provider == "codex-cli"
+            else config.emergency_max_output_tokens
         ),
         strict_json_schema=(provider == "codex-cli"),
         delivery_timeout_seconds=config.delivery_inference_timeout_sec,

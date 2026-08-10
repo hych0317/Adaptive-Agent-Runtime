@@ -60,6 +60,7 @@ from applications.terminal_bench.models import (
     TerminalTurnRequest,
     TerminalToolCapabilities,
     TerminalVerifiedCheckpoint,
+    TerminalPerformanceProtocol,
     TerminalVerificationStatePolicy,
     terminal_fingerprint,
     utc_now,
@@ -77,7 +78,7 @@ _EXECUTION_SEMANTICS = (
     "Use cwd for the working directory and env for the complete explicit environment map.",
     "cwd must be null or an absolute POSIX path; never pass '.' or another relative path.",
     "A non-zero return code is an observed completed command, not a transport failure.",
-    "IN_DOUBT means the command may have started; never repeat it. Use a new inspection command.",
+    "IN_DOUBT means the command may have started; never repeat it or mutate related state until a read-only reconciliation command proves the process stopped and artifacts are known.",
     "Start background services in detached form and supply PID file, log path, and status command.",
     "Label read-only discovery and capability probes as inspect; inspect success is not task completion.",
     "Host-side Codex inference workspace paths never exist inside the task container.",
@@ -86,6 +87,7 @@ _EXECUTION_SEMANTICS = (
     "The last committed command must be verify, complete with return code 0, and have no timeout or transport failure.",
     "apply_patch is not installed in task containers; use one of payload.tool_capabilities.portable_file_edit_methods.",
     "A verify command must declare independent evidence and be read-only with respect to task state.",
+    "Performance verification must use a fresh process with cold, unique inputs and must not warm or cache the measured inputs before timing.",
     "After a successful verify command the Runtime locks the verified state; complete immediately without another command.",
     "No tmux, interactive terminal, verifier API, oracle API, sidecar execution, or host access is available.",
 )
@@ -398,11 +400,30 @@ class JsonlTerminalTrialJournal:
         inspection_commands = session.inspection_commands + int(
             record.intent.command_role is TerminalCommandRole.INSPECT
         )
+        reconciliation_required = session.in_doubt_reconciliation_required
+        if result.execution_state is TerminalExecutionState.IN_DOUBT:
+            reconciliation_required = True
+        elif (
+            reconciliation_required
+            and record.intent.command_role is TerminalCommandRole.INSPECT
+            and result.execution_state is TerminalExecutionState.COMPLETED
+            and result.return_code == 0
+        ):
+            reconciliation_required = False
+        failure_signatures = session.latest_failure_signatures
+        if (
+            result.execution_state is not TerminalExecutionState.COMPLETED
+            or result.return_code != 0
+        ):
+            failure_signatures = _failure_signatures(result)
+        elif record.intent.command_role is TerminalCommandRole.VERIFY:
+            failure_signatures = ()
         update: dict[str, object] = {
             "committed_commands": session.committed_commands + 1,
             "timed_out_commands": session.timed_out_commands + int(result.timed_out),
             "in_doubt_commands": session.in_doubt_commands
             + int(result.execution_state is TerminalExecutionState.IN_DOUBT),
+            "in_doubt_reconciliation_required": reconciliation_required,
             "process_references": tuple(references),
             "completion_blocker": None,
             "proposal_blocker": None,
@@ -412,6 +433,7 @@ class JsonlTerminalTrialJournal:
             "verified_checkpoint": verified_checkpoint,
             "failed_verification_attempts": failed_verification_attempts,
             "verification_corrections": verification_corrections,
+            "latest_failure_signatures": failure_signatures,
         }
         if record.governance_status != "applied":
             update["denied_commands"] = session.denied_commands + 1
@@ -506,6 +528,8 @@ class GatewayTerminalTurnProposalCapability:
         gateway_policy: InferenceGatewayPolicy,
         target_id: str,
         max_output_tokens: int | None = 2048,
+        compact_max_output_tokens: int | None = 8192,
+        emergency_max_output_tokens: int | None = 4096,
         required_structured_output: StructuredOutputLevel = StructuredOutputLevel.JSON_SCHEMA,
         strict_json_schema: bool = False,
         delivery_timeout_seconds: float = 120.0,
@@ -517,6 +541,8 @@ class GatewayTerminalTurnProposalCapability:
         self._gateway_policy = gateway_policy
         self._target_id = target_id
         self._max_output_tokens = max_output_tokens
+        self._compact_max_output_tokens = compact_max_output_tokens
+        self._emergency_max_output_tokens = emergency_max_output_tokens
         self._required_structured_output = required_structured_output
         self._strict_json_schema = strict_json_schema
         if delivery_timeout_seconds <= 0:
@@ -569,6 +595,13 @@ class GatewayTerminalTurnProposalCapability:
                     "another inspection until work is attempted. "
                     "If an installer reports missing or conflicting dependencies, "
                     "address the complete reported set before verification. "
+                    "If the latest failure says command not found or identifies a "
+                    "missing runtime, do not rewrite the same solution for guessed "
+                    "interpreter names. Feature-detect the package manager and install "
+                    "the complete required tool batch, or choose a genuinely available "
+                    "portable implementation. Treat payload.session.latest_failure_"
+                    "signatures as the complete minimum repair set and resolve every "
+                    "entry together. "
                     "For source-build or package-install tasks, inspect the "
                     "project's packaging metadata, then run its canonical "
                     "end-to-end install or build command early to reproduce "
@@ -593,6 +626,15 @@ class GatewayTerminalTurnProposalCapability:
                     "or repair command. Keep that command focused enough to preserve "
                     "time for one final verification. Treat "
                     "payload.remaining_wall_clock_seconds as a hard budget. "
+                    "If payload.finalization_mode is true, stop broad exploration. If "
+                    "payload.verification_due is true, verify now. Otherwise perform at "
+                    "most one focused repair bounded by final_repair_timeout_sec, then "
+                    "verify on the next turn. "
+                    "If payload.reconciliation_mode is true, return only one read-only "
+                    "inspect command that exits zero solely when the prior IN_DOUBT "
+                    "process is stopped and affected artifacts are in a known state; "
+                    "exit nonzero if either fact remains uncertain. Do not mutate, "
+                    "install, repair, verify, or complete during reconciliation. "
                     "If payload.emergency_mode is true, this is the single compact "
                     "recovery turn after a delivery inference timeout: return only "
                     "complete, the shortest sufficient independent verification, "
@@ -633,7 +675,15 @@ class GatewayTerminalTurnProposalCapability:
                     "Reserve a command for independent verification after changing "
                     "task artifacts. Verification must use separately derived "
                     "evidence or official tests, not a copy of the production "
-                    "algorithm. "
+                    "algorithm. Set independence_method to the actual independent "
+                    "oracle family and process_isolation to a fresh process or "
+                    "ephemeral fixture. For extraction, decoding, and forensic tasks, "
+                    "validate the claimed answer through a second evidence modality, "
+                    "not the same metadata label or parsing assumption used to create "
+                    "it. For performance requirements set performance_protocol to "
+                    "cold_unique_inputs, generate unseen inputs, measure first-use "
+                    "behavior in a fresh process, and require a meaningful margin. "
+                    "Never warm, cache, or time the same measured input beforehand. "
                     "Do not complete unless the last committed command is a "
                     "successful verify command. For execute, include a call_key "
                     "that is absent from payload.used_call_keys; retries need a "
@@ -678,7 +728,7 @@ class GatewayTerminalTurnProposalCapability:
             ),
             requirements=InferenceRequirements(
                 required_structured_output=self._required_structured_output,
-                max_output_tokens=self._max_output_tokens,
+                max_output_tokens=self._response_max_output_tokens(request),
             ),
             correlation=InferenceCorrelation(
                 run_id=request.run_id,
@@ -737,6 +787,8 @@ class GatewayTerminalTurnProposalCapability:
             if (
                 request.delivery_mode
                 or request.emergency_mode
+                or request.finalization_mode
+                or request.reconciliation_mode
                 or request.repair_mode
                 or request.verification_due
             ):
@@ -746,6 +798,12 @@ class GatewayTerminalTurnProposalCapability:
                     else self._delivery_timeout_seconds
                 )
                 bounded = min(bounded, timeout_cap)
+            if bounded <= 0.0:
+                raise InferenceExecutionBudgetError(
+                    "insufficient wall-clock capacity for another inference: "
+                    "available 0.0 seconds; no positive inference window "
+                    "remains"
+                )
             gateway_policy = gateway_policy.model_copy(
                 update={
                     "budget": gateway_policy.budget.model_copy(
@@ -756,6 +814,8 @@ class GatewayTerminalTurnProposalCapability:
         elif (
             request.delivery_mode
             or request.emergency_mode
+            or request.finalization_mode
+            or request.reconciliation_mode
             or request.repair_mode
             or request.verification_due
         ):
@@ -780,6 +840,8 @@ class GatewayTerminalTurnProposalCapability:
             if (
                 request.delivery_mode
                 or request.emergency_mode
+                or request.finalization_mode
+                or request.reconciliation_mode
                 or request.repair_mode
                 or request.verification_due
             )
@@ -802,6 +864,29 @@ class GatewayTerminalTurnProposalCapability:
             usage=response.usage,
             model_id=response.model_id,
         )
+
+    def _response_max_output_tokens(
+        self,
+        request: TerminalTurnRequest,
+    ) -> int | None:
+        """Keep endgame responses small without widening provider support."""
+
+        configured = self._max_output_tokens
+        if configured is None:
+            return None
+        if request.emergency_mode:
+            cap = self._emergency_max_output_tokens
+        elif (
+            request.delivery_mode
+            or request.finalization_mode
+            or request.reconciliation_mode
+            or request.repair_mode
+            or request.verification_due
+        ):
+            cap = self._compact_max_output_tokens
+        else:
+            cap = None
+        return configured if cap is None else min(configured, cap)
 
 
 def _terminal_turn_response_schema(
@@ -959,10 +1044,70 @@ _MUTATING_VERIFICATION_PATTERNS = (
     ),
     re.compile(r"\bgit\s+(?:-C\s+\S+\s+)*worktree\s+(?:add|move|remove|prune)\b"),
 )
+_MUTATING_RECONCILIATION_PATTERNS = (
+    re.compile(
+        r"(?im)(?:^|[;&|]\s*)(?:rm|mv|cp|install|apt(?:-get)?|apk|dnf|yum|"
+        r"pip3?|sed\s+-i|perl\s+-[A-Za-z]*i|tee)\b"
+    ),
+    re.compile(r"(?m)(?:^|\s)(?:>>?|2>)\s*(?!/dev/null(?:\s|$))\S+"),
+)
 _TEMP_ROOT_ASSIGNMENT = re.compile(
     r"(?m)^\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)="
     r"[\"']?\$\(\s*mktemp\s+(?:-d|--directory)\b[^)]*\)[\"']?"
 )
+_FAILURE_SIGNATURE_MARKER = re.compile(
+    r"(?i)(?:\bFAIL(?:ED)?\b|\bERROR\b|AssertionError|AttributeError|"
+    r"ImportError|ModuleNotFoundError|command not found|No such file or directory|"
+    r"timed? out|IN_DOUBT|returned? non-zero|exit(?:ed)?[ =:]+[1-9])"
+)
+_SENSITIVE_FAILURE_VALUE = re.compile(
+    r"(?i)(?:AKIA|ASIA)[A-Z0-9]{16}|"
+    r"(?:gh[pousr]_|github_pat_|hf_)[A-Za-z0-9_]{16,}|"
+    r"(?<=[=:][\"'])[^\"'\s]{24,}(?=[\"'])"
+)
+
+
+def _failure_signatures(result: TerminalExecResult) -> tuple[str, ...]:
+    """Return bounded, redacted failure families for the next repair turn."""
+
+    values: list[str] = []
+    combined = "\n".join((result.stdout, result.stderr))
+    for raw_line in combined.splitlines():
+        line = raw_line.strip()
+        if not line or _FAILURE_SIGNATURE_MARKER.search(line) is None:
+            continue
+        line = _SENSITIVE_FAILURE_VALUE.sub("<redacted>", line)
+        line = line[:300]
+        if line not in values:
+            values.append(line)
+        if len(values) >= 12:
+            break
+    if not values and result.execution_state is not TerminalExecutionState.COMPLETED:
+        values.append(
+            "execution_state=" + result.execution_state.value
+            + "; timed_out=" + str(result.timed_out).lower()
+            + "; transport_failed=" + str(result.transport_failed).lower()
+        )
+    elif not values and result.return_code not in (None, 0):
+        values.append(f"command returned non-zero status {result.return_code}")
+    return tuple(values)
+
+
+def _requires_performance_protocol(
+    requirements: tuple[TerminalRequirement, ...],
+) -> bool:
+    description = " ".join(item.description for item in requirements).lower()
+    return any(
+        marker in description
+        for marker in (
+            "performance",
+            "faster",
+            "speedup",
+            "latency",
+            "median time",
+            "benchmark",
+        )
+    )
 
 
 def _sanitized_rejected_draft(draft: TerminalTurnDraft) -> TerminalRejectedDraft:
@@ -1031,6 +1176,17 @@ def _known_verification_mutation(command: str) -> str | None:
     return None
 
 
+def _known_reconciliation_mutation(command: str) -> str | None:
+    git_mutation = _known_verification_mutation(command)
+    if git_mutation is not None:
+        return git_mutation
+    for pattern in _MUTATING_RECONCILIATION_PATTERNS:
+        match = pattern.search(command)
+        if match is not None:
+            return match.group(0).strip()[:160]
+    return None
+
+
 def _identifies_official_test_source(source: str) -> bool:
     lowered = source.lower()
     if any(marker in lowered for marker in ("/tests", "pytest", "official")):
@@ -1070,6 +1226,17 @@ class TerminalSequentialPlanner:
                 reason="Resume the original persisted terminal proposal.",
             )
         session = self._journal.snapshot()
+        if (
+            session.in_doubt_reconciliation_required
+            and session.consecutive_inspections
+            >= self._policy.max_in_doubt_reconciliation_attempts
+        ):
+            return PlanDecision.fail(
+                error=(
+                    "terminal IN_DOUBT state remains unresolved after bounded "
+                    "read-only reconciliation attempts"
+                )
+            )
         if session.verified_checkpoint is not None:
             gate_error = self._journal.completion_gate_error()
             if gate_error is None:
@@ -1102,37 +1269,21 @@ class TerminalSequentialPlanner:
                     "terminal emergency inference budget exhausted: "
                     + exc.reason,
                 ) from exc
-            if request.delivery_mode:
-                retry_request = self._turn_request(
-                    state,
-                    session,
-                    force_delivery=True,
-                    force_emergency=True,
-                )
-                try:
-                    proposal = await self._capability.propose(retry_request)
-                except InferenceExecutionBudgetError as retry_exc:
-                    raise RunBudgetExhaustedError(
-                        "active_execution",
-                        "terminal emergency inference budget exhausted: "
-                        + retry_exc.reason,
-                    ) from retry_exc
-                request = retry_request
-            else:
-                retry_request = self._turn_request(
-                    state,
-                    session,
-                    force_delivery=True,
-                )
-                try:
-                    proposal = await self._capability.propose(retry_request)
-                except InferenceExecutionBudgetError as retry_exc:
-                    raise RunBudgetExhaustedError(
-                        "active_execution",
-                        "terminal inference recovery budget exhausted: "
-                        + retry_exc.reason,
-                    ) from retry_exc
-                request = retry_request
+            retry_request = self._turn_request(
+                state,
+                session,
+                force_delivery=True,
+                force_emergency=True,
+            )
+            try:
+                proposal = await self._capability.propose(retry_request)
+            except InferenceExecutionBudgetError as retry_exc:
+                raise RunBudgetExhaustedError(
+                    "active_execution",
+                    "terminal emergency inference budget exhausted: "
+                    + retry_exc.reason,
+                ) from retry_exc
+            request = retry_request
         self._journal.record_usage(proposal)
         session = self._journal.snapshot()
         budget_error = self._budget_error(
@@ -1143,6 +1294,26 @@ class TerminalSequentialPlanner:
         if budget_error is not None:
             return PlanDecision.fail(error=budget_error)
         draft = proposal.draft
+        if (
+            request.reconciliation_mode
+            and draft.decision is TerminalTurnDecision.COMPLETE
+        ):
+            validation = _TerminalProposalValidationError(
+                code="terminal.in_doubt.reconciliation_required",
+                message=(
+                    "an unresolved IN_DOUBT command must be reconciled before "
+                    "completion"
+                ),
+                field="decision",
+                rejected_value="complete",
+                expected="execute one read-only inspect reconciliation command",
+            )
+            return self._proposal_rejection_decision(
+                state=state,
+                session=session,
+                draft=draft,
+                validation=validation,
+            )
         if draft.decision is TerminalTurnDecision.COMPLETE:
             assert draft.summary is not None
             gate_error = self._journal.completion_gate_error()
@@ -1199,14 +1370,19 @@ class TerminalSequentialPlanner:
                 )
             )
         try:
-            intent = self._resolve_intent(draft, session)
+            intent = self._resolve_intent(
+                draft,
+                session,
+                max_timeout_sec=request.execution_limits.max_timeout_sec,
+            )
             self._validate_intent(
                 intent,
                 session,
                 recovery_mode=request.recovery_mode,
                 repair_mode=request.repair_mode,
                 verification_due=request.verification_due,
-                deadline_timeout_sec=self._deadline_timeout_limit(session),
+                finalization_mode=request.finalization_mode,
+                reconciliation_mode=request.reconciliation_mode,
                 required_requirements=_task_requirements(
                     state.task.description
                 ),
@@ -1350,6 +1526,20 @@ class TerminalSequentialPlanner:
         remaining_wall_clock_seconds = self._remaining_wall_clock_seconds(
             session,
         )
+        all_records = self._journal.recent_records(self._policy.max_commands)
+        has_successful_work = any(
+            item.intent.command_role is TerminalCommandRole.WORK
+            and item.result.execution_state is TerminalExecutionState.COMPLETED
+            and item.result.return_code == 0
+            for item in all_records
+        )
+        finalization_mode = bool(
+            has_successful_work
+            and remaining_wall_clock_seconds is not None
+            and remaining_wall_clock_seconds
+            <= self._policy.finalization_mode_threshold_seconds
+        )
+        reconciliation_mode = session.in_doubt_reconciliation_required
         dynamic_timeout_sec = self._dynamic_timeout_limit(
             remaining_wall_clock_seconds
         )
@@ -1363,15 +1553,17 @@ class TerminalSequentialPlanner:
             >= self._policy.max_wall_clock_seconds
             * self._policy.delivery_mode_fraction
         )
-        all_records = self._journal.recent_records(self._policy.max_commands)
+        compact_context = bool(
+            delivery_mode or finalization_mode or reconciliation_mode
+        )
         context_record_limit = (
             self._policy.max_delivery_context_records
-            if delivery_mode
+            if compact_context
             else self._policy.max_context_records
         )
         context_output_limit = (
             self._policy.max_delivery_context_output_characters
-            if delivery_mode
+            if compact_context
             else self._policy.max_context_output_characters
         )
         records = all_records[-context_record_limit:]
@@ -1396,13 +1588,18 @@ class TerminalSequentialPlanner:
         )
         last_record = all_records[-1] if all_records else None
         verification_due = bool(
-            session.failed_verification_attempts > 0
-            and session.failed_verification_attempts
-            == session.verification_corrections
-            and last_record is not None
+            last_record is not None
             and last_record.intent.command_role is TerminalCommandRole.WORK
             and last_record.result.command_completed
             and last_record.result.return_code == 0
+            and (
+                finalization_mode
+                or (
+                    session.failed_verification_attempts > 0
+                    and session.failed_verification_attempts
+                    == session.verification_corrections
+                )
+            )
         )
         artifact_first_mode = not any(
             item.intent.command_role
@@ -1420,6 +1617,8 @@ class TerminalSequentialPlanner:
         recovery_mode = bool(
             self._recovery_mode(state)
             or delivery_mode
+            or finalization_mode
+            or reconciliation_mode
             or repair_mode
             or verification_due
             or artifact_recovery
@@ -1441,7 +1640,14 @@ class TerminalSequentialPlanner:
                 max_verification_timeout_sec=(
                     dynamic_verification_timeout_sec
                 ),
+                final_repair_timeout_sec=min(
+                    dynamic_timeout_sec,
+                    self._policy.final_repair_timeout_sec,
+                ),
                 cleanup_grace_seconds=self._policy.cleanup_grace_seconds,
+                timeout_admission_margin_seconds=(
+                    self._policy.timeout_admission_margin_seconds
+                ),
                 max_command_characters=self._policy.max_command_characters,
                 max_environment_variables=(
                     self._policy.max_environment_variables
@@ -1461,6 +1667,8 @@ class TerminalSequentialPlanner:
             remaining_wall_clock_seconds=remaining_wall_clock_seconds,
             delivery_mode=delivery_mode,
             emergency_mode=force_emergency,
+            finalization_mode=finalization_mode,
+            reconciliation_mode=reconciliation_mode,
             recovery_mode=recovery_mode,
             artifact_first_mode=artifact_first_mode,
             repair_mode=repair_mode,
@@ -1493,7 +1701,8 @@ class TerminalSequentialPlanner:
             max(
                 1.0,
                 remaining_wall_clock_seconds
-                - self._policy.cleanup_grace_seconds,
+                - self._policy.cleanup_grace_seconds
+                - self._policy.timeout_admission_margin_seconds,
             )
         )
         return min(self._policy.max_timeout_sec, deadline_capacity)
@@ -1501,16 +1710,37 @@ class TerminalSequentialPlanner:
     def _deadline_timeout_limit(
         self,
         session: TerminalSessionSnapshot,
+        *,
+        command_role: TerminalCommandRole,
     ) -> int | None:
         remaining = self._remaining_wall_clock_seconds(session)
         if remaining is None:
             return None
-        return max(0, int(remaining - self._policy.cleanup_grace_seconds))
+        reserve = (
+            self._policy.cleanup_grace_seconds
+            + self._policy.timeout_admission_margin_seconds
+        )
+        has_successful_work = any(
+            item.intent.command_role is TerminalCommandRole.WORK
+            and item.result.execution_state is TerminalExecutionState.COMPLETED
+            and item.result.return_code == 0
+            for item in self._journal.recent_records(self._policy.max_commands)
+        )
+        if (
+            command_role is TerminalCommandRole.WORK
+            and has_successful_work
+            and remaining
+            > self._policy.finalization_mode_threshold_seconds
+        ):
+            reserve += self._policy.finalization_reserve_seconds
+        return max(0, int(remaining - reserve))
 
     def _resolve_intent(
         self,
         draft: TerminalTurnDraft,
         session: TerminalSessionSnapshot,
+        *,
+        max_timeout_sec: int | None = None,
     ) -> TerminalCommandIntent:
         assert (
             draft.call_key is not None
@@ -1529,6 +1759,8 @@ class TerminalSequentialPlanner:
                 default_timeout_sec,
                 self._policy.max_verification_timeout_sec,
             )
+        if max_timeout_sec is not None:
+            default_timeout_sec = min(default_timeout_sec, max_timeout_sec)
         timeout_sec = draft.timeout_sec or default_timeout_sec
         return TerminalCommandIntent(
             trial_id=session.trial_id,
@@ -1550,7 +1782,8 @@ class TerminalSequentialPlanner:
         recovery_mode: bool = False,
         repair_mode: bool = False,
         verification_due: bool = False,
-        deadline_timeout_sec: int | None = None,
+        finalization_mode: bool = False,
+        reconciliation_mode: bool = False,
         required_requirements: tuple[TerminalRequirement, ...],
     ) -> None:
         if session.verified_checkpoint is not None:
@@ -1594,6 +1827,30 @@ class TerminalSequentialPlanner:
                 rejected_value=host_path.group(0),
                 expected="a task-container path such as /app or the current session cwd",
             )
+        if reconciliation_mode:
+            if intent.command_role is not TerminalCommandRole.INSPECT:
+                raise _TerminalProposalValidationError(
+                    code="terminal.in_doubt.reconciliation_required",
+                    message=(
+                        "an unresolved IN_DOUBT command requires a read-only "
+                        "reconciliation before any state-changing action"
+                    ),
+                    field="command_role",
+                    rejected_value=intent.command_role.value,
+                    expected="inspect",
+                )
+            mutation = _known_reconciliation_mutation(intent.command)
+            if mutation is not None:
+                raise _TerminalProposalValidationError(
+                    code="terminal.in_doubt.reconciliation_mutation",
+                    message="IN_DOUBT reconciliation must be read-only",
+                    field="command",
+                    rejected_value=mutation,
+                    expected=(
+                        "a status and artifact inspection that exits zero only "
+                        "when the prior process is stopped and state is known"
+                    ),
+                )
         if repair_mode and intent.command_role is not TerminalCommandRole.WORK:
             raise _TerminalProposalValidationError(
                 code="terminal.verification.repair_required",
@@ -1619,7 +1876,11 @@ class TerminalSequentialPlanner:
                 rejected_value=intent.command_role.value,
                 expected="verify",
             )
-        if recovery_mode and intent.command_role is TerminalCommandRole.INSPECT:
+        if (
+            recovery_mode
+            and not reconciliation_mode
+            and intent.command_role is TerminalCommandRole.INSPECT
+        ):
             raise _TerminalProposalValidationError(
                 code="terminal.recovery.inspect_disallowed",
                 message="recovery mode requires an artifact-producing or targeted repair command",
@@ -1634,6 +1895,25 @@ class TerminalSequentialPlanner:
                 field="timeout_sec",
                 rejected_value=intent.timeout_sec,
                 expected=f"an integer from 1 through {self._policy.max_timeout_sec}",
+            )
+        if (
+            finalization_mode
+            and intent.command_role is TerminalCommandRole.WORK
+            and intent.timeout_sec
+            > min(
+                self._policy.max_timeout_sec,
+                self._policy.final_repair_timeout_sec,
+            )
+        ):
+            raise _TerminalProposalValidationError(
+                code="terminal.finalization.repair_timeout_above_maximum",
+                message="finalization repair exceeds the reserved short repair slot",
+                field="timeout_sec",
+                rejected_value=intent.timeout_sec,
+                expected=(
+                    "an integer from 1 through "
+                    f"{min(self._policy.max_timeout_sec, self._policy.final_repair_timeout_sec)}"
+                ),
             )
         if (
             intent.command_role is TerminalCommandRole.VERIFY
@@ -1652,6 +1932,10 @@ class TerminalSequentialPlanner:
                     f"{self._policy.max_verification_timeout_sec} for verify"
                 ),
             )
+        deadline_timeout_sec = self._deadline_timeout_limit(
+            session,
+            command_role=intent.command_role,
+        )
         if (
             deadline_timeout_sec is not None
             and intent.timeout_sec > deadline_timeout_sec
@@ -1743,6 +2027,25 @@ class TerminalSequentialPlanner:
                     field="verification.requirement_coverage",
                     rejected_value=", ".join(intent.verification.requirement_coverage),
                     expected="every requirement_id from payload.requirements exactly once",
+                )
+            if (
+                _requires_performance_protocol(required_requirements)
+                and intent.verification.evidence_kind.value
+                != "official_tests"
+                and intent.verification.performance_protocol
+                is not TerminalPerformanceProtocol.COLD_UNIQUE_INPUTS
+            ):
+                raise _TerminalProposalValidationError(
+                    code="terminal.verification.performance_protocol_required",
+                    message=(
+                        "performance verification must use cold, unique inputs "
+                        "in an isolated process"
+                    ),
+                    field="verification.performance_protocol",
+                    rejected_value=(
+                        intent.verification.performance_protocol.value
+                    ),
+                    expected="cold_unique_inputs",
                 )
             mutation = _known_verification_mutation(intent.command)
             if mutation is not None:

@@ -122,7 +122,7 @@ class HarborTerminalEnvironmentAdapter:
                     if exc.command_started is False
                     else TerminalExecutionState.IN_DOUBT
                 ),
-                timed_out=exc.timed_out,
+                timed_out=(exc.timed_out or _exception_indicates_timeout(exc)),
             )
         except TimeoutError as exc:
             return self._exception_result(
@@ -141,7 +141,10 @@ class HarborTerminalEnvironmentAdapter:
                     if command_started is False
                     else TerminalExecutionState.IN_DOUBT
                 ),
-                timed_out=bool(getattr(exc, "timed_out", False)),
+                timed_out=(
+                    bool(getattr(exc, "timed_out", False))
+                    or _exception_indicates_timeout(exc)
+                ),
             )
         completed_at = utc_now()
         return_code = getattr(raw, "return_code", None)
@@ -213,6 +216,22 @@ class HarborTerminalEnvironmentAdapter:
     @staticmethod
     def _duration_ms(started_at: datetime, completed_at: datetime) -> int:
         return max(0, int((completed_at - started_at).total_seconds() * 1000))
+
+
+def _exception_indicates_timeout(exc: BaseException) -> bool:
+    """Recognize Harbor timeout wrappers that omit a structured flag."""
+
+    detail = (str(exc) or exc.__class__.__name__).lower()
+    return any(
+        marker in detail
+        for marker in (
+            "timed out",
+            "timeout after",
+            "timeout of",
+            "deadline exceeded",
+            "deadline expired",
+        )
+    )
 
 
 ApplicationFactory = Callable[..., TerminalSequentialApplication]

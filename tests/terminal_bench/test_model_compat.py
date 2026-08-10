@@ -166,9 +166,11 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             config.max_output_tokens,
             32768,
         )
+        self.assertEqual(config.compact_max_output_tokens, 8192)
+        self.assertEqual(config.emergency_max_output_tokens, 4096)
         self.assertEqual(config.inference_timeout_sec, 300.0)
         self.assertEqual(config.delivery_inference_timeout_sec, 180.0)
-        self.assertEqual(config.emergency_inference_timeout_sec, 90.0)
+        self.assertEqual(config.emergency_inference_timeout_sec, 120.0)
         self.assertEqual(config.minimum_inference_timeout_sec, 120.0)
         self.assertEqual(
             config.minimum_delivery_inference_timeout_sec,
@@ -194,6 +196,7 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(policy.max_delivery_context_records, 2)
         self.assertEqual(policy.deadline_reserve_seconds, 60.0)
         self.assertEqual(policy.delivery_mode_fraction, 0.40)
+        self.assertEqual(policy.timeout_admission_margin_seconds, 8.0)
 
         self.assertEqual(policy.max_no_progress_seconds, 480.0)
         self.assertEqual(policy.max_artifact_first_inspections, 1)
@@ -530,7 +533,7 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             target_id="terminal-bench:deepseek:test-model",
             required_structured_output=StructuredOutputLevel.JSON_OBJECT,
             delivery_timeout_seconds=180.0,
-            emergency_timeout_seconds=90.0,
+            emergency_timeout_seconds=120.0,
         )
         request = _turn_request().model_copy(
             update={
@@ -543,7 +546,34 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         await capability.propose(request)
 
         assert gateway.policy is not None
-        self.assertEqual(gateway.policy.budget.max_elapsed_seconds, 90.0)
+        self.assertEqual(gateway.policy.budget.max_elapsed_seconds, 120.0)
+
+    async def test_endgame_modes_reduce_supported_output_budget(self) -> None:
+        for update, expected in (
+            ({"delivery_mode": True}, 8192),
+            ({"repair_mode": True}, 8192),
+            ({"emergency_mode": True}, 4096),
+        ):
+            with self.subTest(update=update):
+                gateway = _RecordingGateway(
+                    {"decision": "complete", "summary": "Task complete"}
+                )
+                capability = GatewayTerminalTurnProposalCapability(
+                    gateway=gateway,
+                    gateway_policy=InferenceGatewayPolicy(),
+                    target_id="terminal-bench:deepseek:test-model",
+                    max_output_tokens=32768,
+                )
+
+                await capability.propose(
+                    _turn_request().model_copy(update=update)
+                )
+
+                assert gateway.request is not None
+                self.assertEqual(
+                    gateway.request.requirements.max_output_tokens,
+                    expected,
+                )
 
     async def test_normal_inference_preserves_future_correction_slot(
         self,
@@ -631,6 +661,33 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         request = _turn_request().model_copy(
             update={
                 "remaining_wall_clock_seconds": 180.0,
+                "delivery_mode": True,
+            }
+        )
+
+        with self.assertRaisesRegex(
+            InferenceExecutionBudgetError,
+            "insufficient wall-clock capacity",
+        ):
+            await capability.propose(request)
+        self.assertIsNone(gateway.request)
+
+    async def test_zero_inference_window_is_a_budget_error(self) -> None:
+        gateway = _RecordingGateway(
+            {"decision": "complete", "summary": "Task complete"}
+        )
+        capability = GatewayTerminalTurnProposalCapability(
+            gateway=gateway,
+            gateway_policy=InferenceGatewayPolicy(),
+            target_id="terminal-bench:deepseek:test-model",
+            required_structured_output=StructuredOutputLevel.JSON_OBJECT,
+            delivery_timeout_seconds=300.0,
+            minimum_timeout_seconds=120.0,
+            minimum_delivery_timeout_seconds=60.0,
+        )
+        request = _turn_request().model_copy(
+            update={
+                "remaining_wall_clock_seconds": 120.0,
                 "delivery_mode": True,
             }
         )

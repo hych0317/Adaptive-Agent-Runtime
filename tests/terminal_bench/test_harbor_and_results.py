@@ -11,10 +11,12 @@ from applications.terminal_bench.composition import TerminalRunArtifacts
 from applications.terminal_bench.harbor_agent import (
     AdaptiveRuntimeHarborAgent,
     AgentContext,
+    HarborTerminalEnvironmentAdapter,
 )
 from applications.terminal_bench.models import (
     TerminalBenchmarkOutcome,
     TerminalExecutionPolicy,
+    TerminalExecutionState,
     TerminalTrialSummary,
     utc_now,
 )
@@ -58,7 +60,25 @@ class _FakeApplication:
         self.closed = True
 
 
+class _RuntimeTimeoutEnvironment:
+    async def exec(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+        raise RuntimeError("Command timed out after 60 seconds")
+
+
 class HarborAndResultTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runtime_timeout_wrapper_sets_timeout_metric(self) -> None:
+        adapter = HarborTerminalEnvironmentAdapter(
+            _RuntimeTimeoutEnvironment(),  # type: ignore[arg-type]
+            max_output_characters=1_000,
+        )
+
+        result = await adapter.exec("long-running-command", timeout_sec=60)
+
+        self.assertTrue(result.timed_out)
+        self.assertTrue(result.transport_failed)
+        self.assertIs(result.execution_state, TerminalExecutionState.IN_DOUBT)
+
     async def test_agent_context_uses_metadata_for_aar_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fake_result = SimpleNamespace()

@@ -6,7 +6,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
-from adaptive_agent_runtime.llm import InferenceUsage, ReasoningEffort
+from adaptive_agent_runtime.llm import (
+    InferenceExecutionBudgetError,
+    InferenceUsage,
+    ReasoningEffort,
+)
 
 from applications.terminal_bench.harbor_agent import AgentContext
 from applications.terminal_bench.models import (
@@ -46,6 +50,19 @@ class _FakePlainApplication:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _BudgetExhaustedCapability:
+    module_id = "test.plain.budget_exhausted"
+
+    def __init__(self) -> None:
+        self.requests = []
+
+    async def propose(self, request):  # type: ignore[no-untyped-def]
+        self.requests.append(request)
+        raise InferenceExecutionBudgetError(
+            "insufficient wall-clock capacity for another inference"
+        )
 
 
 def _summary() -> TerminalTrialSummary:
@@ -188,6 +205,33 @@ class PlainSequentialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(artifacts.summary.runtime_status, "invalid_proposal")
         self.assertEqual(len(capability.requests), 1)
         self.assertEqual(environment.calls, [])
+
+    async def test_inference_budget_exhaustion_is_a_controlled_stop(self) -> None:
+        environment = FakeTerminalEnvironment()
+        capability = _BudgetExhaustedCapability()
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = await build_plain_sequential_application(
+                trial_id="plain-inference-budget",
+                logs_dir=directory,
+                environment=environment,
+                proposal_capability=capability,
+            ).run("Complete the task.")
+
+            transcript = (
+                Path(directory) / "plain-transcript.jsonl"
+            ).read_text(encoding="utf-8")
+            self.assertTrue(
+                (Path(directory) / "plain-summary.json").is_file()
+            )
+
+        self.assertFalse(artifacts.summary.agent_complete)
+        self.assertEqual(
+            artifacts.summary.runtime_status,
+            "inference_budget_exhausted",
+        )
+        self.assertEqual(environment.calls, [])
+        self.assertEqual(len(capability.requests), 1)
+        self.assertIn("plain.inference.budget_exhausted", transcript)
 
     async def test_shared_request_contract_disables_runtime_recovery_flags(
         self,

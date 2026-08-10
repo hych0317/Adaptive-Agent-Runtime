@@ -103,6 +103,24 @@ def terminal_provider_metadata(
                 "uniqueItems": True,
                 "items": {"type": "string", "minLength": 1},
             },
+            "independence_method": {
+                "type": "string",
+                "enum": [
+                    "independent_oracle",
+                    "cross_implementation",
+                    "property_based",
+                    "alternate_evidence",
+                    "official_tests",
+                ],
+            },
+            "process_isolation": {
+                "type": "string",
+                "enum": ["fresh_process", "ephemeral_fixture"],
+            },
+            "performance_protocol": {
+                "type": "string",
+                "enum": ["not_applicable", "cold_unique_inputs"],
+            },
             "state_policy": {
                 "type": "string",
                 "enum": ["read_only"],
@@ -115,6 +133,9 @@ def terminal_provider_metadata(
             "requirement_coverage",
             "coverage_dimensions",
             "validation_methods",
+            "independence_method",
+            "process_isolation",
+            "performance_protocol",
             "state_policy",
         ],
         "additionalProperties": False,

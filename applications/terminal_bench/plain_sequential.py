@@ -16,7 +16,11 @@ from time import monotonic
 from typing import cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from adaptive_agent_runtime.llm import HttpxJSONTransport, InferenceUsage
+from adaptive_agent_runtime.llm import (
+    HttpxJSONTransport,
+    InferenceExecutionBudgetError,
+    InferenceUsage,
+)
 
 from applications.terminal_bench.composition import (
     _CapturingJSONTransport,
@@ -122,7 +126,21 @@ class PlainSequentialApplication:
                 task_id=task_id,
                 started_clock=started_clock,
             )
-            proposal = await self._capability.propose(request)
+            try:
+                proposal = await self._capability.propose(request)
+            except InferenceExecutionBudgetError as exc:
+                status = "inference_budget_exhausted"
+                final_output["error"] = str(exc)
+                self._append(
+                    "plain.inference.budget_exhausted",
+                    {
+                        "error": str(exc),
+                        "remaining_wall_clock_seconds": (
+                            request.remaining_wall_clock_seconds
+                        ),
+                    },
+                )
+                break
             self._record_usage(proposal.usage)
             self._append(
                 "plain.inference.completed",
