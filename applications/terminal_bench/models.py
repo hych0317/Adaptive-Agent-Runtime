@@ -131,6 +131,7 @@ class TerminalVerificationContract(TerminalModel):
 class TerminalExecutionLimits(TerminalModel):
     default_timeout_sec: int = Field(default=120, ge=1)
     max_timeout_sec: int = Field(default=300, ge=1)
+    cleanup_grace_seconds: float = Field(default=10.0, ge=0.0)
     max_command_characters: int = Field(default=20_000, ge=1)
     max_environment_variables: int = Field(default=64, ge=0)
     max_environment_value_characters: int = Field(default=4096, ge=1)
@@ -247,6 +248,11 @@ class TerminalExecutionPolicy(TerminalModel):
     max_no_progress_seconds: float | None = Field(default=480.0, gt=0.0)
     deadline_reserve_seconds: float = Field(default=60.0, ge=0.0)
     delivery_mode_fraction: float = Field(default=0.40, gt=0.0, lt=1.0)
+    max_artifact_first_inspections: int | None = Field(
+        default=1,
+        ge=1,
+        le=4,
+    )
     max_consecutive_inspections: int | None = Field(default=3, ge=1, le=16)
     max_total_inspections: int | None = Field(default=5, ge=1, le=64)
     max_completion_rejections: int = Field(default=2, ge=0, le=10)
@@ -324,6 +330,9 @@ class TerminalTurnRequest(TerminalModel):
     remaining_wall_clock_seconds: float | None = Field(default=None, ge=0.0)
     delivery_mode: bool = False
     recovery_mode: bool = False
+    artifact_first_mode: bool = False
+    repair_mode: bool = False
+    verification_due: bool = False
     execution_semantics: tuple[str, ...] = Field(min_length=1)
 
 

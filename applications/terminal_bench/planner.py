@@ -510,6 +510,7 @@ class GatewayTerminalTurnProposalCapability:
         strict_json_schema: bool = False,
         delivery_timeout_seconds: float = 120.0,
         minimum_timeout_seconds: float = 120.0,
+        minimum_delivery_timeout_seconds: float = 60.0,
     ) -> None:
         self._gateway = gateway
         self._gateway_policy = gateway_policy
@@ -523,9 +524,17 @@ class GatewayTerminalTurnProposalCapability:
         if minimum_timeout_seconds <= 0:
             raise ValueError("minimum inference timeout must be positive")
         self._minimum_timeout_seconds = minimum_timeout_seconds
-        if delivery_timeout_seconds < minimum_timeout_seconds:
+        if minimum_delivery_timeout_seconds <= 0:
             raise ValueError(
-                "delivery inference timeout cannot be below the minimum timeout"
+                "minimum delivery inference timeout must be positive"
+            )
+        self._minimum_delivery_timeout_seconds = (
+            minimum_delivery_timeout_seconds
+        )
+        if delivery_timeout_seconds < minimum_delivery_timeout_seconds:
+            raise ValueError(
+                "delivery inference timeout cannot be below the minimum "
+                "delivery timeout"
             )
 
     async def propose(self, request: TerminalTurnRequest) -> TerminalTurnProposal:
@@ -542,6 +551,13 @@ class GatewayTerminalTurnProposalCapability:
                     "authoritative inputs before editing; do not infer record "
                     "semantics solely from filenames. Derive every output field "
                     "from task artifacts instead of fabricating expected data. "
+                    "If payload.artifact_first_mode is true, create or modify the "
+                    "smallest viable required artifact on this turn whenever the "
+                    "task already identifies its output path or format. If a "
+                    "capability or authoritative-input probe is necessary, combine "
+                    "that bounded probe with artifact-producing work when safe. "
+                    "After one inspection-only command the Runtime may reject "
+                    "another inspection until work is attempted. "
                     "If an installer reports missing or conflicting dependencies, "
                     "address the complete reported set before verification. "
                     "For source-build or package-install tasks, inspect the "
@@ -568,6 +584,12 @@ class GatewayTerminalTurnProposalCapability:
                     "or repair command. Keep that command focused enough to preserve "
                     "time for one final verification. Treat "
                     "payload.remaining_wall_clock_seconds as a hard budget. "
+                    "If payload.repair_mode is true, issue one work command that "
+                    "addresses the complete exact failure set from the latest "
+                    "verification; do not inspect, verify, or complete first. If "
+                    "payload.verification_due is true, issue the independent verify "
+                    "command now and do not make another task-state change. "
+                    "Preserve the Runtime-reserved correction and verification slots. "
                     "Install declared build and runtime dependencies in a coherent "
                     "batch when possible instead of discovering them one at a "
                     "time. If packaging conditionally enables native extensions "
@@ -677,12 +699,30 @@ class GatewayTerminalTurnProposalCapability:
             configured = gateway_policy.budget.max_elapsed_seconds
             action_reserve = min(
                 remaining,
-                float(request.execution_limits.default_timeout_sec) + 10.0,
+                float(request.execution_limits.default_timeout_sec)
+                + request.execution_limits.cleanup_grace_seconds,
             )
-            bounded = max(0.0, remaining - action_reserve)
+            future_turn_reserve = 0.0
+            if not request.delivery_mode:
+                future_action_reserve = (
+                    float(request.execution_limits.default_timeout_sec)
+                    + request.execution_limits.cleanup_grace_seconds
+                )
+                future_turn_reserve = (
+                    self._minimum_delivery_timeout_seconds
+                    + future_action_reserve
+                )
+            bounded = max(
+                0.0,
+                remaining - action_reserve - future_turn_reserve,
+            )
             if configured is not None:
                 bounded = min(bounded, configured)
-            if request.delivery_mode:
+            if (
+                request.delivery_mode
+                or request.repair_mode
+                or request.verification_due
+            ):
                 bounded = min(bounded, self._delivery_timeout_seconds)
             gateway_policy = gateway_policy.model_copy(
                 update={
@@ -691,7 +731,11 @@ class GatewayTerminalTurnProposalCapability:
                     )
                 }
             )
-        elif request.delivery_mode:
+        elif (
+            request.delivery_mode
+            or request.repair_mode
+            or request.verification_due
+        ):
             configured = gateway_policy.budget.max_elapsed_seconds
             bounded = self._delivery_timeout_seconds
             if configured is not None:
@@ -704,14 +748,23 @@ class GatewayTerminalTurnProposalCapability:
                 }
             )
         effective_timeout = gateway_policy.budget.max_elapsed_seconds
+        minimum_timeout = (
+            self._minimum_delivery_timeout_seconds
+            if (
+                request.delivery_mode
+                or request.repair_mode
+                or request.verification_due
+            )
+            else self._minimum_timeout_seconds
+        )
         if (
             effective_timeout is not None
-            and effective_timeout < self._minimum_timeout_seconds
+            and effective_timeout < minimum_timeout
         ):
             raise InferenceExecutionBudgetError(
                 "insufficient wall-clock capacity for another inference: "
                 f"available {effective_timeout:.1f} seconds; "
-                f"minimum {self._minimum_timeout_seconds:.1f} seconds"
+                f"minimum {minimum_timeout:.1f} seconds"
             )
         response = await self._gateway.execute(inference, gateway_policy)
         if response.kind is not ModelResponseKind.OUTPUT:
@@ -1105,6 +1158,8 @@ class TerminalSequentialPlanner:
                 intent,
                 session,
                 recovery_mode=request.recovery_mode,
+                repair_mode=request.repair_mode,
+                verification_due=request.verification_due,
                 required_requirements=_task_requirements(
                     state.task.description
                 ),
@@ -1282,7 +1337,40 @@ class TerminalSequentialPlanner:
             if self._policy.max_cost_usd is None
             else max(0.0, self._policy.max_cost_usd - session.cost_usd)
         )
-        recovery_mode = self._recovery_mode(state) or delivery_mode
+        repair_mode = (
+            session.failed_verification_attempts
+            > session.verification_corrections
+        )
+        last_record = all_records[-1] if all_records else None
+        verification_due = bool(
+            session.failed_verification_attempts > 0
+            and session.failed_verification_attempts
+            == session.verification_corrections
+            and last_record is not None
+            and last_record.intent.command_role is TerminalCommandRole.WORK
+            and last_record.result.command_completed
+            and last_record.result.return_code == 0
+        )
+        artifact_first_mode = not any(
+            item.intent.command_role
+            in (TerminalCommandRole.WORK, TerminalCommandRole.VERIFY)
+            for item in all_records
+        )
+        artifact_inspection_limit = (
+            self._policy.max_artifact_first_inspections
+        )
+        artifact_recovery = bool(
+            artifact_first_mode
+            and artifact_inspection_limit is not None
+            and session.inspection_commands >= artifact_inspection_limit
+        )
+        recovery_mode = bool(
+            self._recovery_mode(state)
+            or delivery_mode
+            or repair_mode
+            or verification_due
+            or artifact_recovery
+        )
         return TerminalTurnRequest(
             run_id=state.run_id,
             task_id=state.task.task_id,
@@ -1294,6 +1382,7 @@ class TerminalSequentialPlanner:
             execution_limits=TerminalExecutionLimits(
                 default_timeout_sec=self._policy.default_timeout_sec,
                 max_timeout_sec=self._policy.max_timeout_sec,
+                cleanup_grace_seconds=self._policy.cleanup_grace_seconds,
                 max_command_characters=self._policy.max_command_characters,
                 max_environment_variables=(
                     self._policy.max_environment_variables
@@ -1313,6 +1402,9 @@ class TerminalSequentialPlanner:
             remaining_wall_clock_seconds=remaining_wall_clock_seconds,
             delivery_mode=delivery_mode,
             recovery_mode=recovery_mode,
+            artifact_first_mode=artifact_first_mode,
+            repair_mode=repair_mode,
+            verification_due=verification_due,
             execution_semantics=_EXECUTION_SEMANTICS,
         )
 
@@ -1351,6 +1443,8 @@ class TerminalSequentialPlanner:
         session: TerminalSessionSnapshot,
         *,
         recovery_mode: bool = False,
+        repair_mode: bool = False,
+        verification_due: bool = False,
         required_requirements: tuple[TerminalRequirement, ...],
     ) -> None:
         if session.verified_checkpoint is not None:
@@ -1393,6 +1487,31 @@ class TerminalSequentialPlanner:
                 field="command",
                 rejected_value=host_path.group(0),
                 expected="a task-container path such as /app or the current session cwd",
+            )
+        if repair_mode and intent.command_role is not TerminalCommandRole.WORK:
+            raise _TerminalProposalValidationError(
+                code="terminal.verification.repair_required",
+                message=(
+                    "the latest failed verification requires a targeted work "
+                    "correction before another verification"
+                ),
+                field="command_role",
+                rejected_value=intent.command_role.value,
+                expected="work",
+            )
+        if (
+            verification_due
+            and intent.command_role is not TerminalCommandRole.VERIFY
+        ):
+            raise _TerminalProposalValidationError(
+                code="terminal.verification.due",
+                message=(
+                    "a successful verification correction must be followed by "
+                    "independent verification before more task-state changes"
+                ),
+                field="command_role",
+                rejected_value=intent.command_role.value,
+                expected="verify",
             )
         if recovery_mode and intent.command_role is TerminalCommandRole.INSPECT:
             raise _TerminalProposalValidationError(

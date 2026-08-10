@@ -302,13 +302,14 @@ class TerminalModelConfig:
     api_key: str | None = None
     base_url: str | None = None
     max_output_tokens: int | None = 32768
-    inference_timeout_sec: float = 360.0
-    delivery_inference_timeout_sec: float = 300.0
+    inference_timeout_sec: float = 300.0
+    delivery_inference_timeout_sec: float = 180.0
     minimum_inference_timeout_sec: float = 120.0
+    minimum_delivery_inference_timeout_sec: float = 60.0
     deepseek_reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH
     deepseek_thinking: Literal["enabled", "disabled"] = "enabled"
     codex_executable: str = "codex"
-    codex_reasoning_effort: ReasoningEffort = ReasoningEffort.MAX
+    codex_reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH
 
 
 @dataclass(frozen=True)
@@ -641,6 +642,9 @@ def build_terminal_model_capability(
         strict_json_schema=(provider == "codex-cli"),
         delivery_timeout_seconds=config.delivery_inference_timeout_sec,
         minimum_timeout_seconds=config.minimum_inference_timeout_sec,
+        minimum_delivery_timeout_seconds=(
+            config.minimum_delivery_inference_timeout_sec
+        ),
     )
     return capability, inference
 

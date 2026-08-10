@@ -362,6 +362,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 ),
                 policy=TerminalExecutionPolicy(
+                    max_artifact_first_inspections=None,
                     max_no_progress_steps=1,
                     max_no_progress_seconds=None,
                 ),
@@ -800,6 +801,44 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
+    async def test_failed_verification_requires_work_before_reverify(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft("create-artifact", call_key="work-1"),
+                verify_draft("assert-artifact", call_key="verification-1"),
+                verify_draft("assert-artifact", call_key="verification-2"),
+            )
+            app = build_terminal_application(
+                trial_id="trial-repair-before-reverify",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(),
+                    completed_result(return_code=1, stderr="assertion failed"),
+                ),
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(
+                    max_proposal_rejections=0,
+                    max_no_progress_seconds=None,
+                ),
+            )
+            try:
+                artifacts = await app.run("create and validate an artifact")
+
+                self.assertEqual(
+                    artifacts.runtime_result.final_state.status,
+                    RunStatus.FAILED,
+                )
+                self.assertEqual(artifacts.summary.command_count, 2)
+                self.assertTrue(capability.requests[2].repair_mode)
+                self.assertIn(
+                    "targeted work correction",
+                    artifacts.runtime_result.final_state.error or "",
+                )
+            finally:
+                app.close()
+
     async def test_multiple_verification_repair_cycles_are_allowed(
         self,
     ) -> None:
@@ -838,6 +877,14 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(session.failed_verification_attempts, 2)
                 self.assertEqual(session.verification_corrections, 2)
                 self.assertEqual(len(capability.requests), 6)
+                self.assertTrue(capability.requests[2].repair_mode)
+                self.assertTrue(capability.requests[2].recovery_mode)
+                self.assertFalse(capability.requests[2].verification_due)
+                self.assertFalse(capability.requests[3].repair_mode)
+                self.assertTrue(capability.requests[3].verification_due)
+                self.assertTrue(capability.requests[3].recovery_mode)
+                self.assertTrue(capability.requests[4].repair_mode)
+                self.assertTrue(capability.requests[5].verification_due)
                 self.assertIsNotNone(session.verified_checkpoint)
                 self.assertTrue(artifacts.summary.trace_consistent)
             finally:
@@ -980,6 +1027,59 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
+    async def test_artifact_first_requires_work_after_one_inspection(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment = FakeTerminalEnvironment(
+                completed_result(stdout="capabilities discovered"),
+            )
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft(
+                    "inspect-capabilities",
+                    call_key="inspect-1",
+                    command_role=TerminalCommandRole.INSPECT,
+                ),
+                execute_draft(
+                    "inspect-more",
+                    call_key="inspect-2",
+                    command_role=TerminalCommandRole.INSPECT,
+                ),
+            )
+            app = build_terminal_application(
+                trial_id="trial-artifact-first-recovery",
+                logs_dir=directory,
+                environment=environment,
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(
+                    max_proposal_rejections=0,
+                    max_no_progress_seconds=None,
+                ),
+            )
+            try:
+                artifacts = await app.run("Create /app/filter.py.")
+
+                self.assertEqual(
+                    artifacts.runtime_result.final_state.status,
+                    RunStatus.FAILED,
+                )
+                self.assertEqual(len(environment.calls), 1)
+                self.assertEqual(len(capability.requests), 2)
+                self.assertTrue(
+                    capability.requests[0].artifact_first_mode
+                )
+                self.assertFalse(capability.requests[0].recovery_mode)
+                self.assertTrue(
+                    capability.requests[1].artifact_first_mode
+                )
+                self.assertTrue(capability.requests[1].recovery_mode)
+                self.assertIn(
+                    "artifact-producing or targeted repair command",
+                    artifacts.runtime_result.final_state.error or "",
+                )
+            finally:
+                app.close()
+
     async def test_consecutive_unique_inspections_enter_recovery_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             environment = FakeTerminalEnvironment(
@@ -1015,6 +1115,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 environment=environment,
                 proposal_capability=capability,
                 policy=TerminalExecutionPolicy(
+                    max_artifact_first_inspections=None,
                     max_consecutive_inspections=3,
                     max_proposal_rejections=0,
                     max_no_progress_seconds=None,

@@ -128,8 +128,8 @@ failure; a network-looking string alone is not enough to reclassify a result.
 
 `codex-cli/luna-*` models use the installed Codex CLI only as a bounded,
 read-only inference backend. Runtime remains the sole command authority. The
-default Codex CLI reasoning effort is `max`; it is passed as
-`model_reasoning_effort="max"`. A side-effect-free CLI `turn.failed` event is
+default Codex CLI reasoning effort is `high`; it is passed as
+`model_reasoning_effort="high"`. A side-effect-free CLI `turn.failed` event is
 retried once before any Runtime action is proposed. Timeouts, process failures,
 protocol errors, and action-bearing CLI traces are not automatically retried.
 

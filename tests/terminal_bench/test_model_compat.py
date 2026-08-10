@@ -166,9 +166,13 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             config.max_output_tokens,
             32768,
         )
-        self.assertEqual(config.inference_timeout_sec, 360.0)
-        self.assertEqual(config.delivery_inference_timeout_sec, 300.0)
+        self.assertEqual(config.inference_timeout_sec, 300.0)
+        self.assertEqual(config.delivery_inference_timeout_sec, 180.0)
         self.assertEqual(config.minimum_inference_timeout_sec, 120.0)
+        self.assertEqual(
+            config.minimum_delivery_inference_timeout_sec,
+            60.0,
+        )
         self.assertEqual(
             config.deepseek_reasoning_effort,
             ReasoningEffort.HIGH,
@@ -176,7 +180,7 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.deepseek_thinking, "enabled")
         self.assertEqual(
             config.codex_reasoning_effort,
-            ReasoningEffort.MAX,
+            ReasoningEffort.HIGH,
         )
 
     def test_terminal_context_is_bounded_within_total_token_budget(self) -> None:
@@ -191,6 +195,7 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(policy.delivery_mode_fraction, 0.40)
 
         self.assertEqual(policy.max_no_progress_seconds, 480.0)
+        self.assertEqual(policy.max_artifact_first_inspections, 1)
         self.assertEqual(policy.max_consecutive_inspections, 3)
         self.assertEqual(policy.max_total_inspections, 5)
 
@@ -256,7 +261,7 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             StructuredOutputLevel.JSON_SCHEMA,
         )
         self.assertIsNone(capability._max_output_tokens)
-        self.assertEqual(profile.limits.default_timeout_seconds, 360.0)
+        self.assertEqual(profile.limits.default_timeout_seconds, 300.0)
         self.assertTrue(capability._strict_json_schema)
 
     def test_codex_cli_schema_requires_all_nullable_fields(self) -> None:
@@ -459,6 +464,9 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("state_policy=read_only", instruction)
         self.assertIn("complete immediately", instruction)
         self.assertIn("Never return rationale", instruction)
+        self.assertIn("payload.artifact_first_mode", instruction)
+        self.assertIn("payload.repair_mode", instruction)
+        self.assertIn("payload.verification_due", instruction)
 
     def test_terminal_cwd_is_normalized_before_docker_execution(self) -> None:
         self.assertIsNone(_resolve_terminal_cwd(".", None))
@@ -492,7 +500,7 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             gateway_policy=gateway_policy,
             target_id="terminal-bench:deepseek:test-model",
             required_structured_output=StructuredOutputLevel.JSON_OBJECT,
-            delivery_timeout_seconds=300.0,
+            delivery_timeout_seconds=180.0,
         )
         request = _turn_request().model_copy(
             update={
@@ -504,12 +512,81 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         await capability.propose(request)
 
         assert gateway.policy is not None
-        self.assertEqual(gateway.policy.budget.max_elapsed_seconds, 300.0)
+        self.assertEqual(gateway.policy.budget.max_elapsed_seconds, 180.0)
 
         assert gateway.request is not None
         payload = gateway.request.input["payload"]
         assert isinstance(payload, Mapping)
         self.assertTrue(payload["delivery_mode"])
+
+    async def test_normal_inference_preserves_future_correction_slot(
+        self,
+    ) -> None:
+        for remaining, expected in ((840.0, 300.0), (480.0, 160.0)):
+            with self.subTest(remaining=remaining):
+                gateway = _RecordingGateway(
+                    {"decision": "complete", "summary": "Task complete"}
+                )
+                gateway_policy = InferenceGatewayPolicy()
+                gateway_policy = gateway_policy.model_copy(
+                    update={
+                        "budget": gateway_policy.budget.model_copy(
+                            update={"max_elapsed_seconds": 300.0}
+                        )
+                    }
+                )
+                capability = GatewayTerminalTurnProposalCapability(
+                    gateway=gateway,
+                    gateway_policy=gateway_policy,
+                    target_id="terminal-bench:deepseek:test-model",
+                    required_structured_output=(
+                        StructuredOutputLevel.JSON_OBJECT
+                    ),
+                    delivery_timeout_seconds=180.0,
+                    minimum_delivery_timeout_seconds=60.0,
+                )
+                request = _turn_request().model_copy(
+                    update={"remaining_wall_clock_seconds": remaining}
+                )
+
+                await capability.propose(request)
+
+                assert gateway.policy is not None
+                self.assertEqual(
+                    gateway.policy.budget.max_elapsed_seconds,
+                    expected,
+                )
+
+    async def test_repair_mode_without_wall_clock_uses_delivery_timeout(
+        self,
+    ) -> None:
+        gateway = _RecordingGateway(
+            {"decision": "complete", "summary": "Task complete"}
+        )
+        gateway_policy = InferenceGatewayPolicy()
+        gateway_policy = gateway_policy.model_copy(
+            update={
+                "budget": gateway_policy.budget.model_copy(
+                    update={"max_elapsed_seconds": 300.0}
+                )
+            }
+        )
+        capability = GatewayTerminalTurnProposalCapability(
+            gateway=gateway,
+            gateway_policy=gateway_policy,
+            target_id="terminal-bench:deepseek:test-model",
+            required_structured_output=StructuredOutputLevel.JSON_OBJECT,
+            delivery_timeout_seconds=180.0,
+        )
+        request = _turn_request().model_copy(update={"repair_mode": True})
+
+        await capability.propose(request)
+
+        assert gateway.policy is not None
+        self.assertEqual(
+            gateway.policy.budget.max_elapsed_seconds,
+            180.0,
+        )
 
     async def test_inference_is_not_started_without_minimum_viable_window(
         self,
@@ -527,7 +604,7 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         )
         request = _turn_request().model_copy(
             update={
-                "remaining_wall_clock_seconds": 200.0,
+                "remaining_wall_clock_seconds": 180.0,
                 "delivery_mode": True,
             }
         )
@@ -542,7 +619,7 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
     def test_delivery_timeout_cannot_be_below_minimum_viable_window(self) -> None:
         with self.assertRaisesRegex(
             ValueError,
-            "cannot be below the minimum",
+            "cannot be below the minimum delivery",
         ):
             GatewayTerminalTurnProposalCapability(
                 gateway=_RecordingGateway({}),
@@ -550,6 +627,7 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 target_id="terminal-bench:deepseek:test-model",
                 delivery_timeout_seconds=60.0,
                 minimum_timeout_seconds=120.0,
+                minimum_delivery_timeout_seconds=90.0,
             )
 
     async def test_invalid_json_object_turn_is_rejected_locally(self) -> None:
