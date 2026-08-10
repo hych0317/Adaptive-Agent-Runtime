@@ -119,6 +119,32 @@ def _turn_request() -> TerminalTurnRequest:
 
 
 class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_instruction_scopes_repairs_and_verification(self) -> None:
+        gateway = _RecordingGateway(
+            {"decision": "complete", "summary": "Task complete"}
+        )
+        capability = GatewayTerminalTurnProposalCapability(
+            gateway=gateway,
+            gateway_policy=InferenceGatewayPolicy(),
+            target_id="terminal-bench:deepseek:test-model",
+            required_structured_output=StructuredOutputLevel.JSON_OBJECT,
+        )
+
+        await capability.propose(_turn_request())
+
+        assert gateway.request is not None
+        instruction = gateway.request.input["instruction"]
+        self.assertIsInstance(instruction, str)
+        assert isinstance(instruction, str)
+        self.assertIn("inspect only that artifact's bounded", instruction)
+        self.assertIn(
+            "Gate verification only on explicit task requirements",
+            instruction,
+        )
+        self.assertIn("unrelated tracked files remain unchanged", instruction)
+        self.assertIn("prefer a standard-library implementation", instruction)
+        self.assertIn("timeout_admission_margin_seconds", instruction)
+
     def test_verification_mutation_detection_preserves_read_only_git_checks(
         self,
     ) -> None:
