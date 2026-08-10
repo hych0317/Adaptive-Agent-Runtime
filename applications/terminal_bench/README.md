@@ -124,6 +124,46 @@ Verifier dependency setup failures with corroborating network evidence are
 reported as `infrastructure_error`, separately from a genuine benchmark
 failure; a network-looking string alone is not enough to reclassify a result.
 
+## Strict Plain Sequential architecture ablation
+
+`PlainSequentialHarborAgent` is the controlled non-AAR baseline. It reuses the
+same model backend, Terminal turn Prompt, JSON Schema, requirement extraction,
+context truncation, command/token/cost/wall-clock budgets, and
+`HarborTerminalEnvironmentAdapter`. Reasoning effort is fixed to `high` for
+both Codex CLI and DeepSeek-style model controls; any other requested effort is
+rejected at Agent construction.
+
+The Plain path calls `BaseEnvironment.exec()` directly. It does not instantiate
+`AgentRuntime`, SQLite persistence, Decision/Governance, authorization permits,
+Effect fingerprints, repeat/no-progress detection, recovery feedback,
+`apply_patch` interception, verification evidence enforcement, verified-state
+locking, or `IN_DOUBT` replay protection. Mechanical proposals outside the
+shared size, environment, timeout, or budget envelope fail the Plain trial
+without a model correction turn. Model-declared `complete` ends the Agent even
+without a successful verification; benchmark success still depends only on the
+Harbor verifier.
+
+Run the single-task acceptance gate with the same outer timeout contract:
+
+```bash
+harbor run \
+  -d terminal-bench/terminal-bench-2-1 \
+  --include-task-name "terminal-bench/regex-log" \
+  --agent "applications.terminal_bench.plain_harbor_agent:PlainSequentialHarborAgent" \
+  --model "codex-cli/gpt-5.6-luna" \
+  --env docker \
+  --n-concurrent 1 \
+  --n-attempts 1 \
+  --max-retries 0 \
+  --ak agent_timeout_sec=900 \
+  --ak deadline_reserve_seconds=60 \
+  --ak reasoning_effort=high
+```
+
+The Plain trial writes `plain-transcript.jsonl` and `plain-summary.json`; it
+does not create `aar-runtime.sqlite3`. The command above is documentation only
+and is never started by import or test discovery.
+
 ## Luna through Codex CLI
 
 `codex-cli/luna-*` models use the installed Codex CLI only as a bounded,
