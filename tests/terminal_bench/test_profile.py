@@ -11,15 +11,22 @@ from adaptive_agent_runtime.core import (
     AgentTask,
     RunStatus,
 )
+from adaptive_agent_runtime.llm import InferenceExecutionBudgetError, InferenceUsage
 
 from applications.terminal_bench.composition import build_terminal_application
 from applications.terminal_bench.contracts import TerminalExecutionError
 from applications.terminal_bench.models import (
     TERMINAL_COMMAND_ACTION,
     TerminalCommandIntent,
+    TerminalCommandRole,
     TerminalExecutionPolicy,
     TerminalExecutionState,
+    TerminalTurnDraft,
+    TerminalTurnProposal,
+    TerminalTurnRequest,
+    TerminalVerificationContract,
 )
+from applications.terminal_bench.planner import _identifies_official_test_source
 from tests.terminal_bench.fakes import (
     FakeTerminalEnvironment,
     ScriptedTerminalTurnCapability,
@@ -30,7 +37,41 @@ from tests.terminal_bench.fakes import (
 )
 
 
+class TimeoutThenScriptedCapability(ScriptedTerminalTurnCapability):
+    def __init__(self, *drafts: TerminalTurnDraft) -> None:
+        super().__init__(*drafts)
+        self._timed_out = False
+
+    async def propose(self, request: TerminalTurnRequest) -> TerminalTurnProposal:
+        self.requests.append(request)
+        if not self._timed_out:
+            self._timed_out = True
+            raise InferenceExecutionBudgetError("elapsed-time limit 360 seconds")
+        self.requests.pop()
+        return await super().propose(request)
+
+
+class AlwaysTimeoutCapability:
+    module_id = "test.terminal_turn.always_timeout"
+
+    def __init__(self) -> None:
+        self.requests: list[TerminalTurnRequest] = []
+
+    async def propose(self, request: TerminalTurnRequest) -> TerminalTurnProposal:
+        self.requests.append(request)
+        raise InferenceExecutionBudgetError("elapsed-time limit 360 seconds")
+
+
 class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
+    def test_eval_py_is_recognized_as_an_official_test_source(self) -> None:
+        self.assertTrue(_identifies_official_test_source("/app/eval.py"))
+        self.assertTrue(
+            _identifies_official_test_source("python3 /app/eval.py")
+        )
+        self.assertFalse(
+            _identifies_official_test_source("/app/evaluate.py")
+        )
+
     async def test_terminal_command_uses_tool_invocation_decision_lifecycle(
         self,
     ) -> None:
@@ -69,6 +110,41 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("applying", stages)
                 self.assertIn("effect_committed", stages)
                 self.assertIn("completed", stages)
+            finally:
+                app.close()
+
+    async def test_all_call_keys_remain_visible_when_history_is_bounded(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft("printf one", call_key="work-1"),
+                execute_draft("printf two", call_key="work-2"),
+                verify_draft("true", call_key="verification-1"),
+            )
+            app = build_terminal_application(
+                trial_id="trial-used-call-keys",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(stdout="one"),
+                    completed_result(stdout="two"),
+                    completed_result(stdout="verified"),
+                ),
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(max_context_records=1),
+            )
+            try:
+                await app.run("run two commands and verify")
+                last_request = capability.requests[-1]
+                self.assertEqual(
+                    last_request.used_call_keys,
+                    ("work-1", "work-2"),
+                )
+                self.assertEqual(
+                    tuple(item.call_key for item in last_request.recent_history),
+                    ("work-2",),
+                )
+                self.assertEqual(len(capability.requests), 3)
             finally:
                 app.close()
 
@@ -228,6 +304,81 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
+    async def test_before_action_deadline_abandons_pending_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment = FakeTerminalEnvironment()
+            app = build_terminal_application(
+                trial_id="trial-action-abandoned",
+                logs_dir=directory,
+                environment=environment,
+                proposal_capability=ScriptedTerminalTurnCapability(
+                    execute_draft("sleep 1", timeout_sec=10)
+                ),
+                policy=TerminalExecutionPolicy(
+                    default_timeout_sec=10,
+                    max_timeout_sec=10,
+                    max_wall_clock_seconds=5.0,
+                    cleanup_grace_seconds=1.0,
+                    max_no_progress_steps=None,
+                    max_no_progress_seconds=None,
+                ),
+            )
+            try:
+                artifacts = await app.run("run a command only when admitted")
+
+                self.assertEqual(
+                    artifacts.runtime_result.final_state.status,
+                    RunStatus.TERMINATED,
+                )
+                self.assertEqual(environment.calls, [])
+                self.assertIsNone(app.journal.pending())
+                self.assertTrue(artifacts.summary.trace_consistent)
+                transcript = Path(directory, "aar-transcript.jsonl").read_text(
+                    encoding="utf-8"
+                )
+                self.assertIn('"kind": "pending.abandoned"', transcript)
+            finally:
+                app.close()
+
+    async def test_repeated_inspection_counts_as_no_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = build_terminal_application(
+                trial_id="trial-repeated-inspection",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(stdout="same diagnostic"),
+                    completed_result(stdout="same diagnostic"),
+                ),
+                proposal_capability=ScriptedTerminalTurnCapability(
+                    execute_draft(
+                        "inspect-state",
+                        call_key="inspection-1",
+                        command_role=TerminalCommandRole.INSPECT,
+                    ),
+                    execute_draft(
+                        "inspect-state",
+                        call_key="inspection-2",
+                        command_role=TerminalCommandRole.INSPECT,
+                    ),
+                ),
+                policy=TerminalExecutionPolicy(
+                    max_no_progress_steps=1,
+                    max_no_progress_seconds=None,
+                ),
+            )
+            try:
+                artifacts = await app.run("diagnose before making a repair")
+
+                self.assertEqual(
+                    artifacts.runtime_result.final_state.status,
+                    RunStatus.TERMINATED,
+                )
+                self.assertEqual(artifacts.summary.command_count, 2)
+                self.assertTrue(artifacts.summary.trace_consistent)
+                self.assertEqual(len(app.journal.records()), 2)
+            finally:
+                app.close()
+
     async def test_failed_to_start_is_provider_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             environment = FakeTerminalEnvironment(
@@ -295,6 +446,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     execute_draft("mutate-state", call_key="attempt-1"),
                     execute_draft("mutate-state", call_key="attempt-2"),
                 ),
+                policy=TerminalExecutionPolicy(max_proposal_rejections=0),
             )
             try:
                 artifacts = await app.run("perform one mutation")
@@ -330,6 +482,127 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     capability.requests[1].session.current_cwd,
                     "/app/work",
+                )
+            finally:
+                app.close()
+
+    async def test_timeout_above_runtime_maximum_is_correctable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft(
+                    "long-build",
+                    call_key="invalid-timeout",
+                    timeout_sec=301,
+                ),
+                execute_draft(
+                    "bounded-build",
+                    call_key="bounded-timeout",
+                    timeout_sec=300,
+                ),
+                verify_draft("test -f /app/result"),
+                complete_draft(),
+            )
+            environment = FakeTerminalEnvironment(
+                completed_result(stdout="built"),
+                completed_result(stdout="verified"),
+            )
+            app = build_terminal_application(
+                trial_id="trial-timeout-correction",
+                logs_dir=directory,
+                environment=environment,
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(max_proposal_rejections=1),
+            )
+            try:
+                artifacts = await app.run("build with a bounded timeout")
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertEqual(len(environment.calls), 2)
+                self.assertEqual(environment.calls[0].command, "bounded-build")
+                rejection = capability.requests[1].session.last_proposal_rejection
+                self.assertIsNotNone(rejection)
+                assert rejection is not None
+                self.assertEqual(rejection.code, "terminal.timeout.above_maximum")
+                self.assertEqual(rejection.rejected_value, "301")
+            finally:
+                app.close()
+
+    async def test_unavailable_apply_patch_is_rejected_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft(
+                    "apply_patch <<'PATCH'\n*** Begin Patch\n*** End Patch\nPATCH",
+                    call_key="unavailable-editor",
+                ),
+                execute_draft(
+                    "python3 -c 'open(\"/app/result\", \"w\").write(\"ok\")'",
+                    call_key="portable-editor",
+                ),
+                verify_draft("test \"$(cat /app/result)\" = ok"),
+                complete_draft(),
+            )
+            environment = FakeTerminalEnvironment(
+                completed_result(),
+                completed_result(),
+            )
+            app = build_terminal_application(
+                trial_id="trial-tool-capability",
+                logs_dir=directory,
+                environment=environment,
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(max_proposal_rejections=1),
+            )
+            try:
+                artifacts = await app.run("edit a task file portably")
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertEqual(len(environment.calls), 2)
+                self.assertNotIn("apply_patch", environment.calls[0].command)
+                rejection = capability.requests[1].session.last_proposal_rejection
+                self.assertIsNotNone(rejection)
+                assert rejection is not None
+                self.assertEqual(rejection.code, "terminal.tool.unavailable")
+                self.assertEqual(rejection.draft.environment_keys, ())
+            finally:
+                app.close()
+
+    async def test_mutating_git_verification_is_rejected_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft("create-artifact"),
+                verify_draft(
+                    "git branch verifier-created-ref",
+                    call_key="polluting-verification",
+                ),
+                verify_draft(
+                    "git show-ref --verify refs/heads/expected",
+                    call_key="read-only-verification",
+                ),
+                complete_draft(),
+            )
+            environment = FakeTerminalEnvironment(
+                completed_result(),
+                completed_result(),
+            )
+            app = build_terminal_application(
+                trial_id="trial-verification-purity",
+                logs_dir=directory,
+                environment=environment,
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(max_proposal_rejections=1),
+            )
+            try:
+                artifacts = await app.run("create and verify repository state")
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertEqual(len(environment.calls), 2)
+                self.assertEqual(
+                    environment.calls[1].command,
+                    "git show-ref --verify refs/heads/expected",
+                )
+                rejection = capability.requests[2].session.last_proposal_rejection
+                self.assertIsNotNone(rejection)
+                assert rejection is not None
+                self.assertEqual(
+                    rejection.code,
+                    "terminal.verification.persistent_mutation",
                 )
             finally:
                 app.close()
@@ -403,7 +676,6 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 proposal_capability=ScriptedTerminalTurnCapability(
                     execute_draft("create-artifact"),
                     verify_draft("assert-artifact"),
-                    complete_draft(),
                 ),
                 policy=TerminalExecutionPolicy(max_completion_rejections=0),
             )
@@ -411,6 +683,93 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 artifacts = await app.run("create and validate an artifact")
                 self.assertTrue(artifacts.runtime_result.succeeded)
                 self.assertTrue(artifacts.summary.agent_complete)
+                self.assertIn(
+                    "Runtime finalized",
+                    str(artifacts.runtime_result.final_state.output),
+                )
+            finally:
+                app.close()
+
+    async def test_successful_verification_completes_at_exact_token_budget(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft("create-artifact"),
+                verify_draft("assert-artifact"),
+                usage=InferenceUsage(total_tokens=1),
+            )
+            app = build_terminal_application(
+                trial_id="trial-exact-token-budget",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(),
+                    completed_result(),
+                ),
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(max_total_tokens=2),
+            )
+            try:
+                artifacts = await app.run("create and validate an artifact")
+                self.assertTrue(
+                    artifacts.runtime_result.succeeded,
+                    artifacts.runtime_result.final_state.model_dump_json(indent=2),
+                )
+                self.assertTrue(artifacts.summary.agent_complete)
+                self.assertEqual(artifacts.summary.total_tokens, 2)
+                self.assertEqual(len(capability.requests), 2)
+            finally:
+                app.close()
+
+    async def test_exact_token_budget_blocks_another_model_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft("create-artifact"),
+                usage=InferenceUsage(total_tokens=1),
+            )
+            environment = FakeTerminalEnvironment(completed_result())
+            app = build_terminal_application(
+                trial_id="trial-exact-token-budget-without-verification",
+                logs_dir=directory,
+                environment=environment,
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(max_total_tokens=1),
+            )
+            try:
+                artifacts = await app.run("create an artifact")
+                self.assertFalse(artifacts.runtime_result.succeeded)
+                self.assertEqual(
+                    artifacts.runtime_result.final_state.error,
+                    "terminal model token budget exhausted",
+                )
+                self.assertEqual(len(capability.requests), 1)
+                self.assertEqual(len(environment.calls), 1)
+            finally:
+                app.close()
+
+    async def test_over_budget_model_turn_does_not_execute_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft("create-artifact"),
+                usage=InferenceUsage(total_tokens=2),
+            )
+            environment = FakeTerminalEnvironment(completed_result())
+            app = build_terminal_application(
+                trial_id="trial-over-token-budget",
+                logs_dir=directory,
+                environment=environment,
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(max_total_tokens=1),
+            )
+            try:
+                artifacts = await app.run("create an artifact")
+                self.assertFalse(artifacts.runtime_result.succeeded)
+                self.assertEqual(
+                    artifacts.runtime_result.final_state.error,
+                    "terminal model token budget exhausted",
+                )
+                self.assertEqual(len(capability.requests), 1)
+                self.assertEqual(len(environment.calls), 0)
             finally:
                 app.close()
 
@@ -441,34 +800,290 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
-    async def test_work_after_verification_invalidates_completion_evidence(
+    async def test_multiple_verification_repair_cycles_are_allowed(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft("create-artifact", call_key="work-1"),
+                verify_draft("assert-artifact", call_key="verification-1"),
+                execute_draft("repair-artifact-1", call_key="work-2"),
+                verify_draft("assert-artifact", call_key="verification-2"),
+                execute_draft("repair-artifact-2", call_key="work-3"),
+                verify_draft("assert-artifact", call_key="verification-3"),
+            )
+            app = build_terminal_application(
+                trial_id="trial-multiple-verification-repairs",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(),
+                    completed_result(return_code=1, stderr="first failure"),
+                    completed_result(),
+                    completed_result(return_code=1, stderr="second failure"),
+                    completed_result(),
+                    completed_result(stdout="verification passed"),
+                ),
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(
+                    max_no_progress_seconds=None,
+                ),
+            )
+            try:
+                artifacts = await app.run("create and validate an artifact")
+                session = app.journal.snapshot()
+
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertTrue(artifacts.summary.agent_complete)
+                self.assertEqual(artifacts.summary.command_count, 6)
+                self.assertEqual(session.failed_verification_attempts, 2)
+                self.assertEqual(session.verification_corrections, 2)
+                self.assertEqual(len(capability.requests), 6)
+                self.assertIsNotNone(session.verified_checkpoint)
+                self.assertTrue(artifacts.summary.trace_consistent)
+            finally:
+                app.close()
+
+    async def test_successful_verification_auto_completes_and_preserves_checkpoint(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft("create-artifact"),
+                verify_draft("assert-artifact"),
+                execute_draft("change-artifact", call_key="command-2"),
+                complete_draft(),
+            )
             app = build_terminal_application(
                 trial_id="trial-stale-verification",
                 logs_dir=directory,
                 environment=FakeTerminalEnvironment(
                     completed_result(),
                     completed_result(),
-                    completed_result(),
                 ),
-                proposal_capability=ScriptedTerminalTurnCapability(
-                    execute_draft("create-artifact"),
-                    verify_draft("assert-artifact"),
-                    execute_draft("change-artifact", call_key="command-2"),
-                    complete_draft(),
-                ),
+                proposal_capability=capability,
                 policy=TerminalExecutionPolicy(max_completion_rejections=0),
             )
             try:
                 artifacts = await app.run("create and validate an artifact")
-                self.assertFalse(artifacts.runtime_result.succeeded)
-                self.assertFalse(artifacts.summary.agent_complete)
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertTrue(artifacts.summary.agent_complete)
+                self.assertEqual(len(app.journal.records()), 2)
+                checkpoint = app.journal.snapshot().verified_checkpoint
+                self.assertIsNotNone(checkpoint)
+                self.assertEqual(len(capability.requests), 2)
+                self.assertIsNone(
+                    app.journal.snapshot().last_proposal_rejection
+                )
+            finally:
+                app.close()
+
+    async def test_verification_must_cover_runtime_requirement_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            verification = TerminalVerificationContract(
+                evidence_kind="independent_check",
+                evidence_sources=("task-local check",),
+                artifact_paths=("/app/hello.html",),
+                requirement_coverage=("req-001",),
+                coverage_dimensions=(
+                    "artifact",
+                    "format",
+                    "semantic",
+                    "end_to_end",
+                ),
+                validation_methods=("HTTP request plus content assertion",),
+            )
+            environment = FakeTerminalEnvironment(completed_result())
+            app = build_terminal_application(
+                trial_id="trial-requirement-coverage",
+                logs_dir=directory,
+                environment=environment,
+                proposal_capability=ScriptedTerminalTurnCapability(
+                    execute_draft("touch /app/hello.html"),
+                    verify_draft(
+                        "test -f /app/hello.html",
+                        verification=verification,
+                    ),
+                ),
+                policy=TerminalExecutionPolicy(
+                    max_proposal_rejections=0,
+                    max_no_progress_seconds=None,
+                ),
+            )
+            try:
+                artifacts = await app.run(
+                    "Create the artifact. Serve hello.html over HTTP."
+                )
+
+                self.assertEqual(
+                    artifacts.runtime_result.final_state.status,
+                    RunStatus.FAILED,
+                )
+                self.assertEqual(len(environment.calls), 1)
                 self.assertIn(
-                    "last committed command is not marked verify",
+                    "verification requirement coverage is incomplete",
                     artifacts.runtime_result.final_state.error or "",
                 )
+            finally:
+                app.close()
+
+    async def test_inference_timeout_retries_once_in_delivery_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = TimeoutThenScriptedCapability(
+                execute_draft("create-artifact"),
+                verify_draft("test -e /app"),
+            )
+            app = build_terminal_application(
+                trial_id="trial-inference-delivery-retry",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(),
+                    completed_result(),
+                ),
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(max_no_progress_seconds=None),
+            )
+            try:
+                artifacts = await app.run("create and validate an artifact")
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertFalse(capability.requests[0].delivery_mode)
+                self.assertTrue(capability.requests[1].delivery_mode)
+                self.assertTrue(capability.requests[1].recovery_mode)
+                self.assertEqual(len(app.journal.records()), 2)
+            finally:
+                app.close()
+
+    async def test_repeated_inference_timeout_is_controlled_termination(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = AlwaysTimeoutCapability()
+            app = build_terminal_application(
+                trial_id="trial-inference-budget-termination",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(),
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(max_no_progress_seconds=None),
+            )
+            try:
+                artifacts = await app.run("create an artifact")
+                state = artifacts.runtime_result.final_state
+                self.assertEqual(state.status, RunStatus.TERMINATED)
+                self.assertIsNone(state.error)
+                self.assertIsNotNone(state.termination)
+                assert state.termination is not None
+                self.assertEqual(
+                    state.termination.primary_reason.value,
+                    "active_execution_budget",
+                )
+                self.assertEqual(len(capability.requests), 2)
+                self.assertFalse(capability.requests[0].delivery_mode)
+                self.assertTrue(capability.requests[1].delivery_mode)
+                self.assertTrue(artifacts.summary.trace_consistent)
+            finally:
+                app.close()
+
+    async def test_consecutive_unique_inspections_enter_recovery_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            environment = FakeTerminalEnvironment(
+                completed_result(stdout="first"),
+                completed_result(stdout="second"),
+                completed_result(stdout="third"),
+            )
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft(
+                    "inspect-1",
+                    call_key="inspect-1",
+                    command_role=TerminalCommandRole.INSPECT,
+                ),
+                execute_draft(
+                    "inspect-2",
+                    call_key="inspect-2",
+                    command_role=TerminalCommandRole.INSPECT,
+                ),
+                execute_draft(
+                    "inspect-3",
+                    call_key="inspect-3",
+                    command_role=TerminalCommandRole.INSPECT,
+                ),
+                execute_draft(
+                    "inspect-4",
+                    call_key="inspect-4",
+                    command_role=TerminalCommandRole.INSPECT,
+                ),
+            )
+            app = build_terminal_application(
+                trial_id="trial-inspection-recovery",
+                logs_dir=directory,
+                environment=environment,
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(
+                    max_consecutive_inspections=3,
+                    max_proposal_rejections=0,
+                    max_no_progress_seconds=None,
+                ),
+            )
+            try:
+                artifacts = await app.run("Inspect, then repair the artifact.")
+
+                self.assertEqual(
+                    artifacts.runtime_result.final_state.status,
+                    RunStatus.FAILED,
+                )
+                self.assertEqual(len(environment.calls), 3)
+                self.assertEqual(app.journal.snapshot().consecutive_inspections, 3)
+                self.assertTrue(capability.requests[-1].recovery_mode)
+            finally:
+                app.close()
+
+    async def test_total_inspections_enter_recovery_across_work_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            drafts: list[TerminalTurnDraft] = []
+            results = []
+            for index in range(1, 6):
+                drafts.extend(
+                    (
+                        execute_draft(
+                            f"inspect-{index}",
+                            call_key=f"inspect-{index}",
+                            command_role=TerminalCommandRole.INSPECT,
+                        ),
+                        execute_draft(
+                            f"work-{index}",
+                            call_key=f"work-{index}",
+                        ),
+                    )
+                )
+                results.extend((completed_result(), completed_result()))
+            drafts.append(
+                execute_draft(
+                    "inspect-6",
+                    call_key="inspect-6",
+                    command_role=TerminalCommandRole.INSPECT,
+                )
+            )
+            capability = ScriptedTerminalTurnCapability(*drafts)
+            app = build_terminal_application(
+                trial_id="trial-total-inspection-recovery",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(*results),
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(
+                    max_consecutive_inspections=3,
+                    max_total_inspections=5,
+                    max_proposal_rejections=0,
+                    max_no_progress_steps=None,
+                    max_no_progress_seconds=None,
+                ),
+            )
+            try:
+                artifacts = await app.run("Inspect incrementally, then repair.")
+                self.assertEqual(
+                    artifacts.runtime_result.final_state.status,
+                    RunStatus.FAILED,
+                )
+                self.assertEqual(len(app.journal.records()), 10)
+                session = app.journal.snapshot()
+                self.assertEqual(session.inspection_commands, 5)
+                self.assertEqual(session.consecutive_inspections, 0)
+                self.assertTrue(capability.requests[-1].recovery_mode)
             finally:
                 app.close()
 

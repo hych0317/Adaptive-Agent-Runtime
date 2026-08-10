@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import unittest
+from unittest.mock import patch
 from typing import Any, cast
 from uuid import uuid4
 
@@ -16,7 +18,30 @@ from adaptive_agent_runtime import (
 from adaptive_agent_runtime.core.state import record_observation, start_state
 
 
+NOW = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+
+
 class ImmutableModelTests(unittest.TestCase):
+    def test_state_timestamps_do_not_regress_with_wall_clock(self) -> None:
+        pending = AgentState(
+            run_id=uuid4(),
+            task=AgentTask(description="test"),
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        with patch(
+            "adaptive_agent_runtime.core.state.utc_now",
+            return_value=NOW - timedelta(milliseconds=25),
+        ):
+            running = start_state(pending)
+
+        self.assertEqual(running.updated_at, NOW)
+        defaulted = AgentState(
+            run_id=uuid4(),
+            task=AgentTask(description="default timestamps"),
+        )
+        self.assertEqual(defaulted.updated_at, defaulted.created_at)
+
     def test_nested_task_input_is_deeply_immutable(self) -> None:
         source: dict[str, Any] = {"filters": [{"sector": "energy"}]}
         task = AgentTask(description="research", input=source)

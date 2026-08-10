@@ -383,7 +383,7 @@ class GovernedOperationExecutor:
                 update={
                     "status": AuthorizationUseStatus.FAILED,
                     "revision": reserved.revision + 1,
-                    "updated_at": self._clock(),
+                    "updated_at": max(self._clock(), reserved.updated_at),
                     "error": f"{exc.__class__.__name__}: {detail}",
                 }
             )
@@ -398,7 +398,7 @@ class GovernedOperationExecutor:
             update={
                 "status": AuthorizationUseStatus.APPLIED,
                 "revision": reserved.revision + 1,
-                "updated_at": self._clock(),
+                "updated_at": max(self._clock(), reserved.updated_at),
                 "result_fingerprint": governance_fingerprint(result),
             }
         )

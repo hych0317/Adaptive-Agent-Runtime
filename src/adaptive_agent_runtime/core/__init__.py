@@ -1,6 +1,7 @@
 """Stable contracts and runtime mechanics for Phase 1."""
 
 from adaptive_agent_runtime.core.contracts import (
+    ActionAbandonmentReconciler,
     ActionExecutor,
     ObservationReconciler,
     Planner,
@@ -49,6 +50,7 @@ from adaptive_agent_runtime.core.state import InMemoryStateStore
 from adaptive_agent_runtime.core.trace import InMemoryTraceSink
 
 __all__ = [
+    "ActionAbandonmentReconciler",
     "ActionExecutor",
     "ActionRequest",
     "AgentRuntime",

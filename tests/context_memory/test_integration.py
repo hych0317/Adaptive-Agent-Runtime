@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
+from unittest.mock import patch
 from uuid import uuid4
 
 from adaptive_agent_runtime import (
@@ -17,9 +18,12 @@ from adaptive_agent_runtime import (
 from adaptive_agent_runtime.context_memory import (
     ConditionalMemoryRecall,
     ContextAssembler,
+    ContextLayer,
     ContextMemoryCoordinator,
+    ContextMetadata,
     ContextScheduler,
     ContextSource,
+    ContextUnit,
     DefaultTaskContextRequirementProvider,
     EvidenceDrivenMemoryConsolidator,
     ExplicitMemoryCandidateFactory,
@@ -52,6 +56,43 @@ def task_node(goal: str) -> TaskNode:
 
 
 class ContextMemoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_access_timestamp_does_not_regress_with_wall_clock(self) -> None:
+        now = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+        run_id = uuid4()
+        unit = ContextUnit(
+            content={"fact": "stable"},
+            metadata=ContextMetadata(
+                source=ContextSource.DOCUMENT,
+                layer=ContextLayer.TASK,
+                run_id=run_id,
+                created_at=now,
+                updated_at=now,
+            ),
+        )
+        store = InMemoryContextStore()
+        await store.save(unit, expected_revision=None)
+        coordinator = ContextMemoryCoordinator(
+            context_store=store,
+            scheduler=ContextScheduler(),
+            assembler=ContextAssembler(),
+            requirements=DefaultTaskContextRequirementProvider(),
+            memory_recall=ConditionalMemoryRecall(InMemoryMemoryStore()),
+        )
+
+        with patch(
+            "adaptive_agent_runtime.context_memory.integration.utc_now",
+            return_value=now - timedelta(milliseconds=25),
+        ):
+            await coordinator._mark_accessed({unit.context_id})
+
+        updated = await store.load(unit.context_id)
+        self.assertIsNotNone(updated)
+        assert updated is not None
+        self.assertEqual(updated.metadata.created_at, now)
+        self.assertEqual(updated.metadata.updated_at, now)
+        self.assertEqual(updated.metadata.last_accessed_at, now)
+        self.assertEqual(updated.metadata.access_count, 1)
+
     async def test_observation_memory_recall_and_next_context_flow(self) -> None:
         first_node = task_node("collect evidence")
         next_node = task_node("analyze evidence")

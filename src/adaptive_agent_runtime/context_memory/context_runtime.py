@@ -48,7 +48,11 @@ from adaptive_agent_runtime.governance.models import GovernanceTarget, RuntimeCo
 def _evolve_metadata(metadata: ContextMetadata, **changes: Any) -> ContextMetadata:
     values = metadata.model_dump(mode="python")
     values.update(changes)
-    values["updated_at"] = utc_now()
+    values["updated_at"] = max(
+        utc_now(),
+        metadata.created_at,
+        metadata.updated_at,
+    )
     return ContextMetadata.model_validate(values)
 
 

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 from adaptive_agent_runtime.context_memory import (
     ConditionalMemoryRecall,
+    ContextArchiveReference,
     ContextCompressionResult,
     ContextLayer,
     ContextLifecycleManager,
@@ -20,6 +23,7 @@ from adaptive_agent_runtime.context_memory import (
     MemoryEvolutionType,
     MemoryRecallQuery,
 )
+from adaptive_agent_runtime.decisioning import decision_fingerprint
 from adaptive_agent_runtime.persistence import SQLitePersistence
 
 
@@ -34,7 +38,46 @@ class DeterministicCompressor:
         )
 
 
+NOW = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+
+
 class SQLiteContextMemoryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_archive_timestamps_do_not_regress_with_wall_clock(self) -> None:
+        unit = ContextUnit(
+            content={"fact": "stable"},
+            metadata=ContextMetadata(
+                source=ContextSource.OBSERVATION,
+                layer=ContextLayer.TASK,
+                run_id=uuid4(),
+                created_at=NOW,
+                updated_at=NOW,
+            ),
+        )
+        with TemporaryDirectory() as directory:
+            persistence = SQLitePersistence(f"{directory}/context.sqlite3")
+            with patch(
+                "adaptive_agent_runtime.persistence.context_memory.utc_now",
+                return_value=NOW - timedelta(milliseconds=25),
+            ):
+                archive_reference = await persistence.context_archive.archive(unit)
+                staged_reference = (
+                    await persistence.context_archive.stage_compression(
+                        unit,
+                        reference=ContextArchiveReference(
+                            context_id=unit.context_id,
+                        ),
+                        effect_fingerprint="a" * 64,
+                        source_fingerprint=decision_fingerprint(unit),
+                    )
+                )
+            archived = await persistence.context_archive.restore(
+                archive_reference
+            )
+            persistence.close()
+
+        self.assertEqual(archived.metadata.updated_at, NOW)
+        self.assertEqual(staged_reference.archived_at, NOW)
+
     async def test_context_archive_restores_after_database_reopen(self) -> None:
         run_id = uuid4()
         unit = ContextUnit(

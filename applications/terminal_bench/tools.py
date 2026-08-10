@@ -63,6 +63,62 @@ def terminal_provider_metadata(
         ],
         "additionalProperties": False,
     }
+    verification_schema = {
+        "type": ["object", "null"],
+        "properties": {
+            "evidence_kind": {
+                "type": "string",
+                "enum": ["official_tests", "independent_check"],
+            },
+            "evidence_sources": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string", "minLength": 1},
+            },
+            "artifact_paths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string", "minLength": 1},
+            },
+            "requirement_coverage": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": True,
+                "items": {
+                    "type": "string",
+                    "pattern": "^req-[0-9]{3,}$",
+                },
+            },
+            "coverage_dimensions": {
+                "type": "array",
+                "uniqueItems": True,
+                "items": {
+                    "type": "string",
+                    "enum": ["artifact", "format", "semantic", "end_to_end"],
+                },
+            },
+            "validation_methods": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": True,
+                "items": {"type": "string", "minLength": 1},
+            },
+            "state_policy": {
+                "type": "string",
+                "enum": ["read_only"],
+            },
+        },
+        "required": [
+            "evidence_kind",
+            "evidence_sources",
+            "artifact_paths",
+            "requirement_coverage",
+            "coverage_dimensions",
+            "validation_methods",
+            "state_policy",
+        ],
+        "additionalProperties": False,
+    }
     schema = {
         "type": "object",
         "properties": {
@@ -74,7 +130,7 @@ def terminal_provider_metadata(
             },
             "command_role": {
                 "type": "string",
-                "enum": ["work", "verify"],
+                "enum": ["inspect", "work", "verify"],
             },
             "cwd": {
                 "type": ["string", "null"],
@@ -95,6 +151,7 @@ def terminal_provider_metadata(
                 "maximum": policy.max_timeout_sec,
             },
             "process_reference": process_reference_schema,
+            "verification": verification_schema,
         },
         "required": [
             "trial_id",
@@ -104,6 +161,7 @@ def terminal_provider_metadata(
             "env",
             "timeout_sec",
             "process_reference",
+            "verification",
         ],
         "additionalProperties": False,
     }

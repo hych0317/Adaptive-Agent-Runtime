@@ -272,6 +272,7 @@ class RunControlState(FrozenModel):
     deadline_at: AwareDatetime | None = None
     active_execution_seconds: float = Field(default=0.0, ge=0.0)
     no_progress_active_seconds: float = Field(default=0.0, ge=0.0)
+    pending_planning_seconds: float = Field(default=0.0, ge=0.0)
     no_progress_steps: int = Field(default=0, ge=0)
     last_progress_at: AwareDatetime | None = None
     last_progress_fingerprint: str | None = Field(
@@ -449,7 +450,9 @@ class AgentState(FrozenModel):
     control: RunControlState = Field(default_factory=RunControlState)
     termination: RunTermination | None = None
     created_at: AwareDatetime = Field(default_factory=utc_now)
-    updated_at: AwareDatetime = Field(default_factory=utc_now)
+    updated_at: AwareDatetime = Field(
+        default_factory=lambda values: values["created_at"]
+    )
 
     @model_validator(mode="after")
     def validate_lifecycle(self) -> AgentState:

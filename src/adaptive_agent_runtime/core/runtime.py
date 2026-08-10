@@ -9,6 +9,7 @@ from uuid import UUID
 from pydantic import JsonValue
 
 from adaptive_agent_runtime.core.contracts import (
+    ActionAbandonmentReconciler,
     ActionExecutor,
     ObservationReconciler,
     Planner,
@@ -216,6 +217,10 @@ class AgentRuntime:
                     elapsed_seconds=monotonic() - planning_started,
                     usage=usage,
                 )
+                control = self._termination.resolve_planning_without_action(
+                    control,
+                    made_progress=False,
+                )
                 guard_snapshot = await invocation_guard.snapshot()
                 control = control.model_copy(
                     update={
@@ -254,6 +259,10 @@ class AgentRuntime:
                     elapsed_seconds=monotonic() - planning_started,
                     usage=usage,
                 )
+                control = self._termination.resolve_planning_without_action(
+                    control,
+                    made_progress=False,
+                )
                 assessment = self._termination.before_planning(
                     control,
                     phase=TerminationCheckPhase.AFTER_PLANNING,
@@ -282,15 +291,19 @@ class AgentRuntime:
                     exc,
                     (RunBudgetExhaustedError, RunUsageAccountingError),
                 ):
-                    reason = (
-                        RunTerminationReason.USAGE_ACCOUNTING_UNAVAILABLE
-                        if isinstance(exc, RunUsageAccountingError)
-                        else (
-                            RunTerminationReason.TOKEN_BUDGET_EXHAUSTED
-                            if exc.resource == "tokens"
-                            else RunTerminationReason.COST_BUDGET_EXHAUSTED
+                    if isinstance(exc, RunUsageAccountingError):
+                        reason = RunTerminationReason.USAGE_ACCOUNTING_UNAVAILABLE
+                    else:
+                        reason = {
+                            "tokens": RunTerminationReason.TOKEN_BUDGET_EXHAUSTED,
+                            "cost": RunTerminationReason.COST_BUDGET_EXHAUSTED,
+                            "active_execution": (
+                                RunTerminationReason.ACTIVE_EXECUTION_BUDGET
+                            ),
+                        }.get(
+                            exc.resource,
+                            RunTerminationReason.USAGE_ACCOUNTING_UNAVAILABLE,
                         )
-                    )
                     assessment = self._termination.explicit_stop(
                         reason,
                         phase=TerminationCheckPhase.AFTER_PLANNING,
@@ -339,6 +352,7 @@ class AgentRuntime:
             assessment = self._termination.before_planning(
                 control,
                 phase=TerminationCheckPhase.AFTER_PLANNING,
+                include_stagnation=False,
             )
             guard_snapshot = await invocation_guard.snapshot()
             control = control.model_copy(
@@ -365,6 +379,10 @@ class AgentRuntime:
                 )
 
             if decision.decision is PlanDecisionType.COMPLETE:
+                control = self._termination.resolve_planning_without_action(
+                    control,
+                    made_progress=True,
+                )
                 previous = state
                 state = complete_state(state, decision, control=control)
                 await self._save_state(state)
@@ -378,6 +396,10 @@ class AgentRuntime:
                 return RunResult(final_state=state)
 
             if decision.decision is PlanDecisionType.FAIL:
+                control = self._termination.resolve_planning_without_action(
+                    control,
+                    made_progress=False,
+                )
                 if decision.error is None:
                     return await self._fail_run(
                         state,
@@ -573,6 +595,20 @@ class AgentRuntime:
         *,
         last_plan: PlanDecision | None = None,
     ) -> RunResult:
+        abandonment_error = await self._reconcile_abandoned_action(
+            state,
+            last_plan,
+            assessment,
+        )
+        if abandonment_error is not None:
+            return await self._fail_run(
+                state,
+                abandonment_error,
+                source=self._planner.module_id,
+                last_plan=last_plan,
+                control=control,
+                assessment=assessment,
+            )
         if assessment.terminal_status is RunStatus.FAILED:
             return await self._fail_run(
                 state,
@@ -626,6 +662,37 @@ class AgentRuntime:
         except Exception as exc:
             return self._module_error(
                 "observation reconciliation",
+                self._planner.module_id,
+                exc,
+            )
+        return None
+
+    async def _reconcile_abandoned_action(
+        self,
+        state: AgentState,
+        last_plan: PlanDecision | None,
+        assessment: StopAssessment,
+    ) -> str | None:
+        if (
+            last_plan is None
+            or last_plan.decision is not PlanDecisionType.EXECUTE
+            or last_plan.action is None
+            or (
+                state.last_observation is not None
+                and state.last_observation.action_id == last_plan.action.action_id
+            )
+            or not isinstance(self._planner, ActionAbandonmentReconciler)
+        ):
+            return None
+        try:
+            await self._planner.reconcile_abandoned_action(
+                state,
+                last_plan.action,
+                assessment.termination,
+            )
+        except Exception as exc:
+            return self._module_error(
+                "action abandonment reconciliation",
                 self._planner.module_id,
                 exc,
             )

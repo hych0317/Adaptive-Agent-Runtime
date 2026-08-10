@@ -318,7 +318,11 @@ class ContextMemoryCoordinator:
             if unit is None:
                 continue
             metadata_values = unit.metadata.model_dump(mode="python")
-            now = utc_now()
+            now = max(
+                utc_now(),
+                unit.metadata.created_at,
+                unit.metadata.updated_at,
+            )
             metadata_values.update(
                 access_count=unit.metadata.access_count + 1,
                 last_accessed_at=now,

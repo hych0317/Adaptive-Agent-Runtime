@@ -302,11 +302,13 @@ class TerminalModelConfig:
     api_key: str | None = None
     base_url: str | None = None
     max_output_tokens: int | None = 32768
-    inference_timeout_sec: float = 300.0
+    inference_timeout_sec: float = 360.0
+    delivery_inference_timeout_sec: float = 300.0
+    minimum_inference_timeout_sec: float = 120.0
     deepseek_reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH
     deepseek_thinking: Literal["enabled", "disabled"] = "enabled"
     codex_executable: str = "codex"
-    codex_reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH
+    codex_reasoning_effort: ReasoningEffort = ReasoningEffort.MAX
 
 
 @dataclass(frozen=True)
@@ -481,6 +483,7 @@ def build_terminal_application(
             max_action_steps=(
                 execution_policy.max_commands
                 + execution_policy.max_completion_rejections
+                + execution_policy.max_proposal_rejections
             ),
             max_wall_clock_seconds=execution_policy.max_wall_clock_seconds,
             max_active_execution_seconds=(
@@ -494,11 +497,12 @@ def build_terminal_application(
                 execution_policy.external_job_deadline_seconds
             ),
             cleanup_grace_seconds=execution_policy.cleanup_grace_seconds,
-            max_total_tokens=execution_policy.max_total_tokens,
-            max_monetary_cost=execution_policy.max_cost_usd,
-            currency=(
-                "USD" if execution_policy.max_cost_usd is not None else None
-            ),
+            # The Terminal Planner and inference Gateway own model budgets. A
+            # duplicate Core limit could stop after a successful verification
+            # Action, before the Planner can finalize its zero-token checkpoint.
+            max_total_tokens=None,
+            max_monetary_cost=None,
+            currency=None,
             repeated_invocation_limit=(
                 execution_policy.repeated_invocation_limit
             ),
@@ -635,6 +639,8 @@ def build_terminal_model_capability(
             else config.max_output_tokens
         ),
         strict_json_schema=(provider == "codex-cli"),
+        delivery_timeout_seconds=config.delivery_inference_timeout_sec,
+        minimum_timeout_seconds=config.minimum_inference_timeout_sec,
     )
     return capability, inference
 

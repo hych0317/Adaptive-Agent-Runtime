@@ -171,8 +171,8 @@ class RunTerminationController:
                 "active_execution_seconds": (
                     control.active_execution_seconds + max(0.0, elapsed_seconds)
                 ),
-                "no_progress_active_seconds": (
-                    control.no_progress_active_seconds
+                "pending_planning_seconds": (
+                    control.pending_planning_seconds
                     + max(0.0, elapsed_seconds)
                 ),
                 "phase": (
@@ -184,14 +184,42 @@ class RunTerminationController:
             }
         )
 
+    def resolve_planning_without_action(
+        self,
+        control: RunControlState,
+        *,
+        made_progress: bool,
+    ) -> RunControlState:
+        """Discard deferred planning time when no Action can classify it.
+
+        A failed or voluntarily final planning turn is not evidence that task
+        execution stagnated. Only an executed Action may classify its preceding
+        planning time as progress or no progress.
+        """
+
+        update: dict[str, object] = {"pending_planning_seconds": 0.0}
+        if made_progress:
+            update.update(
+                {
+                    "no_progress_steps": 0,
+                    "no_progress_active_seconds": 0.0,
+                    "last_progress_at": self._clock(),
+                }
+            )
+        return control.model_copy(update=update)
+
     def before_planning(
         self,
         control: RunControlState,
         *,
         phase: TerminationCheckPhase,
+        include_stagnation: bool = True,
     ) -> StopAssessment | None:
         return self._assessment(
-            self._hard_limit_reasons(control),
+            self._limit_reasons(
+                control,
+                include_stagnation=include_stagnation,
+            ),
             phase=phase,
             control=control,
         )
@@ -202,7 +230,7 @@ class RunTerminationController:
         action: ActionRequest,
         control: RunControlState,
     ) -> tuple[RunControlState, StopAssessment | None]:
-        reasons = list(self._hard_limit_reasons(control))
+        reasons = list(self._limit_reasons(control))
         evidence: list[RunTerminationEvidence] = []
         if state.step_count >= self.policy.max_action_steps:
             reasons.append(RunTerminationReason.MAX_ACTION_STEPS)
@@ -333,17 +361,28 @@ class RunTerminationController:
                 update={
                     "no_progress_steps": 0,
                     "no_progress_active_seconds": 0.0,
+                    "pending_planning_seconds": 0.0,
                     "last_progress_at": self._clock(),
                     "last_progress_fingerprint": progress_fingerprint,
                 }
             )
         elif progress is ProgressKind.NO_PROGRESS:
             control = control.model_copy(
-                update={"no_progress_steps": control.no_progress_steps + 1}
+                update={
+                    "no_progress_steps": control.no_progress_steps + 1,
+                    "no_progress_active_seconds": (
+                        control.no_progress_active_seconds
+                        + control.pending_planning_seconds
+                    ),
+                    "pending_planning_seconds": 0.0,
+                }
             )
         elif observation.control.external_job_heartbeat:
             control = control.model_copy(
-                update={"no_progress_active_seconds": 0.0}
+                update={
+                    "no_progress_active_seconds": 0.0,
+                    "pending_planning_seconds": 0.0,
+                }
             )
 
         job_id = observation.control.external_job_id
@@ -370,10 +409,11 @@ class RunTerminationController:
                     "phase": RunPhase.WAITING_EXTERNAL,
                     "no_progress_steps": 0,
                     "no_progress_active_seconds": 0.0,
+                    "pending_planning_seconds": 0.0,
                 }
             )
 
-        reasons = list(self._hard_limit_reasons(control))
+        reasons = list(self._limit_reasons(control))
         now = self._clock()
         if (
             self.policy.external_job_deadline_seconds is not None
@@ -419,7 +459,7 @@ class RunTerminationController:
         )
         return control, assessment
 
-    def _hard_limit_reasons(
+    def _absolute_limit_reasons(
         self,
         control: RunControlState,
     ) -> tuple[RunTerminationReason, ...]:
@@ -442,6 +482,13 @@ class RunTerminationController:
             and control.usage.monetary_cost >= self.policy.max_monetary_cost
         ):
             reasons.append(RunTerminationReason.COST_BUDGET_EXHAUSTED)
+        return tuple(reasons)
+
+    def _stagnation_limit_reasons(
+        self,
+        control: RunControlState,
+    ) -> tuple[RunTerminationReason, ...]:
+        reasons: list[RunTerminationReason] = []
         if (
             self.policy.max_no_progress_steps is not None
             and control.no_progress_steps >= self.policy.max_no_progress_steps
@@ -453,6 +500,17 @@ class RunTerminationController:
             >= self.policy.max_no_progress_seconds
         ):
             reasons.append(RunTerminationReason.NO_PROGRESS_TIME)
+        return tuple(reasons)
+
+    def _limit_reasons(
+        self,
+        control: RunControlState,
+        *,
+        include_stagnation: bool = True,
+    ) -> tuple[RunTerminationReason, ...]:
+        reasons = list(self._absolute_limit_reasons(control))
+        if include_stagnation:
+            reasons.extend(self._stagnation_limit_reasons(control))
         return tuple(reasons)
 
     def _assessment(

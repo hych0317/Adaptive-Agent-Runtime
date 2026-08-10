@@ -41,6 +41,8 @@ class RunTerminationControllerTests(unittest.TestCase):
             elapsed_seconds=2.0,
             usage=RunUsage(),
         )
+        self.assertEqual(control.no_progress_active_seconds, 0.0)
+        self.assertEqual(control.pending_planning_seconds, 2.0)
         action = ActionRequest(name="long-running-tool")
         control, assessment = controller.after_action(
             control,
@@ -58,7 +60,28 @@ class RunTerminationControllerTests(unittest.TestCase):
         self.assertIsNone(assessment)
         self.assertEqual(control.active_execution_seconds, 102.0)
         self.assertEqual(control.no_progress_active_seconds, 2.0)
+        self.assertEqual(control.pending_planning_seconds, 0.0)
         self.assertEqual(control.no_progress_steps, 1)
+    def test_failed_planning_time_is_not_stagnation_evidence(self) -> None:
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        controller = RunTerminationController(
+            RunStopPolicy(max_no_progress_seconds=5.0),
+            clock=MutableClock(now),
+        )
+        control = controller.after_planning(
+            controller.initial_control(now),
+            elapsed_seconds=10.0,
+            usage=RunUsage(),
+        )
+
+        control = controller.resolve_planning_without_action(
+            control,
+            made_progress=False,
+        )
+
+        self.assertEqual(control.pending_planning_seconds, 0.0)
+        self.assertEqual(control.no_progress_active_seconds, 0.0)
+
 
     def test_wall_clock_deadline_includes_waiting_and_downtime(self) -> None:
         created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)

@@ -9,6 +9,7 @@ from typing import Any
 
 from applications.terminal_bench.models import (
     TerminalBenchmarkAnalysis,
+    TerminalBenchmarkOutcome,
     TerminalTrialSummary,
 )
 
@@ -23,6 +24,7 @@ class TerminalResultAnalyzer:
         aar_summary: TerminalTrialSummary | Mapping[str, Any] | str | Path,
     ) -> TerminalBenchmarkAnalysis:
         trial = _as_mapping(harbor_trial_result)
+        verifier_text = _load_verifier_text(aar_summary)
         summary = _load_summary(aar_summary)
         verifier = trial.get("verifier_result")
         if not isinstance(verifier, Mapping):
@@ -39,7 +41,24 @@ class TerminalResultAnalyzer:
                 if isinstance(value, (int, float)) and not isinstance(value, bool)
             }
         verifier_reward = _primary_reward(rewards)
-        benchmark_pass = verifier_reward is not None and verifier_reward > 0.0
+        infrastructure_reason = _infrastructure_error_reason(
+            trial,
+            verifier_reward,
+            verifier_text,
+        )
+        infrastructure_error = infrastructure_reason is not None
+        benchmark_pass = (
+            not infrastructure_error
+            and verifier_reward is not None
+            and verifier_reward > 0.0
+        )
+        outcome = (
+            TerminalBenchmarkOutcome.INFRASTRUCTURE_ERROR
+            if infrastructure_error
+            else TerminalBenchmarkOutcome.BENCHMARK_PASS
+            if benchmark_pass
+            else TerminalBenchmarkOutcome.BENCHMARK_FAIL
+        )
         agent_context = trial.get("agent_result")
         context = agent_context if isinstance(agent_context, Mapping) else {}
         input_tokens = _nonnegative_int(
@@ -58,6 +77,9 @@ class TerminalResultAnalyzer:
             benchmark_pass=benchmark_pass,
             agent_complete=summary.agent_complete,
             completion_matches_verifier=(summary.agent_complete == benchmark_pass),
+            outcome=outcome,
+            infrastructure_error=infrastructure_error,
+            infrastructure_error_reason=infrastructure_reason,
             command_count=summary.command_count,
             denial_count=summary.denial_count,
             timeout_count=summary.timeout_count,
@@ -92,6 +114,63 @@ def _load_summary(
     return TerminalTrialSummary.model_validate_json(
         Path(value).read_text(encoding="utf-8")
     )
+
+
+def _load_verifier_text(
+    summary: TerminalTrialSummary | Mapping[str, Any] | str | Path,
+) -> str:
+    if not isinstance(summary, (str, Path)):
+        return ""
+    summary_path = Path(summary)
+    trial_dir = (
+        summary_path.parent.parent
+        if summary_path.parent.name == "agent"
+        else summary_path.parent
+    )
+    verifier_dir = trial_dir / "verifier"
+    parts: list[str] = []
+    for name in ("test-stdout.txt", "test-stderr.txt", "exception.txt"):
+        path = verifier_dir / name
+        if path.is_file():
+            parts.append(path.read_text(encoding="utf-8", errors="replace")[:500_000])
+    return "\n".join(parts)
+
+
+def _infrastructure_error_reason(
+    trial: Mapping[str, Any],
+    verifier_reward: float | None,
+    verifier_text: str,
+) -> str | None:
+    if verifier_reward is not None and verifier_reward > 0.0:
+        return None
+    exception = trial.get("exception_info")
+    if isinstance(exception, Mapping):
+        name = str(exception.get("exception_type") or exception.get("type") or "")
+        if any(
+            marker in name.lower()
+            for marker in ("verifiertimeout", "environment", "docker")
+        ):
+            return f"Harbor infrastructure exception: {name or 'unknown'}"
+    lowered = verifier_text.lower()
+    network_markers = (
+        "unable to connect",
+        "connection refused",
+        "could not resolve",
+        "temporary failure resolving",
+        "proxy error",
+        "connection timed out",
+    )
+    setup_markers = (
+        "curl: command not found",
+        "uvx: command not found",
+        "failed to fetch",
+        "unable to fetch some archives",
+    )
+    if any(marker in lowered for marker in network_markers) and any(
+        marker in lowered for marker in setup_markers
+    ):
+        return "verifier dependency setup failed because its network path was unavailable"
+    return None
 
 
 def _primary_reward(rewards: Mapping[str, float]) -> float | None:

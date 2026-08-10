@@ -68,7 +68,9 @@ class ContextMetadata(ContextMemoryModel):
     access_count: int = Field(default=0, ge=0)
     last_accessed_at: AwareDatetime | None = None
     created_at: AwareDatetime = Field(default_factory=utc_now)
-    updated_at: AwareDatetime = Field(default_factory=utc_now)
+    updated_at: AwareDatetime = Field(
+        default_factory=lambda values: values["created_at"]
+    )
 
     @model_validator(mode="after")
     def validate_metadata(self) -> ContextMetadata:

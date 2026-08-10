@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 from adaptive_agent_runtime import (
@@ -18,6 +19,7 @@ from adaptive_agent_runtime import (
     ObservationControl,
     PlanDecision,
     ProgressKind,
+    RunBudgetExhaustedError,
     RunStatus,
     RunStopPolicy,
     RunTerminationReason,
@@ -87,6 +89,14 @@ class RaisingPlanner:
     async def plan(self, state: AgentState) -> PlanDecision:
         del state
         raise ValueError("planning exploded")
+
+
+class ActiveExecutionBudgetPlanner:
+    module_id = "test.active_execution_budget_planner"
+
+    async def plan(self, state: AgentState) -> PlanDecision:
+        del state
+        raise RunBudgetExhaustedError("active_execution", "inference timed out")
 
 
 class FailingDecisionPlanner:
@@ -218,6 +228,31 @@ class BudgetThenBlockedPlanner:
 
 
 class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_active_execution_budget_error_is_controlled_termination(
+        self,
+    ) -> None:
+        trace = InMemoryTraceSink()
+        result = await AgentRuntime(
+            planner=ActiveExecutionBudgetPlanner(),
+            executor=CountingExecutor(),
+            state_store=InMemoryStateStore(),
+            trace_sink=trace,
+        ).run(AgentTask(description="bound inference time"))
+
+        self.assertEqual(result.final_state.status, RunStatus.TERMINATED)
+        self.assertIsNone(result.final_state.error)
+        assert result.final_state.termination is not None
+        self.assertEqual(
+            result.final_state.termination.primary_reason,
+            RunTerminationReason.ACTIVE_EXECUTION_BUDGET,
+        )
+        kinds = [
+            entry.event.kind
+            for entry in trace.entries_for(result.final_state.run_id)
+        ]
+        self.assertIn(CoreEventKind.RUNTIME_TERMINATED, kinds)
+        self.assertNotIn(CoreEventKind.RUNTIME_FAILED, kinds)
+
     async def test_single_step_loop_and_trace_order(self) -> None:
         store = InMemoryStateStore()
         trace = InMemoryTraceSink()
@@ -458,6 +493,37 @@ class RuntimeLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             reconciled.last_observation,
             result.final_state.last_observation,
+        )
+
+    async def test_slow_planning_does_not_block_valid_recovery_action(self) -> None:
+        executor = CountingExecutor()
+        runtime = AgentRuntime(
+            planner=FeedbackPlanner(target_steps=1),
+            executor=executor,
+            state_store=InMemoryStateStore(),
+            trace_sink=InMemoryTraceSink(),
+            stop_policy=RunStopPolicy(
+                max_action_steps=2,
+                repeated_invocation_limit=None,
+                max_no_progress_steps=None,
+                max_no_progress_seconds=5.0,
+            ),
+        )
+
+        with patch(
+            "adaptive_agent_runtime.core.runtime.monotonic",
+            side_effect=(0.0, 10.0, 10.0, 10.0, 10.0, 10.0),
+        ):
+            result = await runtime.run(
+                AgentTask(description="execute a valid recovery after slow planning")
+            )
+
+        self.assertEqual(executor.calls, 1)
+        self.assertTrue(result.succeeded)
+        self.assertEqual(result.final_state.status, RunStatus.COMPLETED)
+        self.assertEqual(
+            result.final_state.control.pending_planning_seconds,
+            0.0,
         )
 
     async def test_critical_nonrecoverable_failure_is_structured_failure(self) -> None:

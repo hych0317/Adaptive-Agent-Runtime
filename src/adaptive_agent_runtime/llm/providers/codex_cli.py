@@ -114,6 +114,7 @@ class CodexCLIInferenceConfig(LLMModel):
     auth_probe_mode: CodexCLIAuthProbeMode = CodexCLIAuthProbeMode.ADVISORY
     inherited_environment_variables: tuple[str, ...] = _DEFAULT_ENVIRONMENT
     reasoning_effort: ReasoningEffort | None = None
+    failed_turn_retries: int = Field(default=1, ge=0, le=2)
 
     @model_validator(mode="after")
     def validate_config(self) -> CodexCLIInferenceConfig:
@@ -131,10 +132,11 @@ class CodexCLIInferenceConfig(LLMModel):
             ReasoningEffort.MEDIUM,
             ReasoningEffort.HIGH,
             ReasoningEffort.XHIGH,
+            ReasoningEffort.MAX,
         }:
             raise ValueError(
                 "Codex CLI reasoning effort must be none, minimal, low, "
-                "medium, high, xhigh, or default"
+                "medium, high, xhigh, max, or default"
             )
         return self
 
@@ -202,6 +204,10 @@ class CodexCLIInferenceTargetDefinition(LLMModel):
         )
 
 
+class _CodexTurnFailedError(BackendProtocolError):
+    """A side-effect-free CLI inference turn failed before yielding a draft."""
+
+
 class CodexCLIInferenceBackend:
     """Use ``codex exec`` as audited inference, never as Runtime authority.
 
@@ -245,6 +251,18 @@ class CodexCLIInferenceBackend:
         )
 
     async def invoke(self, request: InferenceRequest) -> NormalizedModelResponse:
+        self._ensure_supported(request)
+        for attempt in range(self._config.failed_turn_retries + 1):
+            try:
+                return await self._invoke_once(request)
+            except _CodexTurnFailedError:
+                if attempt >= self._config.failed_turn_retries:
+                    raise
+        raise RuntimeError("unreachable Codex CLI retry state")
+
+    async def _invoke_once(
+        self, request: InferenceRequest
+    ) -> NormalizedModelResponse:
         self._ensure_supported(request)
         environment = inherited_environment(
             self._config.inherited_environment_variables
@@ -507,6 +525,18 @@ def _looks_unauthenticated(result: ProcessResult) -> bool:
     )
 
 
+def _codex_event_detail(event: Mapping[str, Any]) -> str:
+    for key in ("message", "error", "detail"):
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:512]
+        if isinstance(value, Mapping):
+            encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            return encoded[:512]
+    encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+    return encoded[:512]
+
+
 def _normalize_jsonl(
     profile: InferenceTargetProfile,
     request: InferenceRequest,
@@ -539,10 +569,15 @@ def _normalize_jsonl(
             thread_id = event.get("thread_id")
             if isinstance(thread_id, str) and thread_id:
                 remote_request_id = thread_id
-        if event_type in {"error", "turn.failed"}:
+        if event_type == "turn.failed":
+            raise _CodexTurnFailedError(
+                profile.target_id,
+                "Codex CLI reported a failed turn: " + _codex_event_detail(event),
+            )
+        if event_type == "error":
             raise BackendProtocolError(
                 profile.target_id,
-                "Codex CLI reported a failed turn",
+                "Codex CLI error event: " + _codex_event_detail(event),
             )
         if event_type in {"item.started", "item.completed"}:
             item = event.get("item")

@@ -10,6 +10,7 @@ from adaptive_agent_runtime.core.models import (
     AgentState,
     Observation,
     PlanDecision,
+    RunTermination,
     RuntimeEvent,
     TraceEntry,
 )
@@ -42,6 +43,21 @@ class ObservationReconciler(RuntimeModule, Protocol):
 
     async def reconcile_observation(self, state: AgentState) -> None:
         """Commit application state derived from Core's latest observation."""
+
+        ...
+
+
+@runtime_checkable
+class ActionAbandonmentReconciler(RuntimeModule, Protocol):
+    """Close application state for a planned Action that will not execute."""
+
+    async def reconcile_abandoned_action(
+        self,
+        state: AgentState,
+        action: ActionRequest,
+        termination: RunTermination,
+    ) -> None:
+        """Persist that ``action`` was abandoned before execution."""
 
         ...
 

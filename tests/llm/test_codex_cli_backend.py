@@ -62,6 +62,7 @@ class RecordingProcessTransport:
         login: ProcessResult | None = None,
         models: ProcessResult | None = None,
         execution: ProcessResult | None = None,
+        executions: Sequence[ProcessResult] | None = None,
         version_error: Exception | None = None,
         login_error: Exception | None = None,
         execution_error: Exception | None = None,
@@ -93,6 +94,7 @@ class RecordingProcessTransport:
             exit_code=0,
             stdout=codex_jsonl('{"answer":"ok"}'),
         )
+        self.executions = list(executions or ())
         self.version_error = version_error
         self.login_error = login_error
         self.execution_error = execution_error
@@ -133,6 +135,8 @@ class RecordingProcessTransport:
             self.schema_during_execution = json.loads(
                 Path(argv[index + 1]).read_text(encoding="utf-8")
             )
+        if self.executions:
+            return self.executions.pop(0)
         return self.execution
 
 
@@ -155,6 +159,18 @@ def codex_jsonl(
         {
             "type": "turn.completed",
             "usage": {"input_tokens": 11, "output_tokens": 7},
+        },
+    )
+    return "\n".join(json.dumps(event) for event in events)
+
+
+def codex_failed_jsonl(message: str) -> str:
+    events = (
+        {"type": "thread.started", "thread_id": "thread-failed"},
+        {"type": "turn.started"},
+        {
+            "type": "turn.failed",
+            "error": {"message": message},
         },
     )
     return "\n".join(json.dumps(event) for event in events)
@@ -423,6 +439,36 @@ class CodexCLIInferenceBackendTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(resolved, str(native))
+
+    async def test_failed_turn_is_retried_once_before_runtime_action(self) -> None:
+        transport = RecordingProcessTransport(
+            executions=(
+                ProcessResult(
+                    exit_code=0,
+                    stdout=codex_failed_jsonl("transient provider failure"),
+                ),
+                ProcessResult(
+                    exit_code=0,
+                    stdout=codex_jsonl('{"conclusions":["Recovered"]}'),
+                ),
+            )
+        )
+        backend = CodexCLIInferenceBackend(
+            cli_profile(),
+            CodexCLIInferenceConfig(
+                reasoning_effort=ReasoningEffort.MAX,
+            ),
+            transport,
+        )
+
+        response = await backend.invoke(reasoning_request())
+
+        self.assertEqual(response.output, {"conclusions": ("Recovered",)})
+        execution_calls = [call for call in transport.calls if "exec" in call[0]]
+        self.assertEqual(len(execution_calls), 2)
+        for argv, _, workspace, _, _ in execution_calls:
+            self.assertIn('model_reasoning_effort="max"', argv)
+            self.assertFalse(Path(workspace).exists())
 
     async def test_internal_action_event_is_rejected(self) -> None:
         transport = RecordingProcessTransport(

@@ -12,6 +12,7 @@ from applications.terminal_bench.models import (
     TerminalCommandRecord,
     TerminalExecResult,
     TerminalPendingCommand,
+    TerminalProposalRejection,
     TerminalSessionSnapshot,
     TerminalTrialSummary,
     TerminalTurnProposal,
@@ -69,6 +70,14 @@ class TerminalTrialJournal(Protocol):
 
     def save_pending(self, pending: TerminalPendingCommand) -> None: ...
 
+    def abandon_pending(
+        self,
+        action_id: UUID,
+        *,
+        reason: str,
+        phase: str,
+    ) -> None: ...
+
     def record_execution(self, invocation_id: UUID, result: TerminalExecResult) -> None: ...
 
     def execution_for(self, invocation_id: UUID) -> TerminalExecResult | None: ...
@@ -80,6 +89,11 @@ class TerminalTrialJournal(Protocol):
     def completion_gate_error(self) -> str | None: ...
 
     def record_completion_rejection(self, reason: str) -> None: ...
+
+    def record_proposal_rejection(
+        self,
+        rejection: TerminalProposalRejection,
+    ) -> None: ...
 
     def mark_complete(self, summary: str) -> None: ...
 

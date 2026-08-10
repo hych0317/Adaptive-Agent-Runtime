@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import unittest
+from unittest.mock import patch
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -80,6 +82,9 @@ def context_unit(
     )
 
 
+NOW = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+
+
 class ContextLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.store = InMemoryContextStore()
@@ -89,6 +94,29 @@ class ContextLifecycleTests(unittest.IsolatedAsyncioTestCase):
             archive=self.archive,
             compressor=StubCompressor(),
         )
+
+    async def test_metadata_defaults_share_one_timestamp(self) -> None:
+        metadata = ContextMetadata(
+            source=ContextSource.DOCUMENT,
+            layer=ContextLayer.TASK,
+            run_id=uuid4(),
+        )
+
+        self.assertEqual(metadata.updated_at, metadata.created_at)
+
+        from adaptive_agent_runtime.context_memory.context_runtime import (
+            _evolve_metadata,
+        )
+        with patch(
+            "adaptive_agent_runtime.context_memory.context_runtime.utc_now",
+            return_value=NOW - timedelta(microseconds=1),
+        ):
+            evolved = _evolve_metadata(
+                metadata.model_copy(
+                    update={"created_at": NOW, "updated_at": NOW}
+                )
+            )
+        self.assertEqual(evolved.updated_at, NOW)
 
     async def test_context_content_is_deeply_immutable(self) -> None:
         source: dict[str, Any] = {"nested": [1, 2]}

@@ -145,6 +145,42 @@ class GovernanceEnforcementTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(calls, 1)
 
+    async def test_resolution_time_does_not_regress_when_clock_moves_backward(self) -> None:
+        subject = {"revision": 1, "value": "approved"}
+        request, decision, authorization, target_identity = allowed_operation(
+            subject
+        )
+        store = InMemoryAuthorizationConsumptionStore()
+        clock_values = iter((NOW, NOW - timedelta(microseconds=1)))
+        executor = GovernedOperationExecutor(
+            verifier=StrictAuthorizationVerifier(),
+            consumption_store=store,
+            clock=lambda: next(clock_values),
+        )
+
+        async def apply() -> dict[str, object]:
+            return {"revision": 2}
+
+        await executor.execute(
+            request=request,
+            decision=decision,
+            authorization=authorization,
+            target=BoundGovernedOperation(
+                module_id="test.target",
+                operation=request.operation,
+                target=target_identity,
+                subject=subject,
+                apply=apply,
+            ),
+        )
+
+        use = await store.load(authorization.authorization_id)
+        self.assertIsNotNone(use)
+        assert use is not None
+        self.assertEqual(use.reserved_at, NOW)
+        self.assertEqual(use.updated_at, NOW)
+        self.assertEqual(use.status, AuthorizationUseStatus.APPLIED)
+
     async def test_changed_subject_is_rejected_before_reservation(self) -> None:
         approved_subject = {"revision": 1}
         request, decision, authorization, target_identity = allowed_operation(

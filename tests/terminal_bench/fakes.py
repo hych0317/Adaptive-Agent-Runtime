@@ -9,6 +9,7 @@ from applications.terminal_bench.models import (
     TerminalCommandRole,
     TerminalExecResult,
     TerminalExecutionState,
+    TerminalVerificationContract,
     TerminalTurnDraft,
     TerminalTurnProposal,
     TerminalTurnRequest,
@@ -84,12 +85,14 @@ def execute_draft(
     env: dict[str, str] | None = None,
     timeout_sec: int | None = None,
     command_role: TerminalCommandRole = TerminalCommandRole.WORK,
+    verification: TerminalVerificationContract | None = None,
 ) -> TerminalTurnDraft:
     return TerminalTurnDraft(
         decision="execute",
         call_key=call_key,
         command=command,
         command_role=command_role,
+        verification=verification,
         cwd=cwd,
         env=env,
         timeout_sec=timeout_sec,
@@ -104,7 +107,22 @@ def verify_draft(
     cwd: str | None = None,
     env: dict[str, str] | None = None,
     timeout_sec: int | None = None,
+    verification: TerminalVerificationContract | None = None,
 ) -> TerminalTurnDraft:
+    if verification is None:
+        verification = TerminalVerificationContract(
+            evidence_kind="independent_check",
+            evidence_sources=("scripted independent check",),
+            artifact_paths=(cwd or "/app",),
+            requirement_coverage=("req-001",),
+            coverage_dimensions=(
+                "artifact",
+                "format",
+                "semantic",
+                "end_to_end",
+            ),
+            validation_methods=("scripted end-to-end assertion",),
+        )
     return execute_draft(
         command,
         call_key=call_key,
@@ -112,6 +130,7 @@ def verify_draft(
         env=env,
         timeout_sec=timeout_sec,
         command_role=TerminalCommandRole.VERIFY,
+        verification=verification,
     )
 
 

@@ -1,6 +1,7 @@
 """Public API for the Adaptive Agent Runtime core."""
 
 from adaptive_agent_runtime.core import (
+    ActionAbandonmentReconciler,
     ActionExecutor,
     ActionRequest,
     AgentRuntime,
@@ -45,6 +46,7 @@ from adaptive_agent_runtime.core import (
 )
 
 __all__ = [
+    "ActionAbandonmentReconciler",
     "ActionExecutor",
     "ActionRequest",
     "AgentRuntime",

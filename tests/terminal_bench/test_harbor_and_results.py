@@ -12,7 +12,12 @@ from applications.terminal_bench.harbor_agent import (
     AdaptiveRuntimeHarborAgent,
     AgentContext,
 )
-from applications.terminal_bench.models import TerminalTrialSummary, utc_now
+from applications.terminal_bench.models import (
+    TerminalBenchmarkOutcome,
+    TerminalExecutionPolicy,
+    TerminalTrialSummary,
+    utc_now,
+)
 from applications.terminal_bench.result_analyzer import TerminalResultAnalyzer
 
 
@@ -88,6 +93,26 @@ class HarborAndResultTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(hasattr(context, "aar_summary"))
             self.assertTrue(fake_app.closed)
 
+    def test_agent_timeout_reserves_time_for_delivery_and_verifier_handoff(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent = AdaptiveRuntimeHarborAgent(
+                logs_dir=Path(directory),
+                model_name="codex-cli/luna-high",
+                agent_timeout_sec="900",
+                deadline_reserve_seconds="120",
+            )
+
+            self.assertEqual(
+                agent._execution_policy.max_wall_clock_seconds,
+                780.0,
+            )
+            self.assertEqual(
+                agent._execution_policy.deadline_reserve_seconds,
+                120.0,
+            )
+
     def test_result_analyzer_runs_after_harbor_verifier(self) -> None:
         analyzer = TerminalResultAnalyzer()
         with self.assertRaisesRegex(ValueError, "after verification"):
@@ -126,6 +151,40 @@ class HarborAndResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(analysis.agent_complete)
         self.assertFalse(analysis.benchmark_pass)
         self.assertFalse(analysis.completion_matches_verifier)
+
+    def test_verifier_network_setup_failure_is_infrastructure_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            trial_dir = Path(directory) / "trial"
+            agent_dir = trial_dir / "agent"
+            verifier_dir = trial_dir / "verifier"
+            agent_dir.mkdir(parents=True)
+            verifier_dir.mkdir(parents=True)
+            summary_path = agent_dir / "aar-summary.json"
+            summary_path.write_text(summary().model_dump_json(), encoding="utf-8")
+            (verifier_dir / "test-stderr.txt").write_text(
+                "curl: (7) unable to connect to package host\n"
+                "failed to fetch verifier dependencies\n",
+                encoding="utf-8",
+            )
+
+            analysis = TerminalResultAnalyzer().analyze(
+                harbor_trial_result={
+                    "verifier_result": {"rewards": {"reward": 0}},
+                    "agent_result": {},
+                },
+                aar_summary=summary_path,
+            )
+
+        self.assertEqual(
+            analysis.outcome,
+            TerminalBenchmarkOutcome.INFRASTRUCTURE_ERROR,
+        )
+        self.assertTrue(analysis.infrastructure_error)
+        self.assertFalse(analysis.benchmark_pass)
+        self.assertIn(
+            "network path",
+            analysis.infrastructure_error_reason or "",
+        )
 
 
 if __name__ == "__main__":

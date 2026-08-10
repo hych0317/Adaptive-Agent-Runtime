@@ -18,6 +18,7 @@ from adaptive_agent_runtime.llm import InferenceUsage
 AAR_TERMINAL_SEQUENTIAL_PROFILE = "AAR Terminal Sequential Profile"
 TERMINAL_COMMAND_ACTION = "terminal.command"
 TERMINAL_COMPLETION_REJECTION_ACTION = "terminal.completion_rejection"
+TERMINAL_PROPOSAL_REJECTION_ACTION = "terminal.proposal_rejection"
 TERMINAL_COMMAND_CAPABILITY = "terminal.command.execute"
 TERMINAL_COMMAND_PROVIDER = "harbor.environment.exec"
 
@@ -61,8 +62,119 @@ class TerminalTurnDecision(StrEnum):
 class TerminalCommandRole(StrEnum):
     """Planner-declared role used by the Runtime completion gate."""
 
+    INSPECT = "inspect"
     WORK = "work"
     VERIFY = "verify"
+
+
+class TerminalVerificationEvidence(StrEnum):
+    OFFICIAL_TESTS = "official_tests"
+    INDEPENDENT_CHECK = "independent_check"
+
+
+class TerminalVerificationStatePolicy(StrEnum):
+    READ_ONLY = "read_only"
+
+
+class TerminalVerificationDimension(StrEnum):
+    """Minimum independent dimensions needed before a task can complete."""
+
+    ARTIFACT = "artifact"
+    FORMAT = "format"
+    SEMANTIC = "semantic"
+    END_TO_END = "end_to_end"
+
+
+class TerminalRequirement(TerminalModel):
+    """One stable, Runtime-derived verification requirement."""
+
+    requirement_id: str = Field(pattern=r"^req-[0-9]{3,}$")
+    description: str = Field(min_length=1, max_length=2000)
+
+
+class TerminalVerificationContract(TerminalModel):
+    """Auditable evidence contract for a model-proposed verification."""
+
+    evidence_kind: TerminalVerificationEvidence
+    evidence_sources: tuple[str, ...] = Field(min_length=1)
+    artifact_paths: tuple[str, ...] = Field(min_length=1)
+    requirement_coverage: tuple[str, ...] = Field(min_length=1)
+    coverage_dimensions: tuple[TerminalVerificationDimension, ...] = ()
+    validation_methods: tuple[str, ...] = Field(min_length=1)
+    state_policy: TerminalVerificationStatePolicy = (
+        TerminalVerificationStatePolicy.READ_ONLY
+    )
+
+    @model_validator(mode="after")
+    def validate_coverage(self) -> TerminalVerificationContract:
+        collections = (
+            self.evidence_sources,
+            self.artifact_paths,
+            self.requirement_coverage,
+            self.coverage_dimensions,
+            self.validation_methods,
+        )
+        if any(len(set(items)) != len(items) for items in collections):
+            raise ValueError("verification evidence entries must be unique")
+        if self.evidence_kind is TerminalVerificationEvidence.INDEPENDENT_CHECK:
+            required = set(TerminalVerificationDimension)
+            missing = required.difference(self.coverage_dimensions)
+            if missing:
+                names = ", ".join(sorted(item.value for item in missing))
+                raise ValueError(
+                    "independent verification is missing coverage dimensions: "
+                    + names
+                )
+        return self
+
+
+class TerminalExecutionLimits(TerminalModel):
+    default_timeout_sec: int = Field(default=120, ge=1)
+    max_timeout_sec: int = Field(default=300, ge=1)
+    max_command_characters: int = Field(default=20_000, ge=1)
+    max_environment_variables: int = Field(default=64, ge=0)
+    max_environment_value_characters: int = Field(default=4096, ge=1)
+
+
+class TerminalToolCapabilities(TerminalModel):
+    shell_exec: bool = True
+    apply_patch: bool = False
+    portable_file_edit_methods: tuple[str, ...] = (
+        "python3 script with explicit path and atomic replace",
+        "sed/awk/perl after feature detection",
+        "shell heredoc only when quoting and overwrite scope are explicit",
+    )
+
+
+class TerminalRejectedDraft(TerminalModel):
+    decision: TerminalTurnDecision
+    call_key: str | None = Field(default=None, max_length=256)
+    command_preview: str | None = Field(default=None, max_length=512)
+    command_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    command_role: TerminalCommandRole | None = None
+    cwd: str | None = Field(default=None, max_length=4096)
+    environment_keys: tuple[str, ...] = ()
+    timeout_sec: int | None = Field(default=None, ge=1)
+
+
+class TerminalProposalRejection(TerminalModel):
+    code: str = Field(min_length=1, max_length=128)
+    message: str = Field(min_length=1, max_length=1024)
+    field: str = Field(min_length=1, max_length=128)
+    rejected_value: str | None = Field(default=None, max_length=512)
+    expected: str = Field(min_length=1, max_length=1024)
+    draft: TerminalRejectedDraft
+
+
+class TerminalVerifiedCheckpoint(TerminalModel):
+    action_id: UUID
+    call_key: str = Field(min_length=1, max_length=256)
+    command_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    verification: TerminalVerificationContract
+    committed_at: AwareDatetime
 
 
 class TerminalProcessReference(TerminalModel):
@@ -118,11 +230,13 @@ class TerminalExecutionPolicy(TerminalModel):
     provider_grace_sec: int = Field(default=10, ge=1, le=120)
     max_command_characters: int = Field(default=20_000, ge=1)
     max_output_characters: int = Field(default=64_000, ge=1)
-    max_context_output_characters: int = Field(default=6_000, ge=1)
-    max_context_records: int = Field(default=8, ge=1)
+    max_context_output_characters: int = Field(default=3_000, ge=1)
+    max_context_records: int = Field(default=4, ge=1)
+    max_delivery_context_output_characters: int = Field(default=1_000, ge=1)
+    max_delivery_context_records: int = Field(default=2, ge=1)
     max_environment_variables: int = Field(default=64, ge=0)
     max_environment_value_characters: int = Field(default=4096, ge=1)
-    max_total_tokens: int | None = Field(default=200_000, ge=1)
+    max_total_tokens: int | None = Field(default=600_000, ge=1)
     max_cost_usd: float | None = Field(default=None, ge=0.0)
     max_wall_clock_seconds: float | None = Field(default=None, gt=0.0)
     max_active_execution_seconds: float | None = Field(default=None, gt=0.0)
@@ -130,8 +244,13 @@ class TerminalExecutionPolicy(TerminalModel):
     cleanup_grace_seconds: float = Field(default=10.0, ge=0.0)
     repeated_invocation_limit: int | None = Field(default=3, ge=2)
     max_no_progress_steps: int | None = Field(default=5, ge=1)
-    max_no_progress_seconds: float | None = Field(default=300.0, gt=0.0)
+    max_no_progress_seconds: float | None = Field(default=480.0, gt=0.0)
+    deadline_reserve_seconds: float = Field(default=60.0, ge=0.0)
+    delivery_mode_fraction: float = Field(default=0.40, gt=0.0, lt=1.0)
+    max_consecutive_inspections: int | None = Field(default=3, ge=1, le=16)
+    max_total_inspections: int | None = Field(default=5, ge=1, le=64)
     max_completion_rejections: int = Field(default=2, ge=0, le=10)
+    max_proposal_rejections: int = Field(default=2, ge=0, le=10)
 
     @model_validator(mode="after")
     def validate_timeouts(self) -> TerminalExecutionPolicy:
@@ -151,6 +270,15 @@ class TerminalSessionSnapshot(TerminalModel):
     in_doubt_commands: int = Field(default=0, ge=0)
     completion_rejections: int = Field(default=0, ge=0)
     completion_blocker: str | None = Field(default=None, min_length=1)
+    proposal_rejections: int = Field(default=0, ge=0)
+    proposal_blocker: str | None = Field(default=None, min_length=1)
+    last_proposal_rejection: TerminalProposalRejection | None = None
+    consecutive_inspections: int = Field(default=0, ge=0)
+    inspection_commands: int = Field(default=0, ge=0)
+    failed_verification_attempts: int = Field(default=0, ge=0)
+    verification_corrections: int = Field(default=0, ge=0)
+    started_at: AwareDatetime = Field(default_factory=utc_now)
+    verified_checkpoint: TerminalVerifiedCheckpoint | None = None
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     total_tokens: int = Field(default=0, ge=0)
@@ -165,6 +293,7 @@ class TerminalHistoryItem(TerminalModel):
     cwd: str | None = None
     environment_keys: tuple[str, ...] = ()
     timeout_sec: int = Field(ge=1)
+    verification: TerminalVerificationContract | None = None
     execution_state: TerminalExecutionState
     return_code: int | None = None
     stdout: str = ""
@@ -178,11 +307,23 @@ class TerminalTurnRequest(TerminalModel):
     task_id: UUID
     instruction: str = Field(min_length=1)
     profile: str = AAR_TERMINAL_SEQUENTIAL_PROFILE
+    requirements: tuple[TerminalRequirement, ...] = Field(min_length=1)
     session: TerminalSessionSnapshot
     recent_history: tuple[TerminalHistoryItem, ...] = ()
+    used_call_keys: tuple[str, ...] = ()
+    execution_limits: TerminalExecutionLimits = Field(
+        default_factory=TerminalExecutionLimits
+    )
+    tool_capabilities: TerminalToolCapabilities = Field(
+        default_factory=TerminalToolCapabilities
+    )
     remaining_commands: int = Field(ge=0)
     remaining_tokens: int | None = Field(default=None, ge=0)
     remaining_cost_usd: float | None = Field(default=None, ge=0.0)
+    elapsed_seconds: float = Field(default=0.0, ge=0.0)
+    remaining_wall_clock_seconds: float | None = Field(default=None, ge=0.0)
+    delivery_mode: bool = False
+    recovery_mode: bool = False
     execution_semantics: tuple[str, ...] = Field(min_length=1)
 
 
@@ -197,6 +338,7 @@ class TerminalTurnDraft(TerminalModel):
     env: dict[str, str] | None = None
     timeout_sec: int | None = Field(default=None, ge=1)
     process_reference: TerminalProcessReference | None = None
+    verification: TerminalVerificationContract | None = None
     summary: str | None = Field(default=None, min_length=1)
     rationale: str = Field(
         default="Model-proposed terminal turn.",
@@ -224,6 +366,7 @@ class TerminalTurnDraft(TerminalModel):
                     self.timeout_sec,
                     self.process_reference,
                     self.command_role,
+                    self.verification,
                 )
             ):
                 raise ValueError("complete draft cannot contain execution settings")
@@ -249,6 +392,7 @@ class TerminalCommandIntent(TerminalModel):
     timeout_sec: int = Field(ge=1)
     command_role: TerminalCommandRole = TerminalCommandRole.WORK
     process_reference: TerminalProcessReference | None = None
+    verification: TerminalVerificationContract | None = None
 
     def tool_arguments(self) -> dict[str, Any]:
         return {
@@ -261,6 +405,11 @@ class TerminalCommandIntent(TerminalModel):
             "process_reference": (
                 self.process_reference.model_dump(mode="json")
                 if self.process_reference is not None
+                else None
+            ),
+            "verification": (
+                self.verification.model_dump(mode="json")
+                if self.verification is not None
                 else None
             ),
         }
@@ -303,6 +452,7 @@ class TerminalCommandRecord(TerminalModel):
             cwd=self.intent.cwd,
             environment_keys=tuple(sorted(self.intent.env)),
             timeout_sec=self.intent.timeout_sec,
+            verification=self.intent.verification,
             execution_state=self.result.execution_state,
             return_code=self.result.return_code,
             stdout=bounded(self.result.stdout),
@@ -334,6 +484,12 @@ class TerminalTrialSummary(TerminalModel):
     completed_at: AwareDatetime
 
 
+class TerminalBenchmarkOutcome(StrEnum):
+    BENCHMARK_PASS = "benchmark_pass"
+    BENCHMARK_FAIL = "benchmark_fail"
+    INFRASTRUCTURE_ERROR = "infrastructure_error"
+
+
 class TerminalBenchmarkAnalysis(TerminalModel):
     trial_id: str = Field(min_length=1)
     verifier_rewards: dict[str, float] = Field(default_factory=dict)
@@ -341,6 +497,9 @@ class TerminalBenchmarkAnalysis(TerminalModel):
     benchmark_pass: bool
     agent_complete: bool
     completion_matches_verifier: bool
+    outcome: TerminalBenchmarkOutcome
+    infrastructure_error: bool = False
+    infrastructure_error_reason: str | None = Field(default=None, min_length=1)
     command_count: int = Field(ge=0)
     denial_count: int = Field(ge=0)
     timeout_count: int = Field(ge=0)

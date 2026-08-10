@@ -230,11 +230,35 @@ class AdaptiveRuntimeHarborAgent(BaseAgent):  # type: ignore[misc]
         *args: object,
         application_factory: ApplicationFactory | None = None,
         execution_policy: TerminalExecutionPolicy | None = None,
+        agent_timeout_sec: float | str | None = None,
+        deadline_reserve_seconds: float | str | None = None,
         **kwargs: object,
     ) -> None:
         super().__init__(*args, **kwargs)
         self._application_factory = application_factory or build_terminal_application
-        self._execution_policy = execution_policy or TerminalExecutionPolicy()
+        policy = execution_policy or TerminalExecutionPolicy()
+        timeout = _optional_positive_float(agent_timeout_sec, "agent_timeout_sec")
+        reserve = (
+            policy.deadline_reserve_seconds
+            if deadline_reserve_seconds is None
+            else _nonnegative_float(
+                deadline_reserve_seconds,
+                "deadline_reserve_seconds",
+            )
+        )
+        if reserve != policy.deadline_reserve_seconds:
+            policy = policy.model_copy(
+                update={"deadline_reserve_seconds": reserve}
+            )
+        if timeout is not None and policy.max_wall_clock_seconds is None:
+            if timeout <= reserve:
+                raise ValueError(
+                    "agent_timeout_sec must exceed deadline_reserve_seconds"
+                )
+            policy = policy.model_copy(
+                update={"max_wall_clock_seconds": timeout - reserve}
+            )
+        self._execution_policy = policy
 
     def _get_env(self, key: str, *alternatives: str) -> str | None:
         import os
@@ -312,6 +336,34 @@ class AdaptiveRuntimeHarborAgent(BaseAgent):  # type: ignore[misc]
         metadata["aar"] = summary.model_dump(mode="json")
         metadata["aar"]["verifier_reward_available"] = False
         context.metadata = metadata
+
+
+def _optional_positive_float(value: object, name: str) -> float | None:
+    if value is None:
+        return None
+    result = _finite_float(value, name)
+    if result <= 0:
+        raise ValueError(f"{name} must be positive")
+    return result
+
+
+def _nonnegative_float(value: object, name: str) -> float:
+    result = _finite_float(value, name)
+    if result < 0:
+        raise ValueError(f"{name} must be nonnegative")
+    return result
+
+
+def _finite_float(value: object, name: str) -> float:
+    import math
+
+    try:
+        result = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be numeric") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
 
 
 __all__ = [

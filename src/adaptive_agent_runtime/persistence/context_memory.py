@@ -227,7 +227,11 @@ class SQLiteContextArchive:
         values = unit.model_dump(mode="python")
         values["lifecycle_state"] = ContextLifecycleState.ARCHIVED
         metadata = unit.metadata.model_dump(mode="python")
-        metadata["updated_at"] = utc_now()
+        metadata["updated_at"] = max(
+            utc_now(),
+            unit.metadata.created_at,
+            unit.metadata.updated_at,
+        )
         values["metadata"] = metadata
         archived = ContextUnit.model_validate(values)
         with self._database.transaction() as cursor:
@@ -262,7 +266,11 @@ class SQLiteContextArchive:
         values = unit.model_dump(mode="python")
         values["lifecycle_state"] = ContextLifecycleState.ARCHIVED
         metadata = unit.metadata.model_dump(mode="python")
-        metadata["updated_at"] = utc_now()
+        metadata["updated_at"] = max(
+            utc_now(),
+            unit.metadata.created_at,
+            unit.metadata.updated_at,
+        )
         values["metadata"] = metadata
         archived = ContextUnit.model_validate(values)
         payload = _model_json(archived)

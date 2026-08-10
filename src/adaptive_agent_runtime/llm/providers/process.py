@@ -141,6 +141,11 @@ class SubprocessTransport:
             await _cancel_tasks(tasks)
             await asyncio.gather(communication, return_exceptions=True)
             raise ProcessTransportTimeoutError from exc
+        except asyncio.CancelledError:
+            await _terminate_process_tree(process)
+            await _cancel_tasks(tasks)
+            await asyncio.gather(communication, return_exceptions=True)
+            raise
         except ProcessTransportOutputLimitError:
             await _terminate_process_tree(process)
             await _cancel_tasks(tasks)

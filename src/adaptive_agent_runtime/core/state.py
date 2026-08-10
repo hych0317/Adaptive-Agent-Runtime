@@ -49,7 +49,11 @@ def _evolve(
     values = state.model_dump(mode="python")
     values.update(changes)
     values["revision"] = state.revision + 1
-    values["updated_at"] = at or utc_now()
+    values["updated_at"] = max(
+        at or utc_now(),
+        state.created_at,
+        state.updated_at,
+    )
     return AgentState.model_validate(values)
 
 
