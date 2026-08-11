@@ -18,6 +18,7 @@ from applications.terminal_bench.models import (
     TerminalExecutionPolicy,
     TerminalExecutionState,
     TerminalTrialSummary,
+    TerminalVerifierTimeoutAttribution,
     utc_now,
 )
 from applications.terminal_bench.result_analyzer import TerminalResultAnalyzer
@@ -45,6 +46,34 @@ def summary(*, agent_complete: bool = True) -> TerminalTrialSummary:
         started_at=now,
         completed_at=now,
     )
+
+
+def analyze_verifier_timeout(verifier_text: str):
+    with tempfile.TemporaryDirectory() as directory:
+        trial_dir = Path(directory) / "trial"
+        agent_dir = trial_dir / "agent"
+        verifier_dir = trial_dir / "verifier"
+        agent_dir.mkdir(parents=True)
+        verifier_dir.mkdir(parents=True)
+        summary_path = agent_dir / "aar-summary.json"
+        summary_path.write_text(summary().model_dump_json(), encoding="utf-8")
+        (verifier_dir / "test-stdout.txt").write_text(
+            verifier_text,
+            encoding="utf-8",
+        )
+        return TerminalResultAnalyzer().analyze(
+            harbor_trial_result={
+                "verifier_result": None,
+                "exception_info": {
+                    "exception_type": "VerifierTimeoutError",
+                    "exception_message": (
+                        "Verifier execution timed out after 900.0 seconds"
+                    ),
+                },
+                "agent_result": {},
+            },
+            aar_summary=summary_path,
+        )
 
 
 class _FakeApplication:
@@ -171,6 +200,68 @@ class HarborAndResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(analysis.agent_complete)
         self.assertFalse(analysis.benchmark_pass)
         self.assertFalse(analysis.completion_matches_verifier)
+
+    def test_verifier_dependency_setup_timeout_is_infrastructure(self) -> None:
+        analysis = analyze_verifier_timeout(
+            "Reading package lists...\n"
+            "curl: (7) unable to connect to package host\n"
+        )
+
+        self.assertIs(
+            analysis.verifier_timeout_attribution,
+            TerminalVerifierTimeoutAttribution.INFRASTRUCTURE,
+        )
+        self.assertIs(
+            analysis.outcome,
+            TerminalBenchmarkOutcome.INFRASTRUCTURE_ERROR,
+        )
+        self.assertTrue(analysis.infrastructure_error)
+
+    def test_explicit_submission_timeout_is_task_attributable(self) -> None:
+        analysis = analyze_verifier_timeout(
+            "pytest test session starts\n"
+            "subprocess.TimeoutExpired: Command ['/app/server'] timed out\n"
+        )
+
+        self.assertIs(
+            analysis.verifier_timeout_attribution,
+            TerminalVerifierTimeoutAttribution.TASK_ATTRIBUTABLE,
+        )
+        self.assertIs(
+            analysis.outcome,
+            TerminalBenchmarkOutcome.BENCHMARK_FAIL,
+        )
+        self.assertFalse(analysis.infrastructure_error)
+
+    def test_ambiguous_verifier_timeout_is_inconclusive(self) -> None:
+        analysis = analyze_verifier_timeout("verifier stopped producing output\n")
+
+        self.assertIs(
+            analysis.verifier_timeout_attribution,
+            TerminalVerifierTimeoutAttribution.INCONCLUSIVE,
+        )
+        self.assertIs(
+            analysis.outcome,
+            TerminalBenchmarkOutcome.INCONCLUSIVE,
+        )
+        self.assertFalse(analysis.infrastructure_error)
+        self.assertFalse(analysis.completion_matches_verifier)
+
+    def test_setup_preamble_does_not_override_started_tests(self) -> None:
+        analysis = analyze_verifier_timeout(
+            "Reading package lists...\n"
+            "pytest test session starts\n"
+            "collected 3 items\n"
+        )
+
+        self.assertIs(
+            analysis.verifier_timeout_attribution,
+            TerminalVerifierTimeoutAttribution.INCONCLUSIVE,
+        )
+        self.assertIs(
+            analysis.outcome,
+            TerminalBenchmarkOutcome.INCONCLUSIVE,
+        )
 
     def test_verifier_network_setup_failure_is_infrastructure_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

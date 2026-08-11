@@ -954,16 +954,24 @@ class TerminalTrialSummary(TerminalModel):
     completed_at: AwareDatetime
 
 
+class TerminalVerifierTimeoutAttribution(StrEnum):
+    INFRASTRUCTURE = "infrastructure"
+    TASK_ATTRIBUTABLE = "task_attributable"
+    INCONCLUSIVE = "inconclusive"
+
+
 class TerminalBenchmarkOutcome(StrEnum):
     BENCHMARK_PASS = "benchmark_pass"
     BENCHMARK_FAIL = "benchmark_fail"
     INFRASTRUCTURE_ERROR = "infrastructure_error"
+    INCONCLUSIVE = "inconclusive"
 
 
 class TerminalBenchmarkAnalysis(TerminalModel):
     trial_id: str = Field(min_length=1)
     verifier_rewards: dict[str, float] = Field(default_factory=dict)
     verifier_reward: float | None = None
+    verifier_timeout_attribution: TerminalVerifierTimeoutAttribution | None = None
     benchmark_pass: bool
     agent_complete: bool
     completion_matches_verifier: bool

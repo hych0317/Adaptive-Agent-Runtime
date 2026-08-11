@@ -11,6 +11,7 @@ from applications.terminal_bench.models import (
     TerminalBenchmarkAnalysis,
     TerminalBenchmarkOutcome,
     TerminalTrialSummary,
+    TerminalVerifierTimeoutAttribution,
 )
 
 
@@ -27,11 +28,16 @@ class TerminalResultAnalyzer:
         verifier_text = _load_verifier_text(aar_summary)
         summary = _load_summary(aar_summary)
         verifier = trial.get("verifier_result")
-        if not isinstance(verifier, Mapping):
+        verifier_timed_out = _verifier_timed_out(trial)
+        if not isinstance(verifier, Mapping) and not verifier_timed_out:
             raise ValueError(
                 "Harbor verifier_result is required; analyze only after verification"
             )
-        raw_rewards = verifier.get("rewards")
+        raw_rewards = (
+            verifier.get("rewards")
+            if isinstance(verifier, Mapping)
+            else None
+        )
         if not isinstance(raw_rewards, Mapping):
             rewards: dict[str, float] = {}
         else:
@@ -41,10 +47,17 @@ class TerminalResultAnalyzer:
                 if isinstance(value, (int, float)) and not isinstance(value, bool)
             }
         verifier_reward = _primary_reward(rewards)
+        timeout_attribution = (
+            _verifier_timeout_attribution(verifier_text)
+            if verifier_timed_out
+            and (verifier_reward is None or verifier_reward <= 0.0)
+            else None
+        )
         infrastructure_reason = _infrastructure_error_reason(
             trial,
             verifier_reward,
             verifier_text,
+            timeout_attribution,
         )
         infrastructure_error = infrastructure_reason is not None
         benchmark_pass = (
@@ -55,6 +68,9 @@ class TerminalResultAnalyzer:
         outcome = (
             TerminalBenchmarkOutcome.INFRASTRUCTURE_ERROR
             if infrastructure_error
+            else TerminalBenchmarkOutcome.INCONCLUSIVE
+            if timeout_attribution
+            is TerminalVerifierTimeoutAttribution.INCONCLUSIVE
             else TerminalBenchmarkOutcome.BENCHMARK_PASS
             if benchmark_pass
             else TerminalBenchmarkOutcome.BENCHMARK_FAIL
@@ -74,9 +90,14 @@ class TerminalResultAnalyzer:
             trial_id=summary.trial_id,
             verifier_rewards=rewards,
             verifier_reward=verifier_reward,
+            verifier_timeout_attribution=timeout_attribution,
             benchmark_pass=benchmark_pass,
             agent_complete=summary.agent_complete,
-            completion_matches_verifier=(summary.agent_complete == benchmark_pass),
+            completion_matches_verifier=(
+                timeout_attribution
+                is not TerminalVerifierTimeoutAttribution.INCONCLUSIVE
+                and summary.agent_complete == benchmark_pass
+            ),
             outcome=outcome,
             infrastructure_error=infrastructure_error,
             infrastructure_error_reason=infrastructure_reason,
@@ -140,15 +161,21 @@ def _infrastructure_error_reason(
     trial: Mapping[str, Any],
     verifier_reward: float | None,
     verifier_text: str,
+    timeout_attribution: TerminalVerifierTimeoutAttribution | None,
 ) -> str | None:
     if verifier_reward is not None and verifier_reward > 0.0:
         return None
+    if timeout_attribution is TerminalVerifierTimeoutAttribution.INFRASTRUCTURE:
+        return (
+            "verifier timeout occurred during dependency setup or an "
+            "unavailable network path"
+        )
     exception = trial.get("exception_info")
     if isinstance(exception, Mapping):
         name = str(exception.get("exception_type") or exception.get("type") or "")
         if any(
             marker in name.lower()
-            for marker in ("verifiertimeout", "environment", "docker")
+            for marker in ("environment", "docker")
         ):
             return f"Harbor infrastructure exception: {name or 'unknown'}"
     lowered = verifier_text.lower()
@@ -171,6 +198,76 @@ def _infrastructure_error_reason(
     ):
         return "verifier dependency setup failed because its network path was unavailable"
     return None
+
+
+def _verifier_timed_out(trial: Mapping[str, Any]) -> bool:
+    exception = trial.get("exception_info")
+    if not isinstance(exception, Mapping):
+        return False
+    name = str(exception.get("exception_type") or exception.get("type") or "")
+    return "verifiertimeout" in name.lower()
+
+
+def _verifier_timeout_attribution(
+    verifier_text: str,
+) -> TerminalVerifierTimeoutAttribution:
+    lowered = verifier_text.lower()
+    network_markers = (
+        "unable to connect",
+        "connection refused",
+        "could not resolve",
+        "temporary failure resolving",
+        "proxy error",
+        "connection timed out",
+    )
+    dependency_setup_markers = (
+        "reading package lists",
+        "apt-get install",
+        "installing collected packages",
+        "failed to fetch",
+        "unable to fetch some archives",
+        "curl:",
+    )
+    test_execution_markers = (
+        "test session starts",
+        "collected ",
+        "unittest",
+        "passed",
+        "failed",
+    )
+    package_download_in_progress = (
+        "get:" in lowered
+        and "http" in lowered
+        and any(marker in lowered for marker in ("ubuntu", "pypi"))
+    )
+    dependency_setup_seen = package_download_in_progress or any(
+        marker in lowered for marker in dependency_setup_markers
+    )
+    if (
+        any(marker in lowered for marker in network_markers)
+        and dependency_setup_seen
+    ) or (
+        dependency_setup_seen
+        and not any(marker in lowered for marker in test_execution_markers)
+    ):
+        return TerminalVerifierTimeoutAttribution.INFRASTRUCTURE
+    explicit_task_timeout_markers = (
+        "candidate process timed out",
+        "submission process timed out",
+        "solution process timed out",
+        "timed out waiting for candidate",
+        "timed out waiting for submission",
+        "timed out waiting for solution",
+    )
+    timeout_expired_for_task_path = (
+        "subprocess.timeoutexpired" in lowered
+        and any(marker in lowered for marker in ("/app/", "candidate", "submission"))
+    )
+    if timeout_expired_for_task_path or any(
+        marker in lowered for marker in explicit_task_timeout_markers
+    ):
+        return TerminalVerifierTimeoutAttribution.TASK_ATTRIBUTABLE
+    return TerminalVerifierTimeoutAttribution.INCONCLUSIVE
 
 
 def _primary_reward(rewards: Mapping[str, float]) -> float | None:
