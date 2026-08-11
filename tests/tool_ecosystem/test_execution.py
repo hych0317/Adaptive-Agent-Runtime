@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import cast
+from unittest.mock import patch
 from uuid import uuid4
 
 from pydantic import JsonValue, ValidationError
@@ -156,6 +157,30 @@ def execution_fixture(
 
 
 class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_backward_wall_clock_preserves_causal_timestamps(self) -> None:
+        provider = ScriptedProvider(
+            "primary",
+            [ToolProviderResult.ok(output={"price": 42})],
+        )
+        _, _, executor, invocation = execution_fixture(provider)
+        now = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+
+        with patch(
+            "adaptive_agent_runtime.tool_ecosystem.execution.utc_now",
+            side_effect=(
+                now,
+                now - timedelta(milliseconds=1),
+                now - timedelta(milliseconds=2),
+                now - timedelta(milliseconds=3),
+            ),
+        ):
+            result = await executor.execute(invocation, ToolExecutionPolicy())
+
+        self.assertEqual(result.started_at, now)
+        self.assertEqual(result.completed_at, now)
+        self.assertEqual(result.attempts[0].started_at, now)
+        self.assertEqual(result.attempts[0].completed_at, now)
+
     async def test_successful_execution_generates_observation_and_trace(self) -> None:
         provider = ScriptedProvider(
             "primary",

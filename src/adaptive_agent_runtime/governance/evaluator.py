@@ -324,7 +324,7 @@ class GovernanceAuthorizationIssuer:
             policy_version=decision.policy_version,
             operation=request.operation,
             target=request.target,
-            issued_at=self._clock(),
+            issued_at=max(self._clock(), decision.decided_at),
         )
         return (
             self._authority.seal_authorization(authorization)

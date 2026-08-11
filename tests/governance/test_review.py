@@ -115,6 +115,47 @@ class HumanReviewTests(unittest.TestCase):
         with self.assertRaises(GovernanceInvariantError):
             self.issuer.issue(changed_request, final)
 
+    def test_small_clock_regression_is_clamped_at_causal_boundaries(self) -> None:
+        request = high_risk_request(200)
+        preliminary = self.governor.evaluate(request)
+        assert preliminary.review_request_id is not None
+        pending = self.reviews.get(preliminary.review_request_id)
+        assert pending is not None
+        approved = self.reviews.resolve(
+            pending.review_request_id,
+            HumanReviewDecision(
+                outcome=ReviewOutcome.APPROVE,
+                reviewer_id="reviewer-clock-skew",
+                rationale="Bounded local clock correction.",
+                decided_at=pending.requested_at - timedelta(milliseconds=1),
+            ),
+        )
+        assert approved.decision is not None
+        self.assertEqual(approved.decision.decided_at, pending.requested_at)
+
+        final = self.governor.finalize_review(request, approved)
+        authorization = GovernanceAuthorizationIssuer(
+            clock=lambda: final.decided_at - timedelta(milliseconds=1)
+        ).issue(request, final)
+        self.assertEqual(authorization.issued_at, final.decided_at)
+
+    def test_large_clock_regression_remains_invalid(self) -> None:
+        request = high_risk_request(201)
+        preliminary = self.governor.evaluate(request)
+        assert preliminary.review_request_id is not None
+        pending = self.reviews.get(preliminary.review_request_id)
+        assert pending is not None
+        with self.assertRaises(GovernanceInvariantError):
+            self.reviews.resolve(
+                pending.review_request_id,
+                HumanReviewDecision(
+                    outcome=ReviewOutcome.APPROVE,
+                    reviewer_id="reviewer-stale",
+                    rationale="Timestamp is too old.",
+                    decided_at=pending.requested_at - timedelta(seconds=2),
+                ),
+            )
+
     def test_rejected_review_cannot_issue_authorization(self) -> None:
         request = high_risk_request(21)
         preliminary = self.governor.evaluate(request)

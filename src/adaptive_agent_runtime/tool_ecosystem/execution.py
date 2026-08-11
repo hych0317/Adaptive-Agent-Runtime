@@ -44,6 +44,10 @@ from adaptive_agent_runtime.governance.models import (
 )
 
 
+def _causal_now(*not_before: datetime) -> datetime:
+    return max(utc_now(), *not_before)
+
+
 class InMemoryToolTraceSink:
     module_id = "tool.trace.in_memory"
 
@@ -151,7 +155,10 @@ class ManagedToolExecutor:
                     attempts=tuple(attempts),
                 )
             attempt_number = len(attempts) + 1
-            attempt_started = utc_now()
+            attempt_started = _causal_now(
+                started_at,
+                *(attempt.completed_at for attempt in attempts[-1:]),
+            )
             await self._trace(
                 invocation,
                 ToolTraceEventKind.ATTEMPT_STARTED,
@@ -217,7 +224,7 @@ class ManagedToolExecutor:
                     attempt_number=attempt_number,
                     status=ToolAttemptStatus.SUCCEEDED,
                     started_at=started_at,
-                    completed_at=utc_now(),
+                    completed_at=_causal_now(started_at),
                     output=result.output,
                 )
             return ToolAttempt(
@@ -228,7 +235,7 @@ class ManagedToolExecutor:
                     else ToolAttemptStatus.FAILED
                 ),
                 started_at=started_at,
-                completed_at=utc_now(),
+                completed_at=_causal_now(started_at),
                 output=result.output,
                 error=result.error,
                 retryable=result.retryable,
@@ -238,7 +245,7 @@ class ManagedToolExecutor:
                 attempt_number=attempt_number,
                 status=ToolAttemptStatus.TIMED_OUT,
                 started_at=started_at,
-                completed_at=utc_now(),
+                completed_at=_causal_now(started_at),
                 error=(
                     f"provider timed out after {policy.timeout_seconds:g} seconds"
                 ),
@@ -250,7 +257,7 @@ class ManagedToolExecutor:
                 attempt_number=attempt_number,
                 status=ToolAttemptStatus.FAILED,
                 started_at=started_at,
-                completed_at=utc_now(),
+                completed_at=_causal_now(started_at),
                 error=f"{exc.__class__.__name__}: {detail}",
                 retryable=True,
             )
@@ -299,7 +306,10 @@ class ManagedToolExecutor:
                     else RetryStatus.FAILED_AFTER_RETRY
                 )
             )
-        completed_at = utc_now()
+        completed_at = _causal_now(
+            started_at,
+            *(attempt.completed_at for attempt in attempts[-1:]),
+        )
         observation = ToolObservation(
             invocation_id=invocation.invocation_id,
             requirement_id=invocation.requirement_id,

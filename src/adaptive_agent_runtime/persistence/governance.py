@@ -26,6 +26,7 @@ from adaptive_agent_runtime.governance.models import (
     stable_governance_id,
     utc_now,
 )
+from adaptive_agent_runtime.governance.review import normalize_review_decision_time
 from adaptive_agent_runtime.persistence.sqlite import SQLiteDatabase
 
 
@@ -137,15 +138,12 @@ class SQLiteHumanReviewService:
                     f"review request '{review_request_id}' does not exist"
                 )
             current = ReviewRequest.model_validate_json(row["snapshot_json"])
+            decision = normalize_review_decision_time(current, decision)
             if current.status is not ReviewStatus.PENDING:
                 if current.decision == decision:
                     return current
                 raise InvalidReviewTransitionError(
                     f"review request '{review_request_id}' is already resolved"
-                )
-            if decision.decided_at < current.requested_at:
-                raise GovernanceInvariantError(
-                    "human decision cannot precede the review request"
                 )
             status = (
                 ReviewStatus.APPROVED

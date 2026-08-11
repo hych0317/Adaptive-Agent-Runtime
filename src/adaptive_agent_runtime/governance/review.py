@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from uuid import UUID
 
 from adaptive_agent_runtime.governance.errors import (
@@ -21,6 +21,23 @@ from adaptive_agent_runtime.governance.models import (
     stable_governance_id,
     utc_now,
 )
+
+_MAX_REVIEW_CLOCK_SKEW = timedelta(seconds=1)
+
+
+def normalize_review_decision_time(
+    current: ReviewRequest,
+    decision: HumanReviewDecision,
+) -> HumanReviewDecision:
+    """Clamp small local clock regressions while rejecting stale decisions."""
+
+    if decision.decided_at >= current.requested_at:
+        return decision
+    if current.requested_at - decision.decided_at > _MAX_REVIEW_CLOCK_SKEW:
+        raise GovernanceInvariantError(
+            "human decision cannot precede the review request"
+        )
+    return decision.model_copy(update={"decided_at": current.requested_at})
 
 
 class InMemoryHumanReviewService:
@@ -95,15 +112,12 @@ class InMemoryHumanReviewService:
             raise ReviewNotFoundError(
                 f"review request '{review_request_id}' does not exist"
             )
+        decision = normalize_review_decision_time(current, decision)
         if current.status is not ReviewStatus.PENDING:
             if current.decision == decision:
                 return current
             raise InvalidReviewTransitionError(
                 f"review request '{review_request_id}' is already resolved"
-            )
-        if decision.decided_at < current.requested_at:
-            raise GovernanceInvariantError(
-                "human decision cannot precede the review request"
             )
         status = (
             ReviewStatus.APPROVED
