@@ -20,6 +20,8 @@ from applications.terminal_bench.models import (
     TerminalCommandRecord,
     TerminalCommandRole,
     TerminalExecutionPolicy,
+    TerminalEvidenceAssurance,
+    TerminalEvidenceProvenance,
     TerminalExecutionState,
     TerminalRequirementKind,
     TerminalRequirementState,
@@ -202,7 +204,10 @@ class TerminalTaskLedgerIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(ledger.generation, 1)
                 self.assertEqual(
                     tuple(item.state for item in ledger.entries),
-                    (TerminalRequirementState.VERIFIED,),
+                    (TerminalRequirementState.SATISFIED,),
+                )
+                self.assertIs(
+                    ledger.entries[0].assurance, TerminalEvidenceAssurance.TRUSTED
                 )
                 self.assertEqual(
                     ledger.entries[0].latest_evidence_action_id,
@@ -420,7 +425,7 @@ class TerminalTaskLedgerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(advanced.task_ledger.generation, 0)
         self.assertIs(
             advanced.task_ledger.entries[0].state,
-            TerminalRequirementState.VERIFIED,
+            TerminalRequirementState.SATISFIED,
         )
         self.assertEqual(advanced.task_ledger.entries[0].evidence_generation, 0)
 
@@ -545,7 +550,9 @@ class TerminalTaskLedgerIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 "entries": tuple(
                     entry.model_copy(
                         update={
-                            "state": TerminalRequirementState.VERIFIED,
+                            "state": TerminalRequirementState.SATISFIED,
+                            "assurance": TerminalEvidenceAssurance.TRUSTED,
+                            "evidence_provenance": TerminalEvidenceProvenance.TASK_PROVIDED,
                             "latest_evidence_action_id": evidence_action_id,
                             "latest_result_fingerprint": "1" * 64,
                             "evidence_generation": 0,

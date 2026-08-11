@@ -48,6 +48,9 @@ from applications.terminal_bench.models import (
     TERMINAL_COMPLETION_REJECTION_ACTION,
     TERMINAL_PROPOSAL_REJECTION_ACTION,
     TerminalCommandRole,
+    TerminalCompletionDisposition,
+    TerminalEvidenceAssurance,
+    TerminalEvidenceProvenance,
     TerminalCommandIntent,
     TerminalCommandRecord,
     TerminalExecResult,
@@ -57,12 +60,15 @@ from applications.terminal_bench.models import (
     TerminalPendingCommand,
     TerminalProposalRejection,
     TerminalProcessReference,
+    TerminalReconciliationReceipt,
     TerminalRequirement,
     TerminalRequirementKind,
     TerminalRequirementLedgerEntry,
     TerminalRequirementState,
     TerminalRejectedDraft,
     TerminalSessionSnapshot,
+    TerminalReconciliationState,
+    TerminalLedgerProjectionEntry,
     TerminalTaskContract,
     TerminalTaskLedger,
     TerminalTrialSummary,
@@ -132,6 +138,70 @@ def _current_generation_has_successful_work(
     return bool(
         session.successful_work_generation is not None
         and session.successful_work_generation == session.task_generation
+    )
+
+
+def _verification_assurance(
+    verification: object,
+) -> TerminalEvidenceAssurance:
+    """Classify declared evidence conservatively; execution success is separate."""
+
+    from applications.terminal_bench.models import TerminalVerificationContract
+
+    if not isinstance(verification, TerminalVerificationContract):
+        return TerminalEvidenceAssurance.NONE
+    provenance = verification.evidence_provenance
+    if (
+        provenance is TerminalEvidenceProvenance.TASK_PROVIDED
+        and verification.evidence_kind.value == "official_tests"
+    ):
+        return TerminalEvidenceAssurance.TRUSTED
+    if (
+        provenance is TerminalEvidenceProvenance.EXTERNAL_STANDARD
+        and verification.evidence_kind.value == "independent_check"
+    ):
+        return TerminalEvidenceAssurance.TRUSTED
+    return TerminalEvidenceAssurance.SELF_CHECKED
+
+
+def _current_generation_is_verifiable(
+    session: TerminalSessionSnapshot,
+) -> bool:
+    if _current_generation_has_successful_work(session):
+        return True
+    receipt = session.latest_reconciliation_receipt
+    return bool(
+        session.reconciliation_state
+        is TerminalReconciliationState.STABLE_UNVERIFIED
+        and receipt is not None
+        and receipt.task_generation == session.task_generation
+    )
+
+
+def _ledger_projection(
+    session: TerminalSessionSnapshot,
+) -> tuple[TerminalLedgerProjectionEntry, ...]:
+    ledger = session.task_ledger
+    if ledger is None:
+        return ()
+    latest_action = (
+        session.latest_verification_receipt.action_id
+        if session.latest_verification_receipt is not None
+        else None
+    )
+    return tuple(
+        TerminalLedgerProjectionEntry(
+            requirement_id=entry.requirement_id,
+            state=entry.state,
+            assurance=entry.assurance,
+            evidence_provenance=entry.evidence_provenance,
+            result_fingerprint=entry.latest_result_fingerprint,
+            changed_in_generation=entry.evidence_generation,
+        )
+        for entry in ledger.entries
+        if entry.state is not TerminalRequirementState.SATISFIED
+        or entry.assurance is not TerminalEvidenceAssurance.TRUSTED
+        or entry.latest_evidence_action_id == latest_action
     )
 
 
@@ -272,6 +342,8 @@ class JsonlTerminalTrialJournal:
                 and set(verification.requirement_coverage) == required_ids
                 and result.succeeded
                 and successful_work_generation == generation
+                and _verification_assurance(verification)
+                is TerminalEvidenceAssurance.TRUSTED
             )
             if migratable:
                 assert record is not None
@@ -290,6 +362,11 @@ class JsonlTerminalTrialJournal:
                     covered_requirement_ids=(
                         verification.requirement_coverage
                     ),
+                    evidence_provenance=(
+                        verification.evidence_provenance
+                    ),
+                    assurance=TerminalEvidenceAssurance.TRUSTED,
+                    artifact_fingerprints=verification.artifact_fingerprints,
                     execution_state=result.execution_state,
                     return_code=result.return_code,
                     timed_out=result.timed_out,
@@ -302,7 +379,14 @@ class JsonlTerminalTrialJournal:
                         "entries": tuple(
                             entry.model_copy(
                                 update={
-                                    "state": TerminalRequirementState.VERIFIED,
+                                    "state": TerminalRequirementState.SATISFIED,
+                                    "assurance": TerminalEvidenceAssurance.TRUSTED,
+                                    "evidence_provenance": (
+                                        verification.evidence_provenance
+                                    ),
+                                    "artifact_fingerprints": (
+                                        verification.artifact_fingerprints
+                                    ),
                                     "latest_evidence_action_id": record.action_id,
                                     "latest_result_fingerprint": result_fingerprint,
                                     "evidence_generation": generation,
@@ -491,7 +575,7 @@ class JsonlTerminalTrialJournal:
         record = self._records[-1]
         if record.intent.command_role is not TerminalCommandRole.VERIFY:
             return "the last committed command is not marked verify"
-        if not _current_generation_has_successful_work(self._session):
+        if not _current_generation_is_verifiable(self._session):
             return (
                 "the verification command has no valid successful work in "
                 "the current task generation"
@@ -529,6 +613,8 @@ class JsonlTerminalTrialJournal:
                 return "the verification receipt belongs to a different task contract"
             if receipt.task_generation != self._session.task_generation:
                 return "the verification receipt belongs to a stale task generation"
+            if receipt.assurance is not TerminalEvidenceAssurance.TRUSTED:
+                return "the verification receipt is not trusted independent evidence"
             if receipt.verification_contract_fingerprint != terminal_fingerprint(
                 record.intent.verification
             ):
@@ -539,7 +625,10 @@ class JsonlTerminalTrialJournal:
             if set(receipt.covered_requirement_ids) != required_ids:
                 return "the verification receipt does not cover the task contract"
             if any(
-                item.state is not TerminalRequirementState.VERIFIED
+                item.state is not TerminalRequirementState.SATISFIED
+                or item.assurance is not TerminalEvidenceAssurance.TRUSTED
+                or item.evidence_provenance is not receipt.evidence_provenance
+                or item.artifact_fingerprints != receipt.artifact_fingerprints
                 or item.latest_evidence_action_id != receipt.action_id
                 or item.latest_result_fingerprint != receipt.result_fingerprint
                 or item.evidence_generation != self._session.task_generation
@@ -547,6 +636,61 @@ class JsonlTerminalTrialJournal:
             ):
                 return "the task requirement ledger is not verified by the receipt"
         return None
+
+    def submission_gate_error(self) -> str | None:
+        """Return None only for a successful but non-trusted final verification."""
+
+        if not self._records:
+            return "no committed verification command exists"
+        record = self._records[-1]
+        if record.intent.command_role is not TerminalCommandRole.VERIFY:
+            return "the last committed command is not marked verify"
+        if not _current_generation_is_verifiable(self._session):
+            return "submission has no stable current-generation task state"
+        if not record.result.succeeded or record.intent.verification is None:
+            return "the latest verification did not pass"
+        receipt = self._session.latest_verification_receipt
+        ledger = self._session.task_ledger
+        if receipt is None or ledger is None:
+            return "submission has no verification receipt and requirement ledger"
+        if receipt.action_id != record.action_id or not receipt.passed:
+            return "submission receipt does not match the latest verification"
+        if receipt.assurance is TerminalEvidenceAssurance.TRUSTED:
+            return "trusted verification must use the success lock"
+        required_ids = {item.requirement_id for item in ledger.entries}
+        if set(receipt.covered_requirement_ids) != required_ids:
+            return "submission receipt does not cover the task contract"
+        if any(
+            item.state is not TerminalRequirementState.SATISFIED
+            or item.assurance is not TerminalEvidenceAssurance.SELF_CHECKED
+            or item.evidence_provenance is not receipt.evidence_provenance
+            or item.artifact_fingerprints != receipt.artifact_fingerprints
+            or item.latest_evidence_action_id != receipt.action_id
+            or item.evidence_generation != self._session.task_generation
+            for item in ledger.entries
+        ):
+            return "submission ledger is not self-checked by the latest receipt"
+        return None
+
+    def mark_submitted_unverified(self, summary: str) -> None:
+        gate_error = self.submission_gate_error()
+        if gate_error is not None:
+            raise RuntimeError(f"terminal submission rejected: {gate_error}")
+        self._agent_summary = summary
+        self._session = self._session.model_copy(
+            update={
+                "completion_disposition": (
+                    TerminalCompletionDisposition.SUBMITTED_UNVERIFIED
+                )
+            }
+        )
+        self._append(
+            "agent.submitted_unverified",
+            {
+                "summary": summary,
+                "session": self._session.model_dump(mode="json"),
+            },
+        )
 
     def record_completion_rejection(self, reason: str) -> None:
         if not reason:
@@ -584,12 +728,43 @@ class JsonlTerminalTrialJournal:
             },
         )
 
+    def record_reconciliation_proposal_rejection(
+        self,
+        rejection: TerminalProposalRejection,
+    ) -> None:
+        self._session = self._session.model_copy(
+            update={
+                "reconciliation_proposal_rejections": (
+                    self._session.reconciliation_proposal_rejections + 1
+                ),
+                "reconciliation_blocker": rejection.message,
+                "last_reconciliation_proposal_rejection": rejection,
+            }
+        )
+        self._append(
+            "agent.reconciliation_proposal_rejected",
+            {
+                "rejection": rejection.model_dump(mode="json"),
+                "session": self._session.model_dump(mode="json"),
+            },
+        )
+
     def mark_complete(self, summary: str) -> None:
         gate_error = self.completion_gate_error()
         if gate_error is not None:
             raise RuntimeError(f"terminal completion rejected: {gate_error}")
         self._agent_summary = summary
-        self._append("agent.completed", {"summary": summary})
+        self._session = self._session.model_copy(
+            update={
+                "completion_disposition": (
+                    TerminalCompletionDisposition.SUCCESS_LOCKED
+                )
+            }
+        )
+        self._append(
+            "agent.completed",
+            {"summary": summary, "session": self._session.model_dump(mode="json")},
+        )
 
     def write_summary(self, summary: TerminalTrialSummary) -> None:
         if self._path is None:
@@ -643,6 +818,9 @@ class JsonlTerminalTrialJournal:
                             entry.model_copy(
                                 update={
                                     "state": TerminalRequirementState.UNKNOWN,
+                                    "assurance": TerminalEvidenceAssurance.NONE,
+                                    "evidence_provenance": TerminalEvidenceProvenance.LEGACY_UNSPECIFIED,
+                                    "artifact_fingerprints": (),
                                     "latest_evidence_action_id": None,
                                     "latest_result_fingerprint": None,
                                     "evidence_generation": None,
@@ -688,18 +866,41 @@ class JsonlTerminalTrialJournal:
                 timed_out=result.timed_out,
                 transport_failed=result.transport_failed,
                 passed=passed,
+                evidence_provenance=(
+                    record.intent.verification.evidence_provenance
+                ),
+                assurance=_verification_assurance(
+                    record.intent.verification
+                ),
+                artifact_fingerprints=(
+                    record.intent.verification.artifact_fingerprints
+                ),
                 observed_at=record.committed_at,
             )
             covered = set(covered_ids)
+            assurance = verification_receipt.assurance
+            provenance = verification_receipt.evidence_provenance
+            artifact_fingerprints = verification_receipt.artifact_fingerprints
             task_ledger = task_ledger.model_copy(
                 update={
                     "entries": tuple(
                         entry.model_copy(
                             update={
                                 "state": (
-                                    TerminalRequirementState.VERIFIED
+                                    TerminalRequirementState.SATISFIED
                                     if passed
                                     else TerminalRequirementState.UNKNOWN
+                                ),
+                                "assurance": (
+                                    assurance if passed else TerminalEvidenceAssurance.NONE
+                                ),
+                                "evidence_provenance": (
+                                    provenance
+                                    if passed
+                                    else TerminalEvidenceProvenance.LEGACY_UNSPECIFIED
+                                ),
+                                "artifact_fingerprints": (
+                                    artifact_fingerprints if passed else ()
                                 ),
                                 "latest_evidence_action_id": (
                                     record.action_id if passed else None
@@ -729,6 +930,8 @@ class JsonlTerminalTrialJournal:
             result.succeeded
             and record.intent.command_role is TerminalCommandRole.VERIFY
             and record.intent.verification is not None
+            and _verification_assurance(record.intent.verification)
+            is TerminalEvidenceAssurance.TRUSTED
         ):
             verified_checkpoint = TerminalVerifiedCheckpoint(
                 action_id=record.action_id,
@@ -766,15 +969,37 @@ class JsonlTerminalTrialJournal:
         inspection_commands = session.inspection_commands + int(
             record.intent.command_role is TerminalCommandRole.INSPECT
         )
+        reconciliation_state = session.reconciliation_state
+        reconciliation_receipt = session.latest_reconciliation_receipt
+        if work_changed_state:
+            reconciliation_state = TerminalReconciliationState.NOT_REQUIRED
+            reconciliation_receipt = None
         reconciliation_required = session.in_doubt_reconciliation_required
         if result.execution_state is TerminalExecutionState.IN_DOUBT:
+            reconciliation_rejections = (
+                session.reconciliation_proposal_rejections
+                if reconciliation_required
+                else 0
+            )
             reconciliation_required = True
+            reconciliation_state = TerminalReconciliationState.REQUIRED
+            reconciliation_receipt = None
         elif (
             reconciliation_required
             and record.intent.command_role is TerminalCommandRole.INSPECT
             and result.succeeded
         ):
             reconciliation_required = False
+            reconciliation_state = TerminalReconciliationState.STABLE_UNVERIFIED
+            reconciliation_receipt = TerminalReconciliationReceipt(
+                action_id=record.action_id,
+                task_generation=task_generation,
+                result_fingerprint=terminal_fingerprint(result),
+                observed_at=record.committed_at,
+            )
+            reconciliation_rejections = session.reconciliation_proposal_rejections
+        else:
+            reconciliation_rejections = session.reconciliation_proposal_rejections
         failure_signatures = session.latest_failure_signatures
         if not result.succeeded:
             failure_signatures = terminal_failure_signatures(result)
@@ -786,6 +1011,13 @@ class JsonlTerminalTrialJournal:
             "in_doubt_commands": session.in_doubt_commands
             + int(result.execution_state is TerminalExecutionState.IN_DOUBT),
             "in_doubt_reconciliation_required": reconciliation_required,
+            "reconciliation_state": reconciliation_state,
+            "latest_reconciliation_receipt": reconciliation_receipt,
+            "reconciliation_blocker": None,
+            "last_reconciliation_proposal_rejection": None,
+            "reconciliation_proposal_rejections": (
+                reconciliation_rejections
+            ),
             "process_references": tuple(references),
             "completion_blocker": None,
             "proposal_blocker": None,
@@ -901,8 +1133,19 @@ class JsonlTerminalTrialJournal:
             self._session = TerminalSessionSnapshot.model_validate(payload["session"])
         elif kind == "agent.proposal_rejected":
             self._session = TerminalSessionSnapshot.model_validate(payload["session"])
+        elif kind == "agent.reconciliation_proposal_rejected":
+            self._session = TerminalSessionSnapshot.model_validate(payload["session"])
         elif kind == "agent.completed":
             self._agent_summary = str(payload["summary"])
+            if "session" in payload:
+                self._session = TerminalSessionSnapshot.model_validate(
+                    payload["session"]
+                )
+        elif kind == "agent.submitted_unverified":
+            self._agent_summary = str(payload["summary"])
+            self._session = TerminalSessionSnapshot.model_validate(
+                payload["session"]
+            )
         elif kind == "trace.inconsistent":
             self._trace_consistent = False
             self._trace_error = str(payload["reason"])
@@ -1035,6 +1278,9 @@ class GatewayTerminalTurnProposalCapability:
                     "otherwise issue the single most consequential artifact-producing "
                     "or repair command. Keep that command focused enough to preserve "
                     "time for one final verification. Treat "
+                    "payload.behavior_hints as conditional tactics derived only from "
+                    "the task contract; apply relevant hints without inventing a "
+                    "task-specific answer. "
                     "payload.remaining_wall_clock_seconds as a hard budget. "
                     "If payload.finalization_mode is true, stop broad exploration. If "
                     "payload.verification_due is true, verify now. Otherwise perform at "
@@ -1140,13 +1386,21 @@ class GatewayTerminalTurnProposalCapability:
                     "For inspect or work, set verification to null. For verify, provide a "
                     "verification object naming official tests or an independently "
                     "derived check, its evidence sources, affected artifact paths, "
+                    "evidence_provenance, optional path=sha256 artifact fingerprints, "
+                    "and every stable requirement ID. Use task_provided only for tests "
+                    "or evidence that existed independently of your solution; use "
+                    "external_standard only for a genuinely external oracle. Runtime "
+                    "observations and agent-generated tests are self-checks and cannot "
+                    "claim SUCCESS_LOCKED. "
                     "every stable requirement_id from payload.requirements in "
                     "requirement_coverage, and validation methods. Coverage must "
                     "contain IDs only; descriptions authored by you are rejected. "
                     "Requirement kind is a conservative Runtime classification "
                     "from explicit task headings; unclassified requirements remain "
-                    "mandatory. The session task_ledger is shadow evidence, not "
-                    "authority to skip work or verification. "
+                    "mandatory. payload.ledger_projection is shadow evidence, not "
+                    "authority to skip work or verification; it contains only unmet "
+                    "or newly changed requirement evidence while the full audit trail "
+                    "remains in the Journal. "
                     "Use state_policy=read_only. An independent check must cover "
                     "artifact existence, format, semantic correctness, and the "
                     "end-to-end consumer workflow. After a failed verification, "
@@ -1166,7 +1420,7 @@ class GatewayTerminalTurnProposalCapability:
                     "null, and also set verification to null. Never return rationale; the Runtime supplies its local "
                     "audit reason."
                 ),
-                "payload": request.model_dump(mode="json"),
+                "payload": _terminal_model_payload(request),
             },
             response_schema=_terminal_turn_response_schema(
                 strict=self._strict_json_schema,
@@ -1548,6 +1802,58 @@ def _requires_performance_protocol(
     )
 
 
+def _terminal_behavior_hints(
+    requirements: tuple[TerminalRequirement, ...],
+) -> tuple[str, ...]:
+    """Return generic tactics only when the task contract makes them relevant."""
+
+    text = " ".join(item.description for item in requirements).lower()
+    hints: list[str] = []
+    if any(marker in text for marker in ("parse", "parser", "syntax", "line")):
+        hints.append(
+            "For parser failures, isolate the first failing line and make the "
+            "smallest local repair before rerunning the bounded parser check."
+        )
+    if any(
+        marker in text
+        for marker in (
+            "exact output",
+            "byte-for-byte",
+            "exactly",
+            "expected output",
+            "format",
+        )
+    ):
+        hints.append(
+            "For exact-output requirements, compare expected and actual bytes with "
+            "a bounded diff; existence and parseability alone are insufficient."
+        )
+    if any(
+        marker in text
+        for marker in ("allowed labels", "label set", "valid tags", "enum", "one of")
+    ):
+        hints.append(
+            "Validate every produced label or tag against the complete allowed set "
+            "and report unexpected and missing members separately."
+        )
+    if _requires_performance_protocol(requirements):
+        hints.append(
+            "Profile the representative slow path first, optimize the measured "
+            "bottleneck, then benchmark cold unseen inputs with a safety margin."
+        )
+    return tuple(hints)
+
+
+def _terminal_model_payload(request: TerminalTurnRequest) -> dict[str, object]:
+    """Project durable state into a bounded model context without losing audit data."""
+
+    payload = request.model_dump(mode="json")
+    session = payload.get("session")
+    if isinstance(session, dict):
+        session.pop("task_ledger", None)
+    return payload
+
+
 def _sanitized_rejected_draft(draft: TerminalTurnDraft) -> TerminalRejectedDraft:
     command = draft.command
     return TerminalRejectedDraft(
@@ -1700,6 +2006,9 @@ class TerminalSequentialPlanner:
                     output={
                         "profile": AAR_TERMINAL_SEQUENTIAL_PROFILE,
                         "agent_complete": True,
+                        "completion_disposition": (
+                            TerminalCompletionDisposition.SUCCESS_LOCKED.value
+                        ),
                         "summary": summary,
                     },
                     reason=(
@@ -1713,6 +2022,26 @@ class TerminalSequentialPlanner:
             )
             return PlanDecision.fail(
                 error="terminal trace is inconsistent: " + gate_error
+            )
+        if (
+            session.latest_verification_receipt is not None
+            and self._journal.submission_gate_error() is None
+        ):
+            summary = (
+                "The final self-check passed without a trusted independent "
+                "oracle; artifacts were submitted for Harbor verification."
+            )
+            self._journal.mark_submitted_unverified(summary)
+            return PlanDecision.complete(
+                output={
+                    "profile": AAR_TERMINAL_SEQUENTIAL_PROFILE,
+                    "agent_complete": False,
+                    "completion_disposition": (
+                        TerminalCompletionDisposition.SUBMITTED_UNVERIFIED.value
+                    ),
+                    "summary": summary,
+                },
+                reason="Submit self-checked artifacts without claiming success.",
             )
         budget_error = self._budget_error(session, allow_command_limit=False)
         if budget_error is not None:
@@ -1787,6 +2116,7 @@ class TerminalSequentialPlanner:
                 session=session,
                 draft=draft,
                 validation=validation,
+                reconciliation_mode=True,
             )
         if draft.decision is TerminalTurnDecision.COMPLETE:
             assert draft.summary is not None
@@ -1797,6 +2127,9 @@ class TerminalSequentialPlanner:
                     output={
                         "profile": AAR_TERMINAL_SEQUENTIAL_PROFILE,
                         "agent_complete": True,
+                        "completion_disposition": (
+                            TerminalCompletionDisposition.SUCCESS_LOCKED.value
+                        ),
                         "summary": draft.summary,
                     },
                     reason=draft.rationale,
@@ -1882,6 +2215,7 @@ class TerminalSequentialPlanner:
                 session=session,
                 draft=draft,
                 validation=validation,
+                reconciliation_mode=request.reconciliation_mode,
             )
         action_id = uuid5(
             _TERMINAL_ACTION_NAMESPACE,
@@ -1935,8 +2269,19 @@ class TerminalSequentialPlanner:
         session: TerminalSessionSnapshot,
         draft: TerminalTurnDraft,
         validation: _TerminalProposalValidationError,
+        reconciliation_mode: bool = False,
     ) -> PlanDecision:
-        if session.proposal_rejections >= self._policy.max_proposal_rejections:
+        rejection_count = (
+            session.reconciliation_proposal_rejections
+            if reconciliation_mode
+            else session.proposal_rejections
+        )
+        rejection_limit = (
+            self._policy.max_reconciliation_proposal_rejections
+            if reconciliation_mode
+            else self._policy.max_proposal_rejections
+        )
+        if rejection_count >= rejection_limit:
             return PlanDecision.fail(
                 error=f"invalid terminal proposal: {validation.message}",
                 reason="Agent exhausted bounded proposal correction attempts.",
@@ -1949,8 +2294,16 @@ class TerminalSequentialPlanner:
             expected=validation.expected,
             draft=_sanitized_rejected_draft(draft),
         )
-        self._journal.record_proposal_rejection(rejection)
+        if reconciliation_mode:
+            self._journal.record_reconciliation_proposal_rejection(rejection)
+        else:
+            self._journal.record_proposal_rejection(rejection)
         updated_session = self._journal.snapshot()
+        updated_count = (
+            updated_session.reconciliation_proposal_rejections
+            if reconciliation_mode
+            else updated_session.proposal_rejections
+        )
         action = ActionRequest(
             action_id=uuid5(
                 _TERMINAL_ACTION_NAMESPACE,
@@ -1959,7 +2312,7 @@ class TerminalSequentialPlanner:
                         str(state.run_id),
                         str(state.revision),
                         "proposal-rejected",
-                        str(updated_session.proposal_rejections),
+                        str(updated_count),
                         rejection.code,
                     )
                 ),
@@ -1967,7 +2320,8 @@ class TerminalSequentialPlanner:
             name=TERMINAL_PROPOSAL_REJECTION_ACTION,
             arguments={
                 "rejection": rejection.model_dump(mode="json"),
-                "proposal_rejections": updated_session.proposal_rejections,
+                "proposal_rejections": updated_count,
+                "reconciliation": reconciliation_mode,
             },
             repeat_detection_exempt=True,
         )
@@ -2005,6 +2359,7 @@ class TerminalSequentialPlanner:
         )
         all_records = self._journal.recent_records(self._policy.max_commands)
         has_successful_work = _current_generation_has_successful_work(session)
+        has_verifiable_state = _current_generation_is_verifiable(session)
         finalization_mode = bool(
             remaining_wall_clock_seconds is not None
             and remaining_wall_clock_seconds
@@ -2062,10 +2417,12 @@ class TerminalSequentialPlanner:
             and session.repair_applied_action_id is None
         )
         verification_due = bool(
-            has_successful_work
+            has_verifiable_state
             and not reconciliation_mode
             and (
-                session.repair_applied_action_id is not None
+                session.reconciliation_state
+                is TerminalReconciliationState.STABLE_UNVERIFIED
+                or session.repair_applied_action_id is not None
                 or (
                     finalization_mode
                     and session.pending_repair_receipt_id is None
@@ -2133,6 +2490,8 @@ class TerminalSequentialPlanner:
             instruction=state.task.description,
             requirements=requirements,
             session=session,
+            ledger_projection=_ledger_projection(session),
+            behavior_hints=_terminal_behavior_hints(requirements),
             recent_history=history,
             used_call_keys=used_call_keys,
             execution_limits=TerminalExecutionLimits(
@@ -2638,7 +2997,7 @@ class TerminalSequentialPlanner:
             )
         if (
             intent.command_role is TerminalCommandRole.VERIFY
-            and not _current_generation_has_successful_work(session)
+            and not _current_generation_is_verifiable(session)
         ):
             raise _TerminalProposalValidationError(
                 code="terminal.verification.no_current_generation_work",

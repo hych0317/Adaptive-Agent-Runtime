@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
@@ -74,6 +75,36 @@ class TerminalVerificationEvidence(StrEnum):
     INDEPENDENT_CHECK = "independent_check"
 
 
+class TerminalEvidenceProvenance(StrEnum):
+    """Where verification evidence originated, independent of its result."""
+
+    TASK_PROVIDED = "task_provided"
+    EXTERNAL_STANDARD = "external_standard"
+    RUNTIME_OBSERVED = "runtime_observed"
+    AGENT_GENERATED = "agent_generated"
+    LEGACY_UNSPECIFIED = "legacy_unspecified"
+
+
+class TerminalEvidenceAssurance(StrEnum):
+    """Runtime assurance attached to a requirement outcome."""
+
+    NONE = "none"
+    SELF_CHECKED = "self_checked"
+    TRUSTED = "trusted"
+
+
+class TerminalCompletionDisposition(StrEnum):
+    IN_PROGRESS = "in_progress"
+    SUCCESS_LOCKED = "success_locked"
+    SUBMITTED_UNVERIFIED = "submitted_unverified"
+
+
+class TerminalReconciliationState(StrEnum):
+    NOT_REQUIRED = "not_required"
+    REQUIRED = "required"
+    STABLE_UNVERIFIED = "stable_unverified"
+
+
 class TerminalVerificationStatePolicy(StrEnum):
     READ_ONLY = "read_only"
 
@@ -124,6 +155,9 @@ class TerminalRequirementState(StrEnum):
     """Shadow evidence state; it is not an execution authorization."""
 
     UNKNOWN = "unknown"
+    SATISFIED = "satisfied"
+    INCONCLUSIVE = "inconclusive"
+    # Kept only so older transcripts remain parseable; new receipts use SATISFIED.
     VERIFIED = "verified"
     BLOCKED = "blocked"
 
@@ -140,12 +174,37 @@ class TerminalRequirement(TerminalModel):
 class TerminalRequirementLedgerEntry(TerminalModel):
     requirement_id: str = Field(pattern=r"^req-[0-9]{3,}$")
     state: TerminalRequirementState = TerminalRequirementState.UNKNOWN
+    assurance: TerminalEvidenceAssurance = TerminalEvidenceAssurance.NONE
+    evidence_provenance: TerminalEvidenceProvenance = (
+        TerminalEvidenceProvenance.LEGACY_UNSPECIFIED
+    )
+    artifact_fingerprints: tuple[str, ...] = ()
     latest_evidence_action_id: UUID | None = None
     latest_result_fingerprint: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{64}$",
     )
     evidence_generation: int | None = Field(default=None, ge=0)
+
+
+class TerminalReconciliationReceipt(TerminalModel):
+    """Runtime-observed proof that an uncertain process is no longer active."""
+
+    action_id: UUID
+    task_generation: int = Field(default=0, ge=0)
+    result_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    observed_at: AwareDatetime
+
+
+class TerminalLedgerProjectionEntry(TerminalModel):
+    """Bounded model-facing delta; full evidence remains in the Journal."""
+
+    requirement_id: str = Field(pattern=r"^req-[0-9]{3,}$")
+    state: TerminalRequirementState
+    assurance: TerminalEvidenceAssurance
+    evidence_provenance: TerminalEvidenceProvenance
+    result_fingerprint: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    changed_in_generation: int | None = Field(default=None, ge=0)
 
 
 class TerminalTaskContract(TerminalModel):
@@ -200,6 +259,10 @@ class TerminalVerificationContract(TerminalModel):
     artifact_paths: tuple[str, ...] = Field(min_length=1)
     requirement_coverage: tuple[str, ...] = Field(min_length=1)
     coverage_dimensions: tuple[TerminalVerificationDimension, ...] = ()
+    evidence_provenance: TerminalEvidenceProvenance = (
+        TerminalEvidenceProvenance.LEGACY_UNSPECIFIED
+    )
+    artifact_fingerprints: tuple[str, ...] = ()
     validation_methods: tuple[str, ...] = Field(min_length=1)
     state_policy: TerminalVerificationStatePolicy = (
         TerminalVerificationStatePolicy.READ_ONLY
@@ -222,6 +285,7 @@ class TerminalVerificationContract(TerminalModel):
             self.requirement_coverage,
             self.coverage_dimensions,
             self.validation_methods,
+            self.artifact_fingerprints,
         )
         if any(len(set(items)) != len(items) for items in collections):
             raise ValueError("verification evidence entries must be unique")
@@ -234,6 +298,18 @@ class TerminalVerificationContract(TerminalModel):
                     "independent verification is missing coverage dimensions: "
                     + names
                 )
+        if any(
+            re.fullmatch(r"[^=\s]{1,4096}=sha256:[0-9a-f]{64}", item) is None
+            for item in self.artifact_fingerprints
+        ):
+            raise ValueError("artifact fingerprints must be path=sha256:<hex>")
+        fingerprint_paths = {
+            item.split("=sha256:", 1)[0] for item in self.artifact_fingerprints
+        }
+        if fingerprint_paths.difference(self.artifact_paths):
+            raise ValueError(
+                "artifact fingerprints must reference declared artifact paths"
+            )
         return self
 
 
@@ -247,6 +323,11 @@ class TerminalVerificationReceipt(TerminalModel):
     command_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     result_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     covered_requirement_ids: tuple[str, ...] = Field(min_length=1)
+    evidence_provenance: TerminalEvidenceProvenance = (
+        TerminalEvidenceProvenance.LEGACY_UNSPECIFIED
+    )
+    assurance: TerminalEvidenceAssurance = TerminalEvidenceAssurance.NONE
+    artifact_fingerprints: tuple[str, ...] = ()
     execution_state: TerminalExecutionState
     return_code: int | None = None
     timed_out: bool = False
@@ -475,6 +556,11 @@ class TerminalExecutionPolicy(TerminalModel):
     max_total_inspections: int | None = Field(default=5, ge=1, le=64)
     max_completion_rejections: int = Field(default=2, ge=0, le=10)
     max_proposal_rejections: int = Field(default=2, ge=0, le=10)
+    max_reconciliation_proposal_rejections: int = Field(
+        default=2,
+        ge=0,
+        le=10,
+    )
     max_in_doubt_reconciliation_attempts: int = Field(default=2, ge=1, le=8)
 
     @model_validator(mode="after")
@@ -506,6 +592,13 @@ class TerminalSessionSnapshot(TerminalModel):
     proposal_rejections: int = Field(default=0, ge=0)
     proposal_blocker: str | None = Field(default=None, min_length=1)
     last_proposal_rejection: TerminalProposalRejection | None = None
+    reconciliation_proposal_rejections: int = Field(default=0, ge=0)
+    reconciliation_blocker: str | None = Field(default=None, min_length=1)
+    last_reconciliation_proposal_rejection: TerminalProposalRejection | None = None
+    reconciliation_state: TerminalReconciliationState = (
+        TerminalReconciliationState.NOT_REQUIRED
+    )
+    latest_reconciliation_receipt: TerminalReconciliationReceipt | None = None
     consecutive_inspections: int = Field(default=0, ge=0)
     inspection_commands: int = Field(default=0, ge=0)
     failed_verification_attempts: int = Field(default=0, ge=0)
@@ -519,10 +612,28 @@ class TerminalSessionSnapshot(TerminalModel):
     task_ledger: TerminalTaskLedger | None = None
     latest_verification_receipt: TerminalVerificationReceipt | None = None
     verified_checkpoint: TerminalVerifiedCheckpoint | None = None
+    completion_disposition: TerminalCompletionDisposition = (
+        TerminalCompletionDisposition.IN_PROGRESS
+    )
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     total_tokens: int = Field(default=0, ge=0)
     cost_usd: float = Field(default=0.0, ge=0.0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_reconciliation_state(cls, value: object) -> object:
+        if isinstance(value, dict):
+            migrated = dict(value)
+            if (
+                migrated.get("in_doubt_reconciliation_required") is True
+                and "reconciliation_state" not in migrated
+            ):
+                migrated["reconciliation_state"] = (
+                    TerminalReconciliationState.REQUIRED.value
+                )
+            return migrated
+        return value
 
     @model_validator(mode="after")
     def validate_verification_state(self) -> TerminalSessionSnapshot:
@@ -560,6 +671,34 @@ class TerminalSessionSnapshot(TerminalModel):
                 raise ValueError(
                     "checkpoint receipt must equal the latest verification receipt"
                 )
+        reconciliation_receipt = self.latest_reconciliation_receipt
+        if self.reconciliation_state is TerminalReconciliationState.REQUIRED:
+            if not self.in_doubt_reconciliation_required:
+                raise ValueError("required reconciliation must remain active")
+        elif self.in_doubt_reconciliation_required:
+            raise ValueError("active reconciliation must use REQUIRED state")
+        if self.reconciliation_state is TerminalReconciliationState.STABLE_UNVERIFIED:
+            if reconciliation_receipt is None:
+                raise ValueError("stable reconciliation requires a receipt")
+            if reconciliation_receipt.task_generation != self.task_generation:
+                raise ValueError("reconciliation receipt belongs to a stale generation")
+        if (
+            self.completion_disposition is TerminalCompletionDisposition.SUCCESS_LOCKED
+            and checkpoint is None
+        ):
+            raise ValueError("success_locked requires a verified checkpoint")
+        if (
+            self.completion_disposition
+            is TerminalCompletionDisposition.SUBMITTED_UNVERIFIED
+        ):
+            if receipt is None or not receipt.passed:
+                raise ValueError(
+                    "submitted_unverified requires a passed verification receipt"
+                )
+            if receipt.assurance is TerminalEvidenceAssurance.TRUSTED:
+                raise ValueError(
+                    "trusted evidence must not use submitted_unverified"
+                )
         return self
 
 
@@ -587,6 +726,8 @@ class TerminalTurnRequest(TerminalModel):
     profile: str = AAR_TERMINAL_SEQUENTIAL_PROFILE
     requirements: tuple[TerminalRequirement, ...] = Field(min_length=1)
     session: TerminalSessionSnapshot
+    ledger_projection: tuple[TerminalLedgerProjectionEntry, ...] = ()
+    behavior_hints: tuple[str, ...] = ()
     recent_history: tuple[TerminalHistoryItem, ...] = ()
     used_call_keys: tuple[str, ...] = ()
     execution_limits: TerminalExecutionLimits = Field(
@@ -752,6 +893,9 @@ class TerminalTrialSummary(TerminalModel):
     run_id: UUID
     task_id: UUID
     agent_complete: bool
+    completion_disposition: TerminalCompletionDisposition = (
+        TerminalCompletionDisposition.IN_PROGRESS
+    )
     runtime_status: str = Field(min_length=1)
     final_output: Any = None
     command_count: int = Field(ge=0)

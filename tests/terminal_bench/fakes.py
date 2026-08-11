@@ -111,8 +111,9 @@ def verify_draft(
 ) -> TerminalTurnDraft:
     if verification is None:
         verification = TerminalVerificationContract(
-            evidence_kind="independent_check",
-            evidence_sources=("scripted independent check",),
+            evidence_kind="official_tests",
+            evidence_provenance="task_provided",
+            evidence_sources=("/tests/scripted_official_test.py",),
             artifact_paths=(cwd or "/app",),
             requirement_coverage=("req-001",),
             coverage_dimensions=(

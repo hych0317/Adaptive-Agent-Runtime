@@ -24,6 +24,7 @@ from applications.terminal_bench.models import (
     TerminalCommandRole,
     TerminalExecutionLimits,
     TerminalExecutionPolicy,
+    TerminalReconciliationState,
     TerminalRequirement,
     TerminalSessionSnapshot,
     TerminalTurnRequest,
@@ -342,7 +343,12 @@ class TerminalDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 )
 
                 app.journal._session = app.journal.snapshot().model_copy(
-                    update={"in_doubt_reconciliation_required": True}
+                    update={
+                        "in_doubt_reconciliation_required": True,
+                        "reconciliation_state": (
+                            TerminalReconciliationState.REQUIRED
+                        ),
+                    }
                 )
                 reconciliation_request = app.runtime._planner._turn_request(
                     self._state("create and verify an artifact"),

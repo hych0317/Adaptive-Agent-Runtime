@@ -33,6 +33,7 @@ from applications.terminal_bench.contracts import (
 )
 from applications.terminal_bench.models import (
     TerminalCommandRole,
+    TerminalCompletionDisposition,
     TerminalExecResult,
     TerminalExecutionLimits,
     TerminalExecutionPolicy,
@@ -211,6 +212,11 @@ class PlainSequentialApplication:
             run_id=run_id,
             task_id=task_id,
             agent_complete=agent_complete,
+            completion_disposition=(
+                TerminalCompletionDisposition.SUBMITTED_UNVERIFIED
+                if agent_complete
+                else TerminalCompletionDisposition.IN_PROGRESS
+            ),
             runtime_status=status,
             final_output=final_output,
             command_count=self._session.committed_commands,

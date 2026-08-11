@@ -99,6 +99,24 @@ def terminal_provider_metadata(
                     "enum": ["artifact", "format", "semantic", "end_to_end"],
                 },
             },
+            "evidence_provenance": {
+                "type": "string",
+                "enum": [
+                    "task_provided",
+                    "external_standard",
+                    "runtime_observed",
+                    "agent_generated",
+                    "legacy_unspecified",
+                ],
+            },
+            "artifact_fingerprints": {
+                "type": "array",
+                "uniqueItems": True,
+                "items": {
+                    "type": "string",
+                    "pattern": "^[^=\\s]{1,4096}=sha256:[0-9a-f]{64}$",
+                },
+            },
             "validation_methods": {
                 "type": "array",
                 "minItems": 1,
@@ -134,6 +152,8 @@ def terminal_provider_metadata(
             "artifact_paths",
             "requirement_coverage",
             "coverage_dimensions",
+            "evidence_provenance",
+            "artifact_fingerprints",
             "validation_methods",
             "independence_method",
             "process_isolation",

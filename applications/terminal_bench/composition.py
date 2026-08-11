@@ -367,6 +367,7 @@ class TerminalSequentialApplication:
             run_id=run_id,
             task_id=task_id,
             agent_complete=agent_complete,
+            completion_disposition=session.completion_disposition,
             runtime_status=result.final_state.status.value,
             final_output=_plain_json(output),
             command_count=session.committed_commands,

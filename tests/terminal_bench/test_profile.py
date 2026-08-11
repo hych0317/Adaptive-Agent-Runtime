@@ -511,7 +511,10 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     execute_draft("mutate-state", call_key="attempt-1"),
                     execute_draft("mutate-state", call_key="attempt-2"),
                 ),
-                policy=TerminalExecutionPolicy(max_proposal_rejections=0),
+                policy=TerminalExecutionPolicy(
+                    max_proposal_rejections=0,
+                    max_reconciliation_proposal_rejections=0,
+                ),
             )
             try:
                 artifacts = await app.run("perform one mutation")
@@ -531,7 +534,6 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     command_started=True,
                 ),
                 completed_result(stdout="process stopped; artifacts known"),
-                completed_result(stdout="repaired"),
                 completed_result(stdout="verified"),
             )
             capability = ScriptedTerminalTurnCapability(
@@ -541,7 +543,6 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     call_key="reconcile-1",
                     command_role=TerminalCommandRole.INSPECT,
                 ),
-                execute_draft("repair-known-state", call_key="attempt-2"),
                 verify_draft("true", call_key="verification-1"),
             )
             app = build_terminal_application(
@@ -555,11 +556,19 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 artifacts = await app.run("repair and verify the artifact")
 
                 self.assertTrue(artifacts.runtime_result.succeeded)
-                self.assertEqual(len(environment.calls), 4)
+                self.assertEqual(len(environment.calls), 3)
                 self.assertTrue(capability.requests[1].reconciliation_mode)
                 self.assertFalse(capability.requests[2].reconciliation_mode)
+                self.assertTrue(capability.requests[2].verification_due)
                 self.assertFalse(
                     app.journal.snapshot().in_doubt_reconciliation_required
+                )
+                self.assertEqual(
+                    app.journal.snapshot().reconciliation_state,
+                    "stable_unverified",
+                )
+                self.assertIsNotNone(
+                    app.journal.snapshot().latest_reconciliation_receipt
                 )
             finally:
                 app.close()
