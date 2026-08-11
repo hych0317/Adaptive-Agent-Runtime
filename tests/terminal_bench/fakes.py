@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import re
 
 from adaptive_agent_runtime.llm import InferenceUsage
 
@@ -15,6 +16,7 @@ from applications.terminal_bench.models import (
     TerminalTurnRequest,
     utc_now,
 )
+from applications.terminal_bench.tools import _RUNTIME_EVIDENCE_MARKER
 
 
 @dataclass(frozen=True)
@@ -26,9 +28,15 @@ class ExecCall:
 
 
 class FakeTerminalEnvironment:
-    def __init__(self, *results: TerminalExecResult | BaseException) -> None:
+    def __init__(
+        self,
+        *results: TerminalExecResult | BaseException,
+        runtime_evidence_stdout: str | None = None,
+    ) -> None:
         self._results = list(results)
+        self._runtime_evidence_stdout = runtime_evidence_stdout
         self.calls: list[ExecCall] = []
+        self.runtime_evidence_calls: list[ExecCall] = []
 
     async def exec(
         self,
@@ -38,14 +46,29 @@ class FakeTerminalEnvironment:
         env: Mapping[str, str] | None = None,
         timeout_sec: int | None = None,
     ) -> TerminalExecResult:
-        self.calls.append(
-            ExecCall(
-                command=command,
-                cwd=cwd,
-                env=(dict(env) if env is not None else None),
-                timeout_sec=timeout_sec,
-            )
+        call = ExecCall(
+            command=command,
+            cwd=cwd,
+            env=(dict(env) if env is not None else None),
+            timeout_sec=timeout_sec,
         )
+        if _RUNTIME_EVIDENCE_MARKER in command:
+            self.runtime_evidence_calls.append(call)
+            stdout = self._runtime_evidence_stdout
+            if stdout is None:
+                source_indices = re.findall(r"printf 'S\\t(\d+)", command)
+                artifact_indices = re.findall(r"printf 'A\\t(\d+)", command)
+                lines = [_RUNTIME_EVIDENCE_MARKER]
+                lines.extend(
+                    f"S\t{index}\t/tests/scripted_official_test.py\t0\t{'a' * 64}"
+                    for index in source_indices
+                )
+                lines.extend(
+                    f"A\t{index}\t{'b' * 64}" for index in artifact_indices
+                )
+                stdout = "\n".join(lines)
+            return completed_result(stdout=stdout)
+        self.calls.append(call)
         if not self._results:
             return completed_result(stdout=f"ran:{command}")
         result = self._results.pop(0)

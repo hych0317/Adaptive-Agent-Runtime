@@ -143,13 +143,27 @@ def _current_generation_has_successful_work(
 
 def _verification_assurance(
     verification: object,
+    result: TerminalExecResult | None = None,
+    *,
+    contract_complete: bool = True,
 ) -> TerminalEvidenceAssurance:
-    """Classify declared evidence conservatively; execution success is separate."""
+    """Trust only provenance and artifact evidence observed by Runtime."""
 
     from applications.terminal_bench.models import TerminalVerificationContract
 
     if not isinstance(verification, TerminalVerificationContract):
         return TerminalEvidenceAssurance.NONE
+    runtime_evidence = result.runtime_verification if result is not None else None
+    if (
+        not contract_complete
+        or runtime_evidence is None
+        or not runtime_evidence.provenance_verified
+        or runtime_evidence.requested_provenance
+        is not verification.evidence_provenance
+        or len(runtime_evidence.artifact_fingerprints)
+        != len(verification.artifact_paths)
+    ):
+        return TerminalEvidenceAssurance.SELF_CHECKED
     provenance = verification.evidence_provenance
     if (
         provenance is TerminalEvidenceProvenance.TASK_PROVIDED
@@ -162,6 +176,34 @@ def _verification_assurance(
     ):
         return TerminalEvidenceAssurance.TRUSTED
     return TerminalEvidenceAssurance.SELF_CHECKED
+
+
+def _runtime_evidence_provenance(
+    verification: object,
+    result: TerminalExecResult,
+) -> TerminalEvidenceProvenance:
+    from applications.terminal_bench.models import TerminalVerificationContract
+
+    if not isinstance(verification, TerminalVerificationContract):
+        return TerminalEvidenceProvenance.RUNTIME_OBSERVED
+    runtime_evidence = result.runtime_verification
+    if (
+        runtime_evidence is not None
+        and runtime_evidence.provenance_verified
+        and runtime_evidence.requested_provenance
+        is verification.evidence_provenance
+    ):
+        return runtime_evidence.requested_provenance
+    if verification.evidence_provenance is TerminalEvidenceProvenance.AGENT_GENERATED:
+        return TerminalEvidenceProvenance.AGENT_GENERATED
+    return TerminalEvidenceProvenance.RUNTIME_OBSERVED
+
+
+def _runtime_artifact_fingerprints(
+    result: TerminalExecResult,
+) -> tuple[str, ...]:
+    evidence = result.runtime_verification
+    return evidence.artifact_fingerprints if evidence is not None else ()
 
 
 def _current_generation_is_verifiable(
@@ -273,6 +315,9 @@ class JsonlTerminalTrialJournal:
     def bind_task_contract(
         self,
         requirements: tuple[TerminalRequirement, ...],
+        *,
+        coverage_complete: bool = True,
+        unmapped_fragments: tuple[str, ...] = (),
     ) -> None:
         """Persist one immutable, Runtime-derived requirement contract."""
 
@@ -293,7 +338,14 @@ class JsonlTerminalTrialJournal:
                 self._task_contract,
                 self._session.task_ledger,
             )
-            if self._task_contract != contract or ledger_error is not None:
+            if (
+                self._task_contract != contract
+                or ledger_error is not None
+                or self._session.contract_coverage_complete
+                is not coverage_complete
+                or self._session.contract_unmapped_fragments
+                != unmapped_fragments
+            ):
                 self._trace_consistent = False
                 raise RuntimeError(
                     "terminal task contract changed within one trial"
@@ -342,7 +394,11 @@ class JsonlTerminalTrialJournal:
                 and set(verification.requirement_coverage) == required_ids
                 and result.succeeded
                 and successful_work_generation == generation
-                and _verification_assurance(verification)
+                and _verification_assurance(
+                    verification,
+                    result,
+                    contract_complete=coverage_complete,
+                )
                 is TerminalEvidenceAssurance.TRUSTED
             )
             if migratable:
@@ -362,11 +418,11 @@ class JsonlTerminalTrialJournal:
                     covered_requirement_ids=(
                         verification.requirement_coverage
                     ),
-                    evidence_provenance=(
-                        verification.evidence_provenance
+                    evidence_provenance=_runtime_evidence_provenance(
+                        verification, result
                     ),
                     assurance=TerminalEvidenceAssurance.TRUSTED,
-                    artifact_fingerprints=verification.artifact_fingerprints,
+                    artifact_fingerprints=_runtime_artifact_fingerprints(result),
                     execution_state=result.execution_state,
                     return_code=result.return_code,
                     timed_out=result.timed_out,
@@ -382,10 +438,10 @@ class JsonlTerminalTrialJournal:
                                     "state": TerminalRequirementState.SATISFIED,
                                     "assurance": TerminalEvidenceAssurance.TRUSTED,
                                     "evidence_provenance": (
-                                        verification.evidence_provenance
+                                        _runtime_evidence_provenance(verification, result)
                                     ),
                                     "artifact_fingerprints": (
-                                        verification.artifact_fingerprints
+                                        _runtime_artifact_fingerprints(result)
                                     ),
                                     "latest_evidence_action_id": record.action_id,
                                     "latest_result_fingerprint": result_fingerprint,
@@ -415,6 +471,8 @@ class JsonlTerminalTrialJournal:
                 "task_ledger": ledger,
                 "latest_verification_receipt": verification_receipt,
                 "verified_checkpoint": verified_checkpoint,
+                "contract_coverage_complete": coverage_complete,
+                "contract_unmapped_fragments": unmapped_fragments,
             }
         )
         self._append(
@@ -570,6 +628,11 @@ class JsonlTerminalTrialJournal:
         )
 
     def completion_gate_error(self) -> str | None:
+        if not self._session.contract_coverage_complete:
+            return (
+                "the Runtime task contract has unmapped critical requirements: "
+                + "; ".join(self._session.contract_unmapped_fragments[:3])
+            )
         if not self._records:
             return "no committed verification command exists"
         record = self._records[-1]
@@ -866,15 +929,16 @@ class JsonlTerminalTrialJournal:
                 timed_out=result.timed_out,
                 transport_failed=result.transport_failed,
                 passed=passed,
-                evidence_provenance=(
-                    record.intent.verification.evidence_provenance
+                evidence_provenance=_runtime_evidence_provenance(
+                    record.intent.verification,
+                    result,
                 ),
                 assurance=_verification_assurance(
-                    record.intent.verification
+                    record.intent.verification,
+                    result,
+                    contract_complete=session.contract_coverage_complete,
                 ),
-                artifact_fingerprints=(
-                    record.intent.verification.artifact_fingerprints
-                ),
+                artifact_fingerprints=_runtime_artifact_fingerprints(result),
                 observed_at=record.committed_at,
             )
             covered = set(covered_ids)
@@ -930,8 +994,8 @@ class JsonlTerminalTrialJournal:
             result.succeeded
             and record.intent.command_role is TerminalCommandRole.VERIFY
             and record.intent.verification is not None
-            and _verification_assurance(record.intent.verification)
-            is TerminalEvidenceAssurance.TRUSTED
+            and verification_receipt is not None
+            and verification_receipt.assurance is TerminalEvidenceAssurance.TRUSTED
         ):
             verified_checkpoint = TerminalVerifiedCheckpoint(
                 action_id=record.action_id,
@@ -1968,8 +2032,15 @@ class TerminalSequentialPlanner:
 
     async def plan(self, state: AgentState) -> PlanDecision:
         await self.reconcile_observation(state)
+        requirements = _task_requirements(state.task.description)
+        unmapped_fragments = _contract_coverage_gaps(
+            state.task.description,
+            requirements,
+        )
         self._journal.bind_task_contract(
-            _task_requirements(state.task.description)
+            requirements,
+            coverage_complete=not unmapped_fragments,
+            unmapped_fragments=unmapped_fragments,
         )
         trace_error = self._journal.trace_error()
         if trace_error is not None:
@@ -3314,6 +3385,46 @@ _REQUIREMENT_SECTION_KINDS = {
     "must not do": TerminalRequirementKind.PROHIBIT,
     "thresholds": TerminalRequirementKind.THRESHOLD,
 }
+_CONTRACT_PATH_SIGNAL = re.compile(
+    r"(?:/(?:[^\s`'\";,]|:(?!\s))+|\b[\w.-]+\."
+    r"(?:json|csv|tsv|xml|ya?ml|toml|ini|txt|log|html?|md|pdf|sqlite3?|db)\b)",
+    re.IGNORECASE,
+)
+_CONTRACT_QUANTITY_SIGNAL = re.compile(r"(?<![\w.-])\d+(?:\.\d+)?%?(?![\w.-])")
+_CONTRACT_POLICY_SIGNAL = re.compile(
+    r"\b(?:exact(?:ly)?|format|schema|must\s+not|do\s+not|never|preserve|"
+    r"unchanged|at\s+least|at\s+most|no\s+more\s+than)\b|"
+    r"禁止|不得|不可|保留|保持不变|至少|至多",
+    re.IGNORECASE,
+)
+
+
+def _contract_coverage_gaps(
+    instruction: str,
+    requirements: tuple[TerminalRequirement, ...],
+) -> tuple[str, ...]:
+    """Independently detect critical source clauses lost by requirement parsing."""
+
+    mapped = "\n".join(item.description for item in requirements).casefold()
+    gaps: list[str] = []
+    for raw_line in instruction.replace("\r\n", "\n").split("\n"):
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("```"):
+            continue
+        signals = [
+            match.group(0).rstrip(".:")
+            for pattern in (
+                _CONTRACT_PATH_SIGNAL,
+                _CONTRACT_QUANTITY_SIGNAL,
+                _CONTRACT_POLICY_SIGNAL,
+            )
+            for match in pattern.finditer(stripped)
+        ]
+        if signals and any(signal.casefold() not in mapped for signal in signals):
+            normalized = " ".join(stripped.split())[:512]
+            if normalized not in gaps:
+                gaps.append(normalized)
+    return tuple(gaps)
 
 
 def _task_requirements(instruction: str) -> tuple[TerminalRequirement, ...]:

@@ -466,6 +466,37 @@ class TerminalProcessReference(TerminalModel):
     stop_command: str | None = Field(default=None, min_length=1, max_length=20_000)
 
 
+class TerminalRuntimeVerificationEvidence(TerminalModel):
+    """Runtime-owned observation of evidence sources and produced artifacts."""
+
+    requested_provenance: TerminalEvidenceProvenance
+    provenance_verified: bool = False
+    evidence_source_fingerprints: tuple[str, ...] = ()
+    artifact_fingerprints: tuple[str, ...] = ()
+    observed_at: AwareDatetime
+    failure_reason: str | None = Field(default=None, min_length=1, max_length=1024)
+
+    @model_validator(mode="after")
+    def validate_runtime_evidence(self) -> TerminalRuntimeVerificationEvidence:
+        fingerprint_pattern = re.compile(r"^[^=\s]{1,4096}=sha256:[0-9a-f]{64}$")
+        if any(
+            fingerprint_pattern.fullmatch(item) is None
+            for item in (
+                *self.evidence_source_fingerprints,
+                *self.artifact_fingerprints,
+            )
+        ):
+            raise ValueError("Runtime evidence fingerprints must be path=sha256:<hex>")
+        if self.provenance_verified and self.requested_provenance not in {
+            TerminalEvidenceProvenance.TASK_PROVIDED,
+            TerminalEvidenceProvenance.EXTERNAL_STANDARD,
+        }:
+            raise ValueError("only trusted provenance classes can be Runtime-verified")
+        if self.provenance_verified and not self.evidence_source_fingerprints:
+            raise ValueError("verified provenance requires source fingerprints")
+        return self
+
+
 class TerminalExecResult(TerminalModel):
     stdout: str = ""
     stderr: str = ""
@@ -478,6 +509,7 @@ class TerminalExecResult(TerminalModel):
     transport_failed: bool = False
     stdout_truncated: bool = False
     stderr_truncated: bool = False
+    runtime_verification: TerminalRuntimeVerificationEvidence | None = None
 
     @model_validator(mode="after")
     def validate_execution_result(self) -> TerminalExecResult:
@@ -612,6 +644,8 @@ class TerminalSessionSnapshot(TerminalModel):
     task_ledger: TerminalTaskLedger | None = None
     latest_verification_receipt: TerminalVerificationReceipt | None = None
     verified_checkpoint: TerminalVerifiedCheckpoint | None = None
+    contract_coverage_complete: bool = True
+    contract_unmapped_fragments: tuple[str, ...] = ()
     completion_disposition: TerminalCompletionDisposition = (
         TerminalCompletionDisposition.IN_PROGRESS
     )
@@ -699,6 +733,14 @@ class TerminalSessionSnapshot(TerminalModel):
                 raise ValueError(
                     "trusted evidence must not use submitted_unverified"
                 )
+        if self.contract_coverage_complete and self.contract_unmapped_fragments:
+            raise ValueError(
+                "complete task contract cannot retain unmapped fragments"
+            )
+        if not self.contract_coverage_complete and not self.contract_unmapped_fragments:
+            raise ValueError(
+                "incomplete task contract requires unmapped fragments"
+            )
         return self
 
 

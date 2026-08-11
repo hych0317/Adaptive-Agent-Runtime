@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime
+import shlex
 from typing import cast
 
 from adaptive_agent_runtime.tool_ecosystem import (
@@ -28,12 +29,173 @@ from applications.terminal_bench.contracts import (
 from applications.terminal_bench.models import (
     TERMINAL_COMMAND_CAPABILITY,
     TERMINAL_COMMAND_PROVIDER,
+    TerminalCommandRole,
     TerminalCommandIntent,
+    TerminalEvidenceProvenance,
     TerminalExecResult,
     TerminalExecutionPolicy,
     TerminalExecutionState,
+    TerminalRuntimeVerificationEvidence,
+    TerminalVerificationContract,
     utc_now,
 )
+_RUNTIME_EVIDENCE_MARKER = "AAR_RUNTIME_EVIDENCE_V1"
+_RUNTIME_EVIDENCE_TIMEOUT_SECONDS = 15
+_MAX_RUNTIME_EVIDENCE_PATHS = 64
+_TASK_EVIDENCE_ROOTS = ("/tests", "/test")
+_STANDARD_EVIDENCE_ROOTS = ("/usr", "/bin", "/sbin", "/lib", "/lib64")
+
+
+def _path_is_within(path: str, roots: tuple[str, ...]) -> bool:
+    return any(path == root or path.startswith(root + "/") for root in roots)
+
+
+def _runtime_evidence_command(
+    verification: TerminalVerificationContract,
+) -> str | None:
+    paths = (*verification.evidence_sources, *verification.artifact_paths)
+    if len(paths) > _MAX_RUNTIME_EVIDENCE_PATHS or any(
+        not path.startswith("/") or any(char.isspace() for char in path)
+        for path in verification.artifact_paths
+    ):
+        return None
+    lines = [
+        "set -eu",
+        "hash_path() {",
+        "  if [ -f \"$1\" ]; then",
+        "    sha256sum -- \"$1\" | awk '{print $1}'",
+        "  elif [ -d \"$1\" ]; then",
+        (
+            "    (cd \"$1\" && find . -type f -print0 | LC_ALL=C "
+            "sort -z | xargs -0 -r sha256sum) | sha256sum | awk '{print $1}'"
+        ),
+        "  else",
+        "    return 1",
+        "  fi",
+        "}",
+        f"printf '{_RUNTIME_EVIDENCE_MARKER}\\n'",
+    ]
+    for index, path in enumerate(verification.evidence_sources):
+        if not path.startswith("/") or any(
+            char.isspace() for char in path
+        ):
+            continue
+        lines.extend(
+            (
+                f"p={shlex.quote(path)}",
+                'r=$(readlink -f -- "$p")',
+                'c=$(stat -c %Z -- "$r")',
+                'h=$(hash_path "$r")',
+                f"printf 'S\\t{index}\\t%s\\t%s\\t%s\\n' \"$r\" \"$c\" \"$h\"",
+            )
+        )
+    for index, path in enumerate(verification.artifact_paths):
+        lines.extend(
+            (
+                f"p={shlex.quote(path)}",
+                'r=$(readlink -f -- "$p")',
+                'h=$(hash_path "$r")',
+                f"printf 'A\\t{index}\\t%s\\n' \"$h\"",
+            )
+        )
+    return "\n".join(lines)
+
+
+def _runtime_evidence_failure(
+    verification: TerminalVerificationContract,
+    reason: str,
+) -> TerminalRuntimeVerificationEvidence:
+    return TerminalRuntimeVerificationEvidence(
+        requested_provenance=verification.evidence_provenance,
+        observed_at=utc_now(),
+        failure_reason=reason[:1024],
+    )
+
+
+def _parse_runtime_evidence(
+    verification: TerminalVerificationContract,
+    result: TerminalExecResult,
+    *,
+    trial_started_epoch: float,
+) -> TerminalRuntimeVerificationEvidence:
+    if not result.succeeded:
+        return _runtime_evidence_failure(
+            verification,
+            "Runtime evidence probe did not complete successfully",
+        )
+    lines = result.stdout.splitlines()
+    if not lines or lines[0] != _RUNTIME_EVIDENCE_MARKER:
+        return _runtime_evidence_failure(
+            verification,
+            "Runtime evidence probe returned an invalid marker",
+        )
+    sources: dict[int, tuple[str, int, str]] = {}
+    artifacts: dict[int, str] = {}
+    try:
+        for line in lines[1:]:
+            parts = line.split("\t")
+            if len(parts) == 5 and parts[0] == "S":
+                index = int(parts[1])
+                path, changed_at, digest = parts[2], int(parts[3]), parts[4]
+                if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                    raise ValueError("invalid source digest")
+                sources[index] = (path, changed_at, digest)
+            elif len(parts) == 3 and parts[0] == "A":
+                index = int(parts[1])
+                digest = parts[2]
+                if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                    raise ValueError("invalid artifact digest")
+                artifacts[index] = digest
+            else:
+                raise ValueError("invalid evidence line")
+        if not set(sources).issubset(range(len(verification.evidence_sources))):
+            raise ValueError("invalid evidence source index")
+        if set(artifacts) != set(range(len(verification.artifact_paths))):
+            raise ValueError("incomplete artifact fingerprints")
+    except (TypeError, ValueError):
+        return _runtime_evidence_failure(
+            verification,
+            "Runtime evidence probe output could not be validated",
+        )
+    source_fingerprints = tuple(
+        f"{sources[index][0]}=sha256:{sources[index][2]}"
+        for index in sorted(sources)
+    )
+    artifact_fingerprints = tuple(
+        f"{path}=sha256:{artifacts[index]}"
+        for index, path in enumerate(verification.artifact_paths)
+    )
+    roots = (
+        _TASK_EVIDENCE_ROOTS
+        if verification.evidence_provenance
+        is TerminalEvidenceProvenance.TASK_PROVIDED
+        else _STANDARD_EVIDENCE_ROOTS
+    )
+    provenance_verified = bool(
+        verification.evidence_provenance
+        in {
+            TerminalEvidenceProvenance.TASK_PROVIDED,
+            TerminalEvidenceProvenance.EXTERNAL_STANDARD,
+        }
+        and set(sources) == set(range(len(verification.evidence_sources)))
+        and all(
+            _path_is_within(path, roots)
+            and changed_at <= trial_started_epoch + 1.0
+            for path, changed_at, _digest in sources.values()
+        )
+    )
+    return TerminalRuntimeVerificationEvidence(
+        requested_provenance=verification.evidence_provenance,
+        provenance_verified=provenance_verified,
+        evidence_source_fingerprints=source_fingerprints,
+        artifact_fingerprints=artifact_fingerprints,
+        observed_at=utc_now(),
+        failure_reason=(
+            None
+            if provenance_verified
+            else "declared provenance was not verified by Runtime"
+        ),
+    )
 
 
 def terminal_provider_metadata(
@@ -236,6 +398,7 @@ class TerminalCommandProvider:
         self._environment = environment
         self._journal = journal
         self._policy = policy
+        self._trial_started_epoch = utc_now().timestamp()
 
     async def invoke(self, invocation: ToolInvocation) -> ToolProviderResult:
         try:
@@ -289,6 +452,23 @@ class TerminalCommandProvider:
                 state=state,
                 timed_out=timed_out,
             )
+        if (
+            result.succeeded
+            and intent.command_role is TerminalCommandRole.VERIFY
+            and intent.verification is not None
+        ):
+            consumed_seconds = (result.duration_ms + 999) // 1000
+            remaining_timeout_sec = max(
+                0,
+                intent.timeout_sec - consumed_seconds,
+            )
+            runtime_verification = await self._collect_runtime_evidence(
+                intent,
+                remaining_timeout_sec=remaining_timeout_sec,
+            )
+            result = result.model_copy(
+                update={"runtime_verification": runtime_verification}
+            )
         result = self._bounded_output(result)
         self._journal.record_execution(invocation.invocation_id, result)
         if result.settled:
@@ -300,6 +480,48 @@ class TerminalCommandProvider:
                 retryable=False,
             )
         return ToolProviderResult.failed(error=error, retryable=False)
+
+    async def _collect_runtime_evidence(
+        self,
+        intent: TerminalCommandIntent,
+        *,
+        remaining_timeout_sec: int,
+    ) -> TerminalRuntimeVerificationEvidence:
+        verification = intent.verification
+        assert verification is not None
+        command = _runtime_evidence_command(verification)
+        if command is None:
+            return _runtime_evidence_failure(
+                verification,
+                "evidence paths are not eligible for Runtime inspection",
+            )
+        if remaining_timeout_sec < 1:
+            return _runtime_evidence_failure(
+                verification,
+                "VERIFY role timeout left no budget for Runtime evidence inspection",
+            )
+        try:
+            result = await self._environment.exec(
+                command,
+                cwd=intent.cwd,
+                env={"PATH": "/usr/bin:/bin"},
+                timeout_sec=min(
+                    _RUNTIME_EVIDENCE_TIMEOUT_SECONDS,
+                    remaining_timeout_sec,
+                ),
+            )
+            if not isinstance(result, TerminalExecResult):
+                raise TypeError("TerminalEnvironment must return TerminalExecResult")
+        except Exception as exc:
+            return _runtime_evidence_failure(
+                verification,
+                "Runtime evidence probe failed: " + exc.__class__.__name__,
+            )
+        return _parse_runtime_evidence(
+            verification,
+            result,
+            trial_started_epoch=self._trial_started_epoch,
+        )
 
     @staticmethod
     def _failure_result(

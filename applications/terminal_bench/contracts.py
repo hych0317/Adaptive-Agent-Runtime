@@ -145,6 +145,9 @@ class TerminalTrialJournal(Protocol):
     def bind_task_contract(
         self,
         requirements: tuple[TerminalRequirement, ...],
+        *,
+        coverage_complete: bool = True,
+        unmapped_fragments: tuple[str, ...] = (),
     ) -> None: ...
 
     def task_contract(self) -> TerminalTaskContract | None: ...
