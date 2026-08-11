@@ -387,8 +387,7 @@ class PlainSequentialApplication:
         self._history.append(item)
         references = list(self._session.process_references)
         if (
-            result.execution_state is TerminalExecutionState.COMPLETED
-            and result.return_code == 0
+            result.succeeded
             and draft.process_reference is not None
         ):
             references = [
@@ -412,7 +411,7 @@ class PlainSequentialApplication:
             "inspection_commands": self._session.inspection_commands
             + int(draft.command_role is TerminalCommandRole.INSPECT),
         }
-        if result.execution_state is TerminalExecutionState.COMPLETED:
+        if result.settled:
             update["current_cwd"] = cwd
             update["environment"] = dict(environment)
         self._session = self._session.model_copy(update=update)

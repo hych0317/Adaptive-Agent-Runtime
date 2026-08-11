@@ -18,6 +18,8 @@ from applications.terminal_bench.composition import (
 )
 from applications.terminal_bench.contracts import (
     TerminalExecutionError,
+    terminal_exception_indicates_timeout,
+    terminal_exception_outcome,
 )
 from applications.terminal_bench.models import (
     AAR_TERMINAL_SEQUENTIAL_PROFILE,
@@ -114,37 +116,28 @@ class HarborTerminalEnvironmentAdapter:
                 timeout_sec=timeout_sec,
             )
         except TerminalExecutionError as exc:
+            state, timed_out = terminal_exception_outcome(exc)
             return self._exception_result(
                 exc,
                 started_at=started_at,
-                state=(
-                    TerminalExecutionState.FAILED_TO_START
-                    if exc.command_started is False
-                    else TerminalExecutionState.IN_DOUBT
-                ),
-                timed_out=(exc.timed_out or _exception_indicates_timeout(exc)),
+                state=state,
+                timed_out=timed_out,
             )
         except TimeoutError as exc:
+            state, timed_out = terminal_exception_outcome(exc)
             return self._exception_result(
                 exc,
                 started_at=started_at,
-                state=TerminalExecutionState.IN_DOUBT,
-                timed_out=True,
+                state=state,
+                timed_out=timed_out,
             )
         except Exception as exc:
-            command_started = getattr(exc, "command_started", None)
+            state, timed_out = terminal_exception_outcome(exc)
             return self._exception_result(
                 exc,
                 started_at=started_at,
-                state=(
-                    TerminalExecutionState.FAILED_TO_START
-                    if command_started is False
-                    else TerminalExecutionState.IN_DOUBT
-                ),
-                timed_out=(
-                    bool(getattr(exc, "timed_out", False))
-                    or _exception_indicates_timeout(exc)
-                ),
+                state=state,
+                timed_out=timed_out,
             )
         completed_at = utc_now()
         return_code = getattr(raw, "return_code", None)
@@ -219,20 +212,9 @@ class HarborTerminalEnvironmentAdapter:
 
 
 def _exception_indicates_timeout(exc: BaseException) -> bool:
-    """Recognize Harbor timeout wrappers that omit a structured flag."""
+    """Backward-compatible wrapper for the Harbor-independent classifier."""
 
-    detail = (str(exc) or exc.__class__.__name__).lower()
-    return any(
-        marker in detail
-        for marker in (
-            "timed out",
-            "timeout after",
-            "timeout of",
-            "deadline exceeded",
-            "deadline expired",
-        )
-    )
-
+    return terminal_exception_indicates_timeout(exc)
 
 ApplicationFactory = Callable[..., TerminalSequentialApplication]
 

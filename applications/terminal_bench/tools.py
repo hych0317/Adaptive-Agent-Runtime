@@ -14,6 +14,7 @@ from adaptive_agent_runtime.tool_ecosystem import (
     ToolInvocation,
     ToolObservation,
     ToolProviderMetadata,
+    ToolProviderOutcome,
     ToolProviderResult,
 )
 from adaptive_agent_runtime.tool_ecosystem.models import ImmutableJsonObject
@@ -22,6 +23,7 @@ from applications.terminal_bench.contracts import (
     TerminalEnvironment,
     TerminalExecutionError,
     TerminalTrialJournal,
+    terminal_exception_outcome,
 )
 from applications.terminal_bench.models import (
     TERMINAL_COMMAND_CAPABILITY,
@@ -244,41 +246,40 @@ class TerminalCommandProvider:
             if not isinstance(result, TerminalExecResult):
                 raise TypeError("TerminalEnvironment must return TerminalExecResult")
         except TerminalExecutionError as exc:
+            state, timed_out = terminal_exception_outcome(exc)
             result = self._failure_result(
                 exc,
                 started_at=started_at,
-                state=(
-                    TerminalExecutionState.FAILED_TO_START
-                    if exc.command_started is False
-                    else TerminalExecutionState.IN_DOUBT
-                ),
-                timed_out=exc.timed_out,
+                state=state,
+                timed_out=timed_out,
             )
         except TimeoutError as exc:
+            state, timed_out = terminal_exception_outcome(exc)
             result = self._failure_result(
                 exc,
                 started_at=started_at,
-                state=TerminalExecutionState.IN_DOUBT,
-                timed_out=True,
+                state=state,
+                timed_out=timed_out,
             )
         except Exception as exc:
+            state, timed_out = terminal_exception_outcome(exc)
             result = self._failure_result(
                 exc,
                 started_at=started_at,
-                state=TerminalExecutionState.IN_DOUBT,
-                timed_out=False,
+                state=state,
+                timed_out=timed_out,
             )
         result = self._bounded_output(result)
         self._journal.record_execution(invocation.invocation_id, result)
-        if result.execution_state is TerminalExecutionState.COMPLETED:
+        if result.settled:
             return ToolProviderResult.ok(output=result.model_dump(mode="json"))
-        return ToolProviderResult.failed(
-            error=(
-                f"terminal execution {result.execution_state.value}: "
-                f"{result.stderr or 'no final process status'}"
-            ),
-            retryable=False,
-        )
+        error = _terminal_tool_error(result)
+        if _terminal_provider_outcome(result) is ToolProviderOutcome.TIMED_OUT:
+            return ToolProviderResult.timed_out_result(
+                error=error,
+                retryable=False,
+            )
+        return ToolProviderResult.failed(error=error, retryable=False)
 
     @staticmethod
     def _failure_result(
@@ -323,14 +324,14 @@ def terminal_tool_observation_from_result(
 ) -> ToolObservation:
     """Reconstruct an authoritative Tool result without replaying the command."""
 
-    succeeded = result.execution_state is TerminalExecutionState.COMPLETED
-    attempt_status = (
-        ToolAttemptStatus.SUCCEEDED if succeeded else ToolAttemptStatus.FAILED
-    )
-    error = None if succeeded else (
-        f"terminal execution {result.execution_state.value}: "
-        f"{result.stderr or 'no final process status'}"
-    )
+    provider_outcome = _terminal_provider_outcome(result)
+    succeeded = provider_outcome is ToolProviderOutcome.SUCCEEDED
+    attempt_status = {
+        ToolProviderOutcome.SUCCEEDED: ToolAttemptStatus.SUCCEEDED,
+        ToolProviderOutcome.FAILED: ToolAttemptStatus.FAILED,
+        ToolProviderOutcome.TIMED_OUT: ToolAttemptStatus.TIMED_OUT,
+    }[provider_outcome]
+    error = None if succeeded else _terminal_tool_error(result)
     attempt = ToolAttempt(
         attempt_number=1,
         status=attempt_status,
@@ -346,9 +347,11 @@ def terminal_tool_observation_from_result(
         capability_id=invocation.capability_id,
         provider_id=invocation.provider_id,
         status=(
-            ToolExecutionStatus.SUCCEEDED
-            if succeeded
-            else ToolExecutionStatus.FAILED
+            {
+                ToolProviderOutcome.SUCCEEDED: ToolExecutionStatus.SUCCEEDED,
+                ToolProviderOutcome.FAILED: ToolExecutionStatus.FAILED,
+                ToolProviderOutcome.TIMED_OUT: ToolExecutionStatus.TIMED_OUT,
+            }[provider_outcome]
         ),
         retry_status=RetryStatus.NOT_RETRIED,
         output=result.model_dump(mode="json") if succeeded else None,
@@ -357,6 +360,24 @@ def terminal_tool_observation_from_result(
         correlation=invocation.correlation,
         started_at=result.started_at,
         completed_at=result.completed_at,
+    )
+
+
+def _terminal_provider_outcome(
+    result: TerminalExecResult,
+) -> ToolProviderOutcome:
+    if result.settled:
+        return ToolProviderOutcome.SUCCEEDED
+    if result.timed_out:
+        return ToolProviderOutcome.TIMED_OUT
+    return ToolProviderOutcome.FAILED
+
+
+def _terminal_tool_error(result: TerminalExecResult) -> str:
+    label = "TIMED_OUT" if result.timed_out else result.execution_state.value
+    return (
+        f"terminal execution {label}: "
+        f"{result.stderr or 'no final process status'}"
     )
 
 

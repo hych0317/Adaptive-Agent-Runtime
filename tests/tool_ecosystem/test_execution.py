@@ -30,6 +30,7 @@ from adaptive_agent_runtime.tool_ecosystem import (
     ToolObservation,
     ToolProvider,
     ToolProviderMetadata,
+    ToolProviderOutcome,
     ToolProviderResult,
     ToolTraceEventKind,
     ToolTraceEvent,
@@ -250,6 +251,35 @@ class ToolExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, ToolExecutionStatus.TIMED_OUT)
         self.assertTrue(provider.cancelled)
         self.assertEqual(provider.calls, 1)
+        self.assertIn(
+            ToolTraceEventKind.ATTEMPT_TIMED_OUT,
+            tuple(
+                entry.event.kind
+                for entry in trace.entries_for(invocation.invocation_id)
+            ),
+        )
+
+    async def test_provider_declared_timeout_uses_explicit_outcome(self) -> None:
+        provider = ScriptedProvider(
+            "declared-timeout",
+            [
+                ToolProviderResult.timed_out_result(
+                    error="remote command timed out",
+                    retryable=False,
+                )
+            ],
+        )
+        _, trace, executor, invocation = execution_fixture(provider)
+
+        result = await executor.execute(invocation, ToolExecutionPolicy())
+
+        self.assertEqual(result.status, ToolExecutionStatus.TIMED_OUT)
+        self.assertEqual(result.attempts[0].status, ToolAttemptStatus.TIMED_OUT)
+        self.assertEqual(provider.calls, 1)
+        declared = ToolProviderResult.timed_out_result(error="timed out")
+        self.assertIs(declared.outcome, ToolProviderOutcome.TIMED_OUT)
+        self.assertFalse(declared.succeeded)
+        self.assertTrue(declared.timed_out)
         self.assertIn(
             ToolTraceEventKind.ATTEMPT_TIMED_OUT,
             tuple(

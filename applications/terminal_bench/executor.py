@@ -14,7 +14,6 @@ from adaptive_agent_runtime.core import (
     FailureRecoveryStatus,
     Observation,
     ObservationControl,
-    OutcomeCertainty,
     ProgressKind,
 )
 
@@ -30,11 +29,15 @@ from applications.terminal_bench.models import (
     TERMINAL_COMPLETION_REJECTION_ACTION,
     TERMINAL_PROPOSAL_REJECTION_ACTION,
     TerminalCommandIntent,
-    TerminalCommandRole,
     TerminalExecResult,
     TerminalExecutionState,
-    terminal_fingerprint,
     utc_now,
+)
+from applications.terminal_bench.progress import (
+    TerminalProgressAssessment,
+    assess_terminal_progress,
+    terminal_failure_code,
+    terminal_outcome_certainty,
 )
 from applications.terminal_bench.tool_decision import (
     TerminalToolDecisionResult,
@@ -159,80 +162,52 @@ class TerminalActionExecutor:
                 effect.invocation.invocation_id,
                 execution_result,
             )
+        progress = assess_terminal_progress(
+            intent,
+            execution_result,
+            self._journal.recent_records(512),
+        )
         metadata = self._metadata(
             decision,
             execution_result,
             effect_fingerprint=decision.effect_fingerprint or "0" * 64,
+            progress=progress,
         )
-        if execution_result.execution_state is TerminalExecutionState.COMPLETED:
-            progress_kind, progress_fingerprint = self._completed_progress(
-                intent,
-                execution_result,
-            )
+        if execution_result.settled:
             return Observation.ok(
                 action.action_id,
                 output=execution_result.model_dump(mode="json"),
                 metadata=cast(Mapping[str, JsonValue], metadata),
                 control=ObservationControl(
-                    progress_kind=progress_kind,
-                    progress_fingerprint=progress_fingerprint,
+                    progress_kind=progress.kind,
+                    progress_fingerprint=progress.fingerprint,
                 ),
             )
         return Observation.failed(
             action.action_id,
             error=(
-                f"terminal execution {execution_result.execution_state.value}: "
+                "terminal execution "
+                + (
+                    "TIMED_OUT"
+                    if execution_result.timed_out
+                    else execution_result.execution_state.value
+                )
+                + ": "
                 f"{execution_result.stderr or tool_observation.error or 'unknown state'}"
             ),
             metadata=cast(Mapping[str, JsonValue], metadata),
             control=ObservationControl(
-                progress_kind=ProgressKind.NO_PROGRESS,
+                progress_kind=progress.kind,
+                progress_fingerprint=progress.fingerprint,
                 failure=FailureDisposition(
-                    failure_code=(
-                        "tool.timeout"
-                        if execution_result.timed_out
-                        else "terminal.execution_uncertain"
-                    ),
+                    failure_code=terminal_failure_code(execution_result),
                     retryable=False,
                     recovery_status=FailureRecoveryStatus.UNAVAILABLE,
-                    outcome_certainty=OutcomeCertainty.IN_DOUBT,
+                    outcome_certainty=terminal_outcome_certainty(
+                        execution_result
+                    ),
                 ),
             ),
-        )
-
-    def _completed_progress(
-        self,
-        intent: TerminalCommandIntent,
-        result: TerminalExecResult,
-    ) -> tuple[ProgressKind, str | None]:
-        if intent.command_role is not TerminalCommandRole.INSPECT:
-            return (
-                ProgressKind.TASK_PROGRESS
-                if result.return_code == 0
-                else ProgressKind.NO_PROGRESS,
-                None,
-            )
-        fingerprint = terminal_fingerprint(
-            {
-                "return_code": result.return_code,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-            }
-        )
-        seen = any(
-            record.intent.command_role is TerminalCommandRole.INSPECT
-            and terminal_fingerprint(
-                {
-                    "return_code": record.result.return_code,
-                    "stdout": record.result.stdout,
-                    "stderr": record.result.stderr,
-                }
-            ) == fingerprint
-            for record in self._journal.recent_records(512)
-        )
-        return (
-            ProgressKind.NO_PROGRESS if seen else ProgressKind.RECOVERY_PROGRESS,
-            fingerprint,
         )
 
     @staticmethod
@@ -241,8 +216,9 @@ class TerminalActionExecutor:
         result: TerminalExecResult,
         *,
         effect_fingerprint: str,
+        progress: TerminalProgressAssessment | None = None,
     ) -> dict[str, JsonValue]:
-        return {
+        metadata: dict[str, JsonValue] = {
             "terminal_result": result.model_dump(mode="json"),
             "terminal_decision": {
                 "request_id": str(decision.request_id),
@@ -251,6 +227,9 @@ class TerminalActionExecutor:
                 "status": decision.status,
             },
         }
+        if progress is not None:
+            metadata["terminal_progress"] = progress.metadata()
+        return metadata
 
     @staticmethod
     def _not_executed_result(

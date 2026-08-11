@@ -35,6 +35,13 @@ from applications.terminal_bench.contracts import (
     TerminalTrialJournal,
     TerminalTurnProposalCapability,
 )
+from applications.terminal_bench.deadline import (
+    TerminalDeadlineSequence,
+    TerminalDeadlineSlots,
+    TerminalInferenceTiming,
+    allocate_deadline_slots,
+    allocate_terminal_deadline_sequence,
+)
 from applications.terminal_bench.models import (
     AAR_TERMINAL_SEQUENTIAL_PROFILE,
     TERMINAL_COMMAND_ACTION,
@@ -51,8 +58,13 @@ from applications.terminal_bench.models import (
     TerminalProposalRejection,
     TerminalProcessReference,
     TerminalRequirement,
+    TerminalRequirementKind,
+    TerminalRequirementLedgerEntry,
+    TerminalRequirementState,
     TerminalRejectedDraft,
     TerminalSessionSnapshot,
+    TerminalTaskContract,
+    TerminalTaskLedger,
     TerminalTrialSummary,
     TerminalTurnDecision,
     TerminalTurnDraft,
@@ -60,11 +72,13 @@ from applications.terminal_bench.models import (
     TerminalTurnRequest,
     TerminalToolCapabilities,
     TerminalVerifiedCheckpoint,
+    TerminalVerificationReceipt,
     TerminalPerformanceProtocol,
     TerminalVerificationStatePolicy,
     terminal_fingerprint,
     utc_now,
 )
+from applications.terminal_bench.progress import terminal_failure_signatures
 
 
 _TERMINAL_ACTION_NAMESPACE = uuid5(
@@ -93,6 +107,51 @@ _EXECUTION_SEMANTICS = (
 )
 
 
+def _task_contract_ledger_error(
+    contract: TerminalTaskContract,
+    ledger: TerminalTaskLedger | None,
+) -> str | None:
+    if ledger is None:
+        return "task contract has no requirement ledger"
+    if ledger.contract_version != contract.contract_version:
+        return "task contract and ledger versions do not match"
+    if ledger.contract_fingerprint != contract.contract_fingerprint:
+        return "task contract and ledger fingerprints do not match"
+    contract_ids = tuple(
+        item.requirement_id for item in contract.requirements
+    )
+    ledger_ids = tuple(item.requirement_id for item in ledger.entries)
+    if ledger_ids != contract_ids:
+        return "task contract and ledger requirement IDs do not match"
+    return None
+
+
+def _current_generation_has_successful_work(
+    session: TerminalSessionSnapshot,
+) -> bool:
+    return bool(
+        session.successful_work_generation is not None
+        and session.successful_work_generation == session.task_generation
+    )
+
+
+def _legacy_generation_state(
+    records: tuple[TerminalCommandRecord, ...],
+) -> tuple[int, int | None]:
+    """Derive generation state only while migrating a pre-contract trace."""
+
+    generation = 0
+    successful_generation: int | None = None
+    for record in records:
+        if record.intent.command_role is not TerminalCommandRole.WORK:
+            continue
+        if record.result.execution_state is TerminalExecutionState.FAILED_TO_START:
+            continue
+        generation += 1
+        successful_generation = generation if record.result.succeeded else None
+    return generation, successful_generation
+
+
 class JsonlTerminalTrialJournal:
     """Append-only transcript plus a replayed trial-local working snapshot."""
 
@@ -108,7 +167,9 @@ class JsonlTerminalTrialJournal:
         self._executions: dict[UUID, TerminalExecResult] = {}
         self._records: list[TerminalCommandRecord] = []
         self._agent_summary: str | None = None
+        self._task_contract: TerminalTaskContract | None = None
         self._trace_consistent = True
+        self._trace_error: str | None = None
         if self._path is not None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             if self._path.is_file():
@@ -122,8 +183,165 @@ class JsonlTerminalTrialJournal:
     def trace_consistent(self) -> bool:
         return self._trace_consistent and self._pending is None
 
+    def trace_error(self) -> str | None:
+        return self._trace_error
+
+    def mark_trace_inconsistent(self, reason: str) -> None:
+        if not reason:
+            raise ValueError("trace inconsistency reason is required")
+        self._trace_consistent = False
+        if self._trace_error is None:
+            self._trace_error = reason
+            self._append("trace.inconsistent", {"reason": reason})
+
     def snapshot(self) -> TerminalSessionSnapshot:
         return self._session
+
+    def task_contract(self) -> TerminalTaskContract | None:
+        return self._task_contract
+
+    def bind_task_contract(
+        self,
+        requirements: tuple[TerminalRequirement, ...],
+    ) -> None:
+        """Persist one immutable, Runtime-derived requirement contract."""
+
+        contract_fingerprint = terminal_fingerprint(
+            {
+                "contract_version": "1",
+                "requirements": [
+                    item.model_dump(mode="json") for item in requirements
+                ],
+            }
+        )
+        contract = TerminalTaskContract(
+            contract_fingerprint=contract_fingerprint,
+            requirements=requirements,
+        )
+        if self._task_contract is not None:
+            ledger_error = _task_contract_ledger_error(
+                self._task_contract,
+                self._session.task_ledger,
+            )
+            if self._task_contract != contract or ledger_error is not None:
+                self._trace_consistent = False
+                raise RuntimeError(
+                    "terminal task contract changed within one trial"
+                )
+            return
+        if self._session.task_ledger is not None:
+            self._trace_consistent = False
+            raise RuntimeError("terminal task ledger has no persisted contract")
+        generation, successful_work_generation = _legacy_generation_state(
+            tuple(self._records)
+        )
+        ledger = TerminalTaskLedger(
+            contract_version=contract.contract_version,
+            contract_fingerprint=contract_fingerprint,
+            generation=generation,
+            entries=tuple(
+                TerminalRequirementLedgerEntry(
+                    requirement_id=item.requirement_id,
+                )
+                for item in requirements
+            ),
+        )
+        verification_receipt: TerminalVerificationReceipt | None = None
+        verified_checkpoint = self._session.verified_checkpoint
+        migration_error: str | None = None
+        if (
+            verified_checkpoint is not None
+            and verified_checkpoint.receipt is None
+        ):
+            record = self._records[-1] if self._records else None
+            result = record.result if record is not None else None
+            verification = (
+                record.intent.verification if record is not None else None
+            )
+            required_ids = {item.requirement_id for item in ledger.entries}
+            migratable = bool(
+                record is not None
+                and result is not None
+                and record.action_id == verified_checkpoint.action_id
+                and record.intent.command_role is TerminalCommandRole.VERIFY
+                and verification is not None
+                and record.intent.execution_fingerprint
+                == verified_checkpoint.command_fingerprint
+                and terminal_fingerprint(verification)
+                == terminal_fingerprint(verified_checkpoint.verification)
+                and set(verification.requirement_coverage) == required_ids
+                and result.succeeded
+                and successful_work_generation == generation
+            )
+            if migratable:
+                assert record is not None
+                assert result is not None
+                assert verification is not None
+                result_fingerprint = terminal_fingerprint(result)
+                verification_receipt = TerminalVerificationReceipt(
+                    action_id=record.action_id,
+                    task_generation=generation,
+                    task_contract_fingerprint=contract_fingerprint,
+                    verification_contract_fingerprint=(
+                        terminal_fingerprint(verification)
+                    ),
+                    command_fingerprint=record.intent.execution_fingerprint,
+                    result_fingerprint=result_fingerprint,
+                    covered_requirement_ids=(
+                        verification.requirement_coverage
+                    ),
+                    execution_state=result.execution_state,
+                    return_code=result.return_code,
+                    timed_out=result.timed_out,
+                    transport_failed=result.transport_failed,
+                    passed=True,
+                    observed_at=record.committed_at,
+                )
+                ledger = ledger.model_copy(
+                    update={
+                        "entries": tuple(
+                            entry.model_copy(
+                                update={
+                                    "state": TerminalRequirementState.VERIFIED,
+                                    "latest_evidence_action_id": record.action_id,
+                                    "latest_result_fingerprint": result_fingerprint,
+                                    "evidence_generation": generation,
+                                }
+                            )
+                            for entry in ledger.entries
+                        )
+                    }
+                )
+                verified_checkpoint = verified_checkpoint.model_copy(
+                    update={
+                        "task_generation": generation,
+                        "receipt": verification_receipt,
+                    }
+                )
+            else:
+                migration_error = (
+                    "legacy verified checkpoint cannot be migrated to the "
+                    "current task contract"
+                )
+        self._task_contract = contract
+        self._session = self._session.model_copy(
+            update={
+                "task_generation": generation,
+                "successful_work_generation": successful_work_generation,
+                "task_ledger": ledger,
+                "latest_verification_receipt": verification_receipt,
+                "verified_checkpoint": verified_checkpoint,
+            }
+        )
+        self._append(
+            "task.contract.bound",
+            {
+                "contract": contract.model_dump(mode="json"),
+                "session": self._session.model_dump(mode="json"),
+            },
+        )
+        if migration_error is not None:
+            self.mark_trace_inconsistent(migration_error)
 
     def recent_records(self, limit: int) -> tuple[TerminalCommandRecord, ...]:
         if limit < 1:
@@ -273,11 +491,11 @@ class JsonlTerminalTrialJournal:
         record = self._records[-1]
         if record.intent.command_role is not TerminalCommandRole.VERIFY:
             return "the last committed command is not marked verify"
-        if not any(
-            item.intent.command_role is TerminalCommandRole.WORK
-            for item in self._records[:-1]
-        ):
-            return "the verification command has no preceding work command"
+        if not _current_generation_has_successful_work(self._session):
+            return (
+                "the verification command has no valid successful work in "
+                "the current task generation"
+            )
         result = record.result
         if result.execution_state is not TerminalExecutionState.COMPLETED:
             return "the verification command did not complete with a known result"
@@ -290,6 +508,44 @@ class JsonlTerminalTrialJournal:
         checkpoint = self._session.verified_checkpoint
         if checkpoint is None or checkpoint.action_id != record.action_id:
             return "the latest successful verification has no locked checkpoint"
+        if checkpoint.task_generation != self._session.task_generation:
+            return "the locked checkpoint belongs to a stale task generation"
+        ledger = self._session.task_ledger
+        if ledger is not None:
+            contract = self._task_contract
+            if contract is None:
+                return "the task requirement ledger has no persisted contract"
+            ledger_error = _task_contract_ledger_error(contract, ledger)
+            if ledger_error is not None:
+                return ledger_error
+            if ledger.generation != self._session.task_generation:
+                return "the task requirement ledger belongs to a stale generation"
+            receipt = checkpoint.receipt
+            if receipt is None:
+                return "the locked checkpoint has no Runtime verification receipt"
+            if self._session.latest_verification_receipt != receipt:
+                return "the checkpoint does not match the latest verification receipt"
+            if receipt.task_contract_fingerprint != ledger.contract_fingerprint:
+                return "the verification receipt belongs to a different task contract"
+            if receipt.task_generation != self._session.task_generation:
+                return "the verification receipt belongs to a stale task generation"
+            if receipt.verification_contract_fingerprint != terminal_fingerprint(
+                record.intent.verification
+            ):
+                return "the verification receipt contract fingerprint does not match"
+            if receipt.result_fingerprint != terminal_fingerprint(result):
+                return "the verification receipt result fingerprint does not match"
+            required_ids = {item.requirement_id for item in ledger.entries}
+            if set(receipt.covered_requirement_ids) != required_ids:
+                return "the verification receipt does not cover the task contract"
+            if any(
+                item.state is not TerminalRequirementState.VERIFIED
+                or item.latest_evidence_action_id != receipt.action_id
+                or item.latest_result_fingerprint != receipt.result_fingerprint
+                or item.evidence_generation != self._session.task_generation
+                for item in ledger.entries
+            ):
+                return "the task requirement ledger is not verified by the receipt"
         return None
 
     def record_completion_rejection(self, reason: str) -> None:
@@ -354,8 +610,7 @@ class JsonlTerminalTrialJournal:
         result = record.result
         references = list(session.process_references)
         if (
-            result.execution_state is TerminalExecutionState.COMPLETED
-            and result.return_code == 0
+            result.succeeded
             and record.intent.process_reference is not None
         ):
             references = [
@@ -365,31 +620,142 @@ class JsonlTerminalTrialJournal:
                 != record.intent.process_reference.reference_id
             ]
             references.append(record.intent.process_reference)
+        task_ledger = session.task_ledger
+        task_generation = session.task_generation
+        successful_work_generation = session.successful_work_generation
+        pending_repair_receipt_id = session.pending_repair_receipt_id
+        repair_applied_action_id = session.repair_applied_action_id
+        pending_before_work = pending_repair_receipt_id
+        work_changed_state = bool(
+            record.intent.command_role is TerminalCommandRole.WORK
+            and result.execution_state is not TerminalExecutionState.FAILED_TO_START
+        )
+        if work_changed_state:
+            task_generation += 1
+            successful_work_generation = (
+                task_generation if result.succeeded else None
+            )
+            if task_ledger is not None:
+                task_ledger = task_ledger.model_copy(
+                    update={
+                        "generation": task_generation,
+                        "entries": tuple(
+                            entry.model_copy(
+                                update={
+                                    "state": TerminalRequirementState.UNKNOWN,
+                                    "latest_evidence_action_id": None,
+                                    "latest_result_fingerprint": None,
+                                    "evidence_generation": None,
+                                }
+                            )
+                            for entry in task_ledger.entries
+                        ),
+                    }
+                )
+            if result.succeeded and pending_before_work is not None:
+                repair_applied_action_id = record.action_id
+            elif pending_before_work is not None:
+                repair_applied_action_id = None
+        verification_receipt = session.latest_verification_receipt
+        if (
+            task_ledger is not None
+            and record.intent.command_role is TerminalCommandRole.VERIFY
+            and record.intent.verification is not None
+        ):
+            covered_ids = tuple(
+                record.intent.verification.requirement_coverage
+            )
+            passed = result.succeeded
+            conclusively_blocked = bool(
+                result.settled
+                and result.return_code not in (None, 0)
+            )
+            result_fingerprint = terminal_fingerprint(result)
+            verification_receipt = TerminalVerificationReceipt(
+                action_id=record.action_id,
+                task_generation=task_generation,
+                task_contract_fingerprint=(
+                    task_ledger.contract_fingerprint
+                ),
+                verification_contract_fingerprint=terminal_fingerprint(
+                    record.intent.verification
+                ),
+                command_fingerprint=record.intent.execution_fingerprint,
+                result_fingerprint=result_fingerprint,
+                covered_requirement_ids=covered_ids,
+                execution_state=result.execution_state,
+                return_code=result.return_code,
+                timed_out=result.timed_out,
+                transport_failed=result.transport_failed,
+                passed=passed,
+                observed_at=record.committed_at,
+            )
+            covered = set(covered_ids)
+            task_ledger = task_ledger.model_copy(
+                update={
+                    "entries": tuple(
+                        entry.model_copy(
+                            update={
+                                "state": (
+                                    TerminalRequirementState.VERIFIED
+                                    if passed
+                                    else TerminalRequirementState.UNKNOWN
+                                ),
+                                "latest_evidence_action_id": (
+                                    record.action_id if passed else None
+                                ),
+                                "latest_result_fingerprint": (
+                                    result_fingerprint if passed else None
+                                ),
+                                "evidence_generation": (
+                                    task_generation if passed else None
+                                ),
+                            }
+                        )
+                        if entry.requirement_id in covered
+                        else entry
+                        for entry in task_ledger.entries
+                    )
+                }
+            )
+            if conclusively_blocked:
+                pending_repair_receipt_id = record.action_id
+                repair_applied_action_id = None
+            elif passed:
+                pending_repair_receipt_id = None
+                repair_applied_action_id = None
         verified_checkpoint = session.verified_checkpoint
         if (
-            result.execution_state is TerminalExecutionState.COMPLETED
-            and result.return_code == 0
+            result.succeeded
             and record.intent.command_role is TerminalCommandRole.VERIFY
             and record.intent.verification is not None
         ):
             verified_checkpoint = TerminalVerifiedCheckpoint(
                 action_id=record.action_id,
+                task_generation=task_generation,
                 call_key=record.intent.call_key,
                 command_fingerprint=record.intent.execution_fingerprint,
                 verification=record.intent.verification,
+                receipt=(
+                    verification_receipt
+                    if verification_receipt is not None
+                    and verification_receipt.action_id == record.action_id
+                    else None
+                ),
                 committed_at=record.committed_at,
             )
         failed_verification_attempts = session.failed_verification_attempts
         verification_corrections = session.verification_corrections
         if (
             record.intent.command_role is TerminalCommandRole.VERIFY
-            and result.execution_state is TerminalExecutionState.COMPLETED
+            and result.settled
             and result.return_code != 0
         ):
             failed_verification_attempts += 1
         elif (
             record.intent.command_role is TerminalCommandRole.WORK
-            and failed_verification_attempts > verification_corrections
+            and result.succeeded
+            and pending_before_work is not None
         ):
             verification_corrections += 1
         consecutive_inspections = (
@@ -406,16 +772,12 @@ class JsonlTerminalTrialJournal:
         elif (
             reconciliation_required
             and record.intent.command_role is TerminalCommandRole.INSPECT
-            and result.execution_state is TerminalExecutionState.COMPLETED
-            and result.return_code == 0
+            and result.succeeded
         ):
             reconciliation_required = False
         failure_signatures = session.latest_failure_signatures
-        if (
-            result.execution_state is not TerminalExecutionState.COMPLETED
-            or result.return_code != 0
-        ):
-            failure_signatures = _failure_signatures(result)
+        if not result.succeeded:
+            failure_signatures = terminal_failure_signatures(result)
         elif record.intent.command_role is TerminalCommandRole.VERIFY:
             failure_signatures = ()
         update: dict[str, object] = {
@@ -430,14 +792,20 @@ class JsonlTerminalTrialJournal:
             "last_proposal_rejection": None,
             "consecutive_inspections": consecutive_inspections,
             "inspection_commands": inspection_commands,
+            "task_generation": task_generation,
+            "successful_work_generation": successful_work_generation,
+            "pending_repair_receipt_id": pending_repair_receipt_id,
+            "repair_applied_action_id": repair_applied_action_id,
             "verified_checkpoint": verified_checkpoint,
             "failed_verification_attempts": failed_verification_attempts,
             "verification_corrections": verification_corrections,
             "latest_failure_signatures": failure_signatures,
+            "task_ledger": task_ledger,
+            "latest_verification_receipt": verification_receipt,
         }
         if record.governance_status != "applied":
             update["denied_commands"] = session.denied_commands + 1
-        if result.execution_state is TerminalExecutionState.COMPLETED:
+        if result.settled:
             update["current_cwd"] = record.intent.cwd
             update["environment"] = dict(record.intent.env)
         return session.model_copy(update=update)
@@ -473,7 +841,29 @@ class JsonlTerminalTrialJournal:
                 ) from exc
 
     def _replay_event(self, kind: str, payload: Any) -> None:
-        if kind == "pending.saved":
+        if kind == "task.contract.bound":
+            contract = TerminalTaskContract.model_validate(
+                payload["contract"]
+            )
+            session = TerminalSessionSnapshot.model_validate(
+                payload["session"]
+            )
+            ledger_error = _task_contract_ledger_error(
+                contract,
+                session.task_ledger,
+            )
+            if ledger_error is not None:
+                self._trace_consistent = False
+                raise RuntimeError(ledger_error)
+            if (
+                self._task_contract is not None
+                and self._task_contract != contract
+            ):
+                self._trace_consistent = False
+                raise RuntimeError("terminal task contract changed in transcript")
+            self._task_contract = contract
+            self._session = session
+        elif kind == "pending.saved":
             pending_payload = dict(payload)
             proposal_payload = pending_payload.get("proposal")
             if isinstance(proposal_payload, Mapping):
@@ -513,6 +903,9 @@ class JsonlTerminalTrialJournal:
             self._session = TerminalSessionSnapshot.model_validate(payload["session"])
         elif kind == "agent.completed":
             self._agent_summary = str(payload["summary"])
+        elif kind == "trace.inconsistent":
+            self._trace_consistent = False
+            self._trace_error = str(payload["reason"])
 
 
 class GatewayTerminalTurnProposalCapability:
@@ -571,6 +964,18 @@ class GatewayTerminalTurnProposalCapability:
                 "emergency inference timeout cannot be below the minimum "
                 "delivery timeout"
             )
+        configured_normal_timeout = gateway_policy.budget.max_elapsed_seconds
+        self.deadline_timing = TerminalInferenceTiming(
+            normal_preferred_seconds=(
+                configured_normal_timeout
+                if configured_normal_timeout is not None
+                else max(delivery_timeout_seconds, minimum_timeout_seconds)
+            ),
+            compact_preferred_seconds=delivery_timeout_seconds,
+            emergency_preferred_seconds=emergency_timeout_seconds,
+            normal_minimum_seconds=minimum_timeout_seconds,
+            compact_minimum_seconds=minimum_delivery_timeout_seconds,
+        )
 
     async def propose(self, request: TerminalTurnRequest) -> TerminalTurnProposal:
         inference = InferenceRequest(
@@ -634,7 +1039,10 @@ class GatewayTerminalTurnProposalCapability:
                     "If payload.finalization_mode is true, stop broad exploration. If "
                     "payload.verification_due is true, verify now. Otherwise perform at "
                     "most one focused repair bounded by final_repair_timeout_sec, then "
-                    "verify on the next turn. "
+                    "verify on the next turn. payload.execution_limits.deadline_sequence "
+                    "is authoritative: reconcile_then_work_verify and "
+                    "reconcile_then_verify permit only inspect now, work_then_verify "
+                    "permits only work now, and direct_verify permits only verify now. "
                     "If payload.reconciliation_mode is true, return only one read-only "
                     "inspect command that exits zero solely when the prior IN_DOUBT "
                     "process is stopped and affected artifacts are in a known state; "
@@ -735,6 +1143,10 @@ class GatewayTerminalTurnProposalCapability:
                     "every stable requirement_id from payload.requirements in "
                     "requirement_coverage, and validation methods. Coverage must "
                     "contain IDs only; descriptions authored by you are rejected. "
+                    "Requirement kind is a conservative Runtime classification "
+                    "from explicit task headings; unclassified requirements remain "
+                    "mandatory. The session task_ledger is shadow evidence, not "
+                    "authority to skip work or verification. "
                     "Use state_policy=read_only. An independent check must cover "
                     "artifact existence, format, semantic correctness, and the "
                     "end-to-end consumer workflow. After a failed verification, "
@@ -794,7 +1206,37 @@ class GatewayTerminalTurnProposalCapability:
                     )
                 }
             )
-        if request.remaining_wall_clock_seconds is not None:
+        precomputed_inference_cap = (
+            request.execution_limits.max_inference_timeout_sec
+        )
+        if precomputed_inference_cap is not None:
+            configured = gateway_policy.budget.max_elapsed_seconds
+            bounded = precomputed_inference_cap
+            if configured is not None:
+                bounded = min(bounded, configured)
+            if request.emergency_mode:
+                bounded = min(bounded, self._emergency_timeout_seconds)
+            elif (
+                request.delivery_mode
+                or request.finalization_mode
+                or request.reconciliation_mode
+                or request.repair_mode
+                or request.verification_due
+            ):
+                bounded = min(bounded, self._delivery_timeout_seconds)
+            if bounded <= 0.0:
+                raise InferenceExecutionBudgetError(
+                    "insufficient wall-clock capacity for another inference: "
+                    "available 0.0 seconds; no positive inference window remains"
+                )
+            gateway_policy = gateway_policy.model_copy(
+                update={
+                    "budget": gateway_policy.budget.model_copy(
+                        update={"max_elapsed_seconds": bounded}
+                    )
+                }
+            )
+        elif request.remaining_wall_clock_seconds is not None:
             remaining = max(0.0, request.remaining_wall_clock_seconds)
             configured = gateway_policy.budget.max_elapsed_seconds
             action_reserve = min(
@@ -1089,44 +1531,6 @@ _TEMP_ROOT_ASSIGNMENT = re.compile(
     r"(?m)^\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)="
     r"[\"']?\$\(\s*mktemp\s+(?:-d|--directory)\b[^)]*\)[\"']?"
 )
-_FAILURE_SIGNATURE_MARKER = re.compile(
-    r"(?i)(?:\bFAIL(?:ED)?\b|\bERROR\b|AssertionError|AttributeError|"
-    r"ImportError|ModuleNotFoundError|command not found|No such file or directory|"
-    r"timed? out|IN_DOUBT|returned? non-zero|exit(?:ed)?[ =:]+[1-9])"
-)
-_SENSITIVE_FAILURE_VALUE = re.compile(
-    r"(?i)(?:AKIA|ASIA)[A-Z0-9]{16}|"
-    r"(?:gh[pousr]_|github_pat_|hf_)[A-Za-z0-9_]{16,}|"
-    r"(?<=[=:][\"'])[^\"'\s]{24,}(?=[\"'])"
-)
-
-
-def _failure_signatures(result: TerminalExecResult) -> tuple[str, ...]:
-    """Return bounded, redacted failure families for the next repair turn."""
-
-    values: list[str] = []
-    combined = "\n".join((result.stdout, result.stderr))
-    for raw_line in combined.splitlines():
-        line = raw_line.strip()
-        if not line or _FAILURE_SIGNATURE_MARKER.search(line) is None:
-            continue
-        line = _SENSITIVE_FAILURE_VALUE.sub("<redacted>", line)
-        line = line[:300]
-        if line not in values:
-            values.append(line)
-        if len(values) >= 12:
-            break
-    if not values and result.execution_state is not TerminalExecutionState.COMPLETED:
-        values.append(
-            "execution_state=" + result.execution_state.value
-            + "; timed_out=" + str(result.timed_out).lower()
-            + "; transport_failed=" + str(result.transport_failed).lower()
-        )
-    elif not values and result.return_code not in (None, 0):
-        values.append(f"command returned non-zero status {result.return_code}")
-    return tuple(values)
-
-
 def _requires_performance_protocol(
     requirements: tuple[TerminalRequirement, ...],
 ) -> bool:
@@ -1250,9 +1654,22 @@ class TerminalSequentialPlanner:
         self._capability = capability
         self._journal = journal
         self._policy = policy or TerminalExecutionPolicy()
+        timing = getattr(capability, "deadline_timing", None)
+        self._deadline_timing = (
+            timing if isinstance(timing, TerminalInferenceTiming) else None
+        )
+        self._uses_deadline_slots = self._deadline_timing is not None
 
     async def plan(self, state: AgentState) -> PlanDecision:
         await self.reconcile_observation(state)
+        self._journal.bind_task_contract(
+            _task_requirements(state.task.description)
+        )
+        trace_error = self._journal.trace_error()
+        if trace_error is not None:
+            return PlanDecision.fail(
+                error="terminal trace is inconsistent: " + trace_error
+            )
         pending = self._journal.pending()
         if pending is not None:
             return PlanDecision.execute(
@@ -1290,6 +1707,13 @@ class TerminalSequentialPlanner:
                         "inference."
                     ),
                 )
+            self._journal.mark_trace_inconsistent(
+                "verified checkpoint failed completion validation: "
+                + gate_error
+            )
+            return PlanDecision.fail(
+                error="terminal trace is inconsistent: " + gate_error
+            )
         budget_error = self._budget_error(session, allow_command_limit=False)
         if budget_error is not None:
             return PlanDecision.fail(error=budget_error)
@@ -1309,6 +1733,22 @@ class TerminalSequentialPlanner:
                 force_delivery=True,
                 force_emergency=True,
             )
+            retry_inference_cap = (
+                retry_request.execution_limits.max_inference_timeout_sec
+            )
+            deadline_timing = self._deadline_timing
+            if (
+                self._uses_deadline_slots
+                and deadline_timing is not None
+                and retry_inference_cap is not None
+                and retry_inference_cap
+                < deadline_timing.compact_minimum_seconds
+            ):
+                raise RunBudgetExhaustedError(
+                    "active_execution",
+                    "terminal emergency inference budget exhausted: full "
+                    "emergency action and verification sequence does not fit",
+                ) from exc
             try:
                 proposal = await self._capability.propose(retry_request)
             except InferenceExecutionBudgetError as retry_exc:
@@ -1417,6 +1857,9 @@ class TerminalSequentialPlanner:
                 verification_due=request.verification_due,
                 finalization_mode=request.finalization_mode,
                 reconciliation_mode=request.reconciliation_mode,
+                deadline_sequence=(
+                    request.execution_limits.deadline_sequence
+                ),
                 required_requirements=_task_requirements(
                     state.task.description
                 ),
@@ -1561,17 +2004,15 @@ class TerminalSequentialPlanner:
             session,
         )
         all_records = self._journal.recent_records(self._policy.max_commands)
-        has_successful_work = any(
-            item.intent.command_role is TerminalCommandRole.WORK
-            and item.result.execution_state is TerminalExecutionState.COMPLETED
-            and item.result.return_code == 0
-            for item in all_records
-        )
+        has_successful_work = _current_generation_has_successful_work(session)
         finalization_mode = bool(
-            has_successful_work
-            and remaining_wall_clock_seconds is not None
+            remaining_wall_clock_seconds is not None
             and remaining_wall_clock_seconds
-            <= self._policy.finalization_mode_threshold_seconds
+            <= self._effective_finalization_threshold_seconds()
+            and (
+                self._uses_deadline_slots
+                or has_successful_work
+            )
         )
         reconciliation_mode = session.in_doubt_reconciliation_required
         dynamic_timeout_sec = self._dynamic_timeout_limit(
@@ -1616,25 +2057,33 @@ class TerminalSequentialPlanner:
             if self._policy.max_cost_usd is None
             else max(0.0, self._policy.max_cost_usd - session.cost_usd)
         )
-        repair_mode = (
-            session.failed_verification_attempts
-            > session.verification_corrections
+        repair_mode = bool(
+            session.pending_repair_receipt_id is not None
+            and session.repair_applied_action_id is None
         )
-        last_record = all_records[-1] if all_records else None
         verification_due = bool(
-            last_record is not None
-            and last_record.intent.command_role is TerminalCommandRole.WORK
-            and last_record.result.command_completed
-            and last_record.result.return_code == 0
+            has_successful_work
+            and not reconciliation_mode
             and (
-                finalization_mode
+                session.repair_applied_action_id is not None
                 or (
-                    session.failed_verification_attempts > 0
-                    and session.failed_verification_attempts
-                    == session.verification_corrections
+                    finalization_mode
+                    and session.pending_repair_receipt_id is None
                 )
             )
         )
+        deadline_sequence: TerminalDeadlineSequence | None = None
+        if self._uses_deadline_slots:
+            if reconciliation_mode:
+                deadline_sequence = (
+                    TerminalDeadlineSequence.RECONCILE_THEN_VERIFY
+                    if has_successful_work
+                    else TerminalDeadlineSequence.RECONCILE_THEN_WORK_VERIFY
+                )
+            elif verification_due:
+                deadline_sequence = TerminalDeadlineSequence.DIRECT_VERIFY
+            elif finalization_mode or repair_mode:
+                deadline_sequence = TerminalDeadlineSequence.WORK_THEN_VERIFY
         artifact_first_mode = not any(
             item.intent.command_role
             in (TerminalCommandRole.WORK, TerminalCommandRole.VERIFY)
@@ -1657,6 +2106,27 @@ class TerminalSequentialPlanner:
             or verification_due
             or artifact_recovery
         )
+        deadline_slots: TerminalDeadlineSlots | None = None
+        if self._uses_deadline_slots:
+            deadline_slots = self._deadline_slots(
+                remaining_wall_clock_seconds,
+                delivery_mode=delivery_mode,
+                emergency_mode=force_emergency,
+                finalization_mode=finalization_mode,
+                reconciliation_mode=reconciliation_mode,
+                repair_mode=repair_mode,
+                verification_due=verification_due,
+                sequence=deadline_sequence,
+            )
+            if deadline_slots.action_limit_seconds is not None:
+                dynamic_timeout_sec = max(
+                    1,
+                    deadline_slots.action_limit_seconds,
+                )
+                dynamic_verification_timeout_sec = min(
+                    dynamic_timeout_sec,
+                    self._policy.max_verification_timeout_sec,
+                )
         return TerminalTurnRequest(
             run_id=state.run_id,
             task_id=state.task.task_id,
@@ -1671,8 +2141,32 @@ class TerminalSequentialPlanner:
                     dynamic_timeout_sec,
                 ),
                 max_timeout_sec=dynamic_timeout_sec,
+                max_work_timeout_sec=min(
+                    dynamic_timeout_sec,
+                    self._policy.final_repair_timeout_sec,
+                ),
                 max_verification_timeout_sec=(
                     dynamic_verification_timeout_sec
+                ),
+                max_inspection_timeout_sec=(
+                    dynamic_timeout_sec
+                    if deadline_sequence
+                    in {
+                        TerminalDeadlineSequence.RECONCILE_THEN_WORK_VERIFY,
+                        TerminalDeadlineSequence.RECONCILE_THEN_VERIFY,
+                    }
+                    or deadline_sequence is None
+                    else None
+                ),
+                deadline_sequence=deadline_sequence,
+                max_inference_timeout_sec=(
+                    None
+                    if deadline_slots is None
+                    else (
+                        deadline_slots.inference_limit_seconds
+                        if deadline_slots.feasible
+                        else 0.0
+                    )
                 ),
                 final_repair_timeout_sec=min(
                     dynamic_timeout_sec,
@@ -1681,6 +2175,21 @@ class TerminalSequentialPlanner:
                 cleanup_grace_seconds=self._policy.cleanup_grace_seconds,
                 timeout_admission_margin_seconds=(
                     self._policy.timeout_admission_margin_seconds
+                ),
+                followup_inference_reserve_seconds=(
+                    0.0
+                    if deadline_slots is None
+                    else deadline_slots.followup_inference_seconds
+                ),
+                verification_reserve_seconds=(
+                    0.0
+                    if deadline_slots is None
+                    else deadline_slots.verification_seconds
+                ),
+                deadline_cleanup_reserve_seconds=(
+                    0.0
+                    if deadline_slots is None
+                    else deadline_slots.cleanup_seconds
                 ),
                 max_command_characters=self._policy.max_command_characters,
                 max_environment_variables=(
@@ -1725,6 +2234,120 @@ class TerminalSequentialPlanner:
             self._policy.max_wall_clock_seconds - elapsed_seconds,
         )
 
+    def _effective_finalization_threshold_seconds(self) -> float:
+        timing = self._deadline_timing
+        if timing is None:
+            return self._policy.finalization_mode_threshold_seconds
+        required = (
+            timing.compact_minimum_seconds
+            + self._policy.final_repair_timeout_sec
+            + timing.compact_minimum_seconds
+            + self._policy.max_verification_timeout_sec
+            + self._policy.cleanup_grace_seconds
+            + self._policy.timeout_admission_margin_seconds
+        )
+        return max(
+            self._policy.finalization_mode_threshold_seconds,
+            required,
+        )
+
+    def _deadline_slots(
+        self,
+        remaining_wall_clock_seconds: float | None,
+        *,
+        delivery_mode: bool = False,
+        emergency_mode: bool = False,
+        finalization_mode: bool = False,
+        reconciliation_mode: bool = False,
+        repair_mode: bool = False,
+        verification_due: bool = False,
+        include_current_inference: bool = True,
+        sequence: TerminalDeadlineSequence | None = None,
+    ) -> TerminalDeadlineSlots:
+        compact = bool(
+            delivery_mode
+            or emergency_mode
+            or finalization_mode
+            or reconciliation_mode
+            or repair_mode
+            or verification_due
+        )
+        timing = self._deadline_timing
+        if timing is None:
+            raise RuntimeError("deadline timing is unavailable")
+        minimum_inference = (
+            timing.compact_minimum_seconds
+            if compact
+            else timing.normal_minimum_seconds
+        )
+        preferred_inference = (
+            timing.emergency_preferred_seconds
+            if emergency_mode
+            else (
+                timing.compact_preferred_seconds
+                if compact
+                else timing.normal_preferred_seconds
+            )
+        )
+        if not include_current_inference:
+            minimum_inference = 0.0
+            preferred_inference = 0.0
+        if sequence is not None:
+            return allocate_terminal_deadline_sequence(
+                sequence=sequence,
+                remaining_seconds=remaining_wall_clock_seconds,
+                minimum_inference_seconds=minimum_inference,
+                preferred_inference_seconds=preferred_inference,
+                followup_inference_seconds=timing.compact_minimum_seconds,
+                work_timeout_seconds=self._policy.final_repair_timeout_sec,
+                verification_timeout_seconds=(
+                    self._policy.max_verification_timeout_sec
+                ),
+                reconciliation_timeout_seconds=(
+                    self._policy.final_repair_timeout_sec
+                ),
+                cleanup_seconds=(
+                    self._policy.cleanup_grace_seconds
+                    + self._policy.timeout_admission_margin_seconds
+                ),
+                include_current_inference=include_current_inference,
+            )
+        if verification_due:
+            preferred_action = self._policy.max_verification_timeout_sec
+            maximum_action = self._policy.max_verification_timeout_sec
+            followup_inference = 0.0
+            verification = 0.0
+        elif finalization_mode:
+            preferred_action = self._policy.final_repair_timeout_sec
+            maximum_action = self._policy.final_repair_timeout_sec
+            followup_inference = (
+                timing.compact_minimum_seconds
+            )
+            verification = float(self._policy.max_verification_timeout_sec)
+        else:
+            preferred_action = min(
+                self._policy.default_timeout_sec,
+                self._policy.max_timeout_sec,
+            )
+            maximum_action = self._policy.max_timeout_sec
+            followup_inference = (
+                timing.compact_minimum_seconds
+            )
+            verification = float(self._policy.max_verification_timeout_sec)
+        return allocate_deadline_slots(
+            remaining_seconds=remaining_wall_clock_seconds,
+            minimum_inference_seconds=minimum_inference,
+            preferred_inference_seconds=preferred_inference,
+            preferred_action_seconds=preferred_action,
+            maximum_action_seconds=maximum_action,
+            followup_inference_seconds=followup_inference,
+            verification_seconds=verification,
+            cleanup_seconds=(
+                self._policy.cleanup_grace_seconds
+                + self._policy.timeout_admission_margin_seconds
+            ),
+        )
+
     def _dynamic_timeout_limit(
         self,
         remaining_wall_clock_seconds: float | None,
@@ -1746,20 +2369,40 @@ class TerminalSequentialPlanner:
         session: TerminalSessionSnapshot,
         *,
         command_role: TerminalCommandRole,
+        finalization_mode: bool = False,
+        deadline_sequence: TerminalDeadlineSequence | None = None,
     ) -> int | None:
         remaining = self._remaining_wall_clock_seconds(session)
         if remaining is None:
             return None
+        if self._uses_deadline_slots:
+            fresh_finalization = bool(
+                finalization_mode
+                or remaining
+                <= self._effective_finalization_threshold_seconds()
+            )
+            effective_sequence = deadline_sequence
+            if effective_sequence is None and fresh_finalization:
+                effective_sequence = (
+                    TerminalDeadlineSequence.DIRECT_VERIFY
+                    if command_role is TerminalCommandRole.VERIFY
+                    else TerminalDeadlineSequence.WORK_THEN_VERIFY
+                )
+            slots = self._deadline_slots(
+                remaining,
+                finalization_mode=fresh_finalization,
+                verification_due=(
+                    command_role is TerminalCommandRole.VERIFY
+                ),
+                sequence=effective_sequence,
+                include_current_inference=False,
+            )
+            return slots.action_limit_seconds or 0
         reserve = (
             self._policy.cleanup_grace_seconds
             + self._policy.timeout_admission_margin_seconds
         )
-        has_successful_work = any(
-            item.intent.command_role is TerminalCommandRole.WORK
-            and item.result.execution_state is TerminalExecutionState.COMPLETED
-            and item.result.return_code == 0
-            for item in self._journal.recent_records(self._policy.max_commands)
-        )
+        has_successful_work = _current_generation_has_successful_work(session)
         if (
             command_role is TerminalCommandRole.WORK
             and has_successful_work
@@ -1818,6 +2461,7 @@ class TerminalSequentialPlanner:
         verification_due: bool = False,
         finalization_mode: bool = False,
         reconciliation_mode: bool = False,
+        deadline_sequence: TerminalDeadlineSequence | None = None,
         required_requirements: tuple[TerminalRequirement, ...],
     ) -> None:
         if session.verified_checkpoint is not None:
@@ -1830,6 +2474,71 @@ class TerminalSequentialPlanner:
                 field="decision",
                 rejected_value="execute",
                 expected="complete",
+            )
+        fresh_remaining = self._remaining_wall_clock_seconds(session)
+        fresh_finalization = bool(
+            self._uses_deadline_slots
+            and fresh_remaining is not None
+            and (
+                finalization_mode
+                or fresh_remaining
+                <= self._effective_finalization_threshold_seconds()
+            )
+        )
+        effective_sequence = deadline_sequence
+        if effective_sequence is None and fresh_finalization:
+            if reconciliation_mode:
+                effective_sequence = (
+                    TerminalDeadlineSequence.RECONCILE_THEN_VERIFY
+                    if _current_generation_has_successful_work(session)
+                    else TerminalDeadlineSequence.RECONCILE_THEN_WORK_VERIFY
+                )
+            else:
+                effective_sequence = (
+                    TerminalDeadlineSequence.DIRECT_VERIFY
+                    if intent.command_role is TerminalCommandRole.VERIFY
+                    else TerminalDeadlineSequence.WORK_THEN_VERIFY
+                )
+        expected_role = {
+            TerminalDeadlineSequence.RECONCILE_THEN_WORK_VERIFY: (
+                TerminalCommandRole.INSPECT
+            ),
+            TerminalDeadlineSequence.RECONCILE_THEN_VERIFY: (
+                TerminalCommandRole.INSPECT
+            ),
+            TerminalDeadlineSequence.WORK_THEN_VERIFY: TerminalCommandRole.WORK,
+            TerminalDeadlineSequence.DIRECT_VERIFY: TerminalCommandRole.VERIFY,
+        }.get(effective_sequence)
+        if (
+            expected_role is not None
+            and intent.command_role is not expected_role
+            and not (
+                fresh_finalization
+                and not reconciliation_mode
+                and intent.command_role is TerminalCommandRole.INSPECT
+            )
+        ):
+            raise _TerminalProposalValidationError(
+                code="terminal.deadline.sequence_role_mismatch",
+                message="command role does not match the admitted deadline sequence",
+                field="command_role",
+                rejected_value=intent.command_role.value,
+                expected=expected_role.value,
+            )
+        if (
+            fresh_finalization
+            and not reconciliation_mode
+            and intent.command_role is TerminalCommandRole.INSPECT
+        ):
+            raise _TerminalProposalValidationError(
+                code="terminal.finalization.inspect_disallowed",
+                message=(
+                    "inspection no longer fits before the reserved work and "
+                    "verification sequence"
+                ),
+                field="command_role",
+                rejected_value=intent.command_role.value,
+                expected="work or verify",
             )
         if len(intent.command) > self._policy.max_command_characters:
             raise _TerminalProposalValidationError(
@@ -1885,7 +2594,11 @@ class TerminalSequentialPlanner:
                         "when the prior process is stopped and state is known"
                     ),
                 )
-        if repair_mode and intent.command_role is not TerminalCommandRole.WORK:
+        if (
+            repair_mode
+            and not reconciliation_mode
+            and intent.command_role is not TerminalCommandRole.WORK
+        ):
             raise _TerminalProposalValidationError(
                 code="terminal.verification.repair_required",
                 message=(
@@ -1898,6 +2611,7 @@ class TerminalSequentialPlanner:
             )
         if (
             verification_due
+            and not reconciliation_mode
             and intent.command_role is not TerminalCommandRole.VERIFY
         ):
             raise _TerminalProposalValidationError(
@@ -1922,6 +2636,20 @@ class TerminalSequentialPlanner:
                 rejected_value=intent.command_role.value,
                 expected="work or verify",
             )
+        if (
+            intent.command_role is TerminalCommandRole.VERIFY
+            and not _current_generation_has_successful_work(session)
+        ):
+            raise _TerminalProposalValidationError(
+                code="terminal.verification.no_current_generation_work",
+                message=(
+                    "direct verification requires valid successful work in "
+                    "the current task generation"
+                ),
+                field="command_role",
+                rejected_value=intent.command_role.value,
+                expected="work before verify",
+            )
         if intent.timeout_sec > self._policy.max_timeout_sec:
             raise _TerminalProposalValidationError(
                 code="terminal.timeout.above_maximum",
@@ -1931,7 +2659,7 @@ class TerminalSequentialPlanner:
                 expected=f"an integer from 1 through {self._policy.max_timeout_sec}",
             )
         if (
-            finalization_mode
+            effective_sequence is TerminalDeadlineSequence.WORK_THEN_VERIFY
             and intent.command_role is TerminalCommandRole.WORK
             and intent.timeout_sec
             > min(
@@ -1947,6 +2675,25 @@ class TerminalSequentialPlanner:
                 expected=(
                     "an integer from 1 through "
                     f"{min(self._policy.max_timeout_sec, self._policy.final_repair_timeout_sec)}"
+                ),
+            )
+        if (
+            effective_sequence
+            in {
+                TerminalDeadlineSequence.RECONCILE_THEN_WORK_VERIFY,
+                TerminalDeadlineSequence.RECONCILE_THEN_VERIFY,
+            }
+            and intent.command_role is TerminalCommandRole.INSPECT
+            and intent.timeout_sec > self._policy.final_repair_timeout_sec
+        ):
+            raise _TerminalProposalValidationError(
+                code="terminal.reconciliation.timeout_above_maximum",
+                message="reconciliation inspection exceeds its bounded slot",
+                field="timeout_sec",
+                rejected_value=intent.timeout_sec,
+                expected=(
+                    "an integer from 1 through "
+                    f"{self._policy.final_repair_timeout_sec}"
                 ),
             )
         if (
@@ -1969,6 +2716,8 @@ class TerminalSequentialPlanner:
         deadline_timeout_sec = self._deadline_timeout_limit(
             session,
             command_role=intent.command_role,
+            finalization_mode=finalization_mode,
+            deadline_sequence=effective_sequence,
         )
         if (
             deadline_timeout_sec is not None
@@ -2198,13 +2947,23 @@ class TerminalSequentialPlanner:
 
 _SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?。！？])\s+(?=[A-Z0-9`/])")
 _LIST_ITEM = re.compile(r"^\s*(?:[-*+]\s+|[0-9]+[.)]\s+)")
+_MARKDOWN_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
+_REQUIREMENT_SECTION_KINDS = {
+    "must achieve": TerminalRequirementKind.ACHIEVE,
+    "must produce": TerminalRequirementKind.PRODUCE,
+    "must preserve": TerminalRequirementKind.PRESERVE,
+    "must not do": TerminalRequirementKind.PROHIBIT,
+    "thresholds": TerminalRequirementKind.THRESHOLD,
+}
 
 
 def _task_requirements(instruction: str) -> tuple[TerminalRequirement, ...]:
-    """Derive stable requirement IDs without delegating coverage to the model."""
+    """Derive stable requirement IDs and conservatively classify explicit sections."""
 
-    units: list[str] = []
+    units: list[tuple[str, TerminalRequirementKind, str | None]] = []
     paragraph_lines: list[str] = []
+    current_kind = TerminalRequirementKind.UNCLASSIFIED
+    current_section: str | None = None
 
     def flush() -> None:
         if not paragraph_lines:
@@ -2214,7 +2973,9 @@ def _task_requirements(instruction: str) -> tuple[TerminalRequirement, ...]:
         for sentence in _SENTENCE_BOUNDARY.split(paragraph):
             normalized = " ".join(sentence.split())
             if normalized:
-                units.append(normalized[:2000])
+                units.append(
+                    (normalized[:2000], current_kind, current_section)
+                )
 
     for raw_line in instruction.replace("\r\n", "\n").split("\n"):
         stripped = raw_line.strip()
@@ -2226,19 +2987,43 @@ def _task_requirements(instruction: str) -> tuple[TerminalRequirement, ...]:
             paragraph_lines.append(_LIST_ITEM.sub("", raw_line, count=1))
             flush()
             continue
+        heading_match = _MARKDOWN_HEADING.match(raw_line)
+        if heading_match is not None:
+            flush()
+            section = heading_match.group(1).strip().rstrip(":").strip()
+            current_kind = _REQUIREMENT_SECTION_KINDS.get(
+                section.casefold(),
+                TerminalRequirementKind.UNCLASSIFIED,
+            )
+            current_section = (
+                section
+                if current_kind is not TerminalRequirementKind.UNCLASSIFIED
+                else None
+            )
+            continue
         if stripped.startswith("#"):
             flush()
+            current_kind = TerminalRequirementKind.UNCLASSIFIED
+            current_section = None
             continue
         paragraph_lines.append(stripped)
     flush()
     if not units:
-        units.append("Complete the task exactly as instructed.")
+        units.append(
+            (
+                "Complete the task exactly as instructed.",
+                TerminalRequirementKind.UNCLASSIFIED,
+                None,
+            )
+        )
     return tuple(
         TerminalRequirement(
             requirement_id=f"req-{index:03d}",
-            description=unit,
+            description=description,
+            kind=kind,
+            source_section=source_section,
         )
-        for index, unit in enumerate(units, start=1)
+        for index, (description, kind, source_section) in enumerate(units, start=1)
     )
 
 

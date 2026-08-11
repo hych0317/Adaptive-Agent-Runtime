@@ -104,6 +104,14 @@ class ToolExecutionStatus(StrEnum):
     POLICY_REJECTED = "policy_rejected"
 
 
+class ToolProviderOutcome(StrEnum):
+    """Provider-declared result before retry and execution aggregation."""
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+
+
 class RetryStatus(StrEnum):
     NOT_RETRIED = "not_retried"
     SUCCEEDED_AFTER_RETRY = "succeeded_after_retry"
@@ -224,14 +232,14 @@ class ToolInvocation(ToolModel):
 
 
 class ToolProviderResult(ToolModel):
-    succeeded: bool
+    outcome: ToolProviderOutcome
     output: ImmutableJsonValue = None
     error: str | None = None
     retryable: bool = True
 
     @model_validator(mode="after")
     def validate_result(self) -> ToolProviderResult:
-        if self.succeeded:
+        if self.outcome is ToolProviderOutcome.SUCCEEDED:
             if self.error is not None:
                 raise ValueError("successful provider result cannot contain an error")
             if self.retryable:
@@ -240,9 +248,21 @@ class ToolProviderResult(ToolModel):
             raise ValueError("failed provider result requires an error")
         return self
 
+    @property
+    def succeeded(self) -> bool:
+        return self.outcome is ToolProviderOutcome.SUCCEEDED
+
+    @property
+    def timed_out(self) -> bool:
+        return self.outcome is ToolProviderOutcome.TIMED_OUT
+
     @classmethod
     def ok(cls, *, output: JsonValue = None) -> ToolProviderResult:
-        return cls(succeeded=True, output=output, retryable=False)
+        return cls(
+            outcome=ToolProviderOutcome.SUCCEEDED,
+            output=output,
+            retryable=False,
+        )
 
     @classmethod
     def failed(
@@ -251,7 +271,24 @@ class ToolProviderResult(ToolModel):
         error: str,
         retryable: bool = True,
     ) -> ToolProviderResult:
-        return cls(succeeded=False, error=error, retryable=retryable)
+        return cls(
+            outcome=ToolProviderOutcome.FAILED,
+            error=error,
+            retryable=retryable,
+        )
+
+    @classmethod
+    def timed_out_result(
+        cls,
+        *,
+        error: str,
+        retryable: bool = True,
+    ) -> ToolProviderResult:
+        return cls(
+            outcome=ToolProviderOutcome.TIMED_OUT,
+            error=error,
+            retryable=retryable,
+        )
 
 
 class ToolAttempt(ToolModel):

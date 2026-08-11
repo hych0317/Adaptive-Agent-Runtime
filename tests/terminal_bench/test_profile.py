@@ -286,6 +286,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             environment = FakeTerminalEnvironment(
                 completed_result(return_code=7, stderr="not found"),
                 completed_result(stdout="handled"),
+                completed_result(stdout="handled"),
             )
             app = build_terminal_application(
                 trial_id="trial-nonzero",
@@ -293,7 +294,14 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 environment=environment,
                 proposal_capability=ScriptedTerminalTurnCapability(
                     execute_draft("test -f /app/missing"),
-                    verify_draft("test ! -f /app/missing"),
+                    execute_draft(
+                        "test ! -f /app/missing",
+                        call_key="work-2",
+                    ),
+                    verify_draft(
+                        "test ! -f /app/missing",
+                        call_key="verification-1",
+                    ),
                     complete_draft("handled nonzero"),
                 ),
             )
@@ -312,10 +320,12 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 trial_id="trial-no-progress-termination",
                 logs_dir=directory,
                 environment=FakeTerminalEnvironment(
+                    completed_result(return_code=1, stderr="unchanged"),
                     completed_result(return_code=1, stderr="unchanged")
                 ),
                 proposal_capability=ScriptedTerminalTurnCapability(
-                    execute_draft("false")
+                    execute_draft("false", call_key="failure-1"),
+                    execute_draft("false", call_key="failure-2"),
                 ),
                 policy=TerminalExecutionPolicy(
                     max_no_progress_steps=1,
@@ -329,10 +339,17 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     artifacts.runtime_result.final_state.status,
                     RunStatus.TERMINATED,
                 )
-                self.assertEqual(artifacts.summary.command_count, 1)
+                self.assertEqual(artifacts.summary.command_count, 2)
                 self.assertTrue(artifacts.summary.trace_consistent)
                 self.assertIsNone(app.journal.pending())
-                self.assertEqual(len(app.journal.records()), 1)
+                records = app.journal.records()
+                self.assertEqual(len(records), 2)
+                self.assertEqual(records[-1].result.return_code, 1)
+                self.assertEqual(records[-1].result.stderr, "unchanged")
+                self.assertEqual(
+                    records[-1].action_id,
+                    artifacts.runtime_result.final_state.last_observation.action_id,
+                )
             finally:
                 app.close()
 

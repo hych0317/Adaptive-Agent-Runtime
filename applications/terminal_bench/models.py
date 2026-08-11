@@ -14,6 +14,8 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validato
 from adaptive_agent_runtime.core import ActionRequest
 from adaptive_agent_runtime.llm import InferenceUsage
 
+from applications.terminal_bench.deadline import TerminalDeadlineSequence
+
 
 AAR_TERMINAL_SEQUENTIAL_PROFILE = "AAR Terminal Sequential Profile"
 TERMINAL_COMMAND_ACTION = "terminal.command"
@@ -107,11 +109,87 @@ class TerminalVerificationDimension(StrEnum):
     END_TO_END = "end_to_end"
 
 
+class TerminalRequirementKind(StrEnum):
+    """Conservative classification derived only from explicit task sections."""
+
+    ACHIEVE = "achieve"
+    PRODUCE = "produce"
+    PRESERVE = "preserve"
+    PROHIBIT = "prohibit"
+    THRESHOLD = "threshold"
+    UNCLASSIFIED = "unclassified"
+
+
+class TerminalRequirementState(StrEnum):
+    """Shadow evidence state; it is not an execution authorization."""
+
+    UNKNOWN = "unknown"
+    VERIFIED = "verified"
+    BLOCKED = "blocked"
+
+
 class TerminalRequirement(TerminalModel):
     """One stable, Runtime-derived verification requirement."""
 
     requirement_id: str = Field(pattern=r"^req-[0-9]{3,}$")
     description: str = Field(min_length=1, max_length=2000)
+    kind: TerminalRequirementKind = TerminalRequirementKind.UNCLASSIFIED
+    source_section: str | None = Field(default=None, min_length=1, max_length=256)
+
+
+class TerminalRequirementLedgerEntry(TerminalModel):
+    requirement_id: str = Field(pattern=r"^req-[0-9]{3,}$")
+    state: TerminalRequirementState = TerminalRequirementState.UNKNOWN
+    latest_evidence_action_id: UUID | None = None
+    latest_result_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    evidence_generation: int | None = Field(default=None, ge=0)
+
+
+class TerminalTaskContract(TerminalModel):
+    """Immutable task contract persisted once at trial start."""
+
+    contract_version: str = Field(default="1", min_length=1, max_length=32)
+    contract_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    requirements: tuple[TerminalRequirement, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_contract(self) -> TerminalTaskContract:
+        requirement_ids = tuple(
+            item.requirement_id for item in self.requirements
+        )
+        if len(set(requirement_ids)) != len(requirement_ids):
+            raise ValueError("task contract requirement IDs must be unique")
+        expected_fingerprint = terminal_fingerprint(
+            {
+                "contract_version": self.contract_version,
+                "requirements": [
+                    item.model_dump(mode="json")
+                    for item in self.requirements
+                ],
+            }
+        )
+        if self.contract_fingerprint != expected_fingerprint:
+            raise ValueError("task contract fingerprint does not match requirements")
+        return self
+
+
+class TerminalTaskLedger(TerminalModel):
+    """Compact, journal-persisted shadow view of requirement evidence."""
+
+    contract_version: str = Field(default="1", min_length=1, max_length=32)
+    contract_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    generation: int = Field(default=0, ge=0)
+    entries: tuple[TerminalRequirementLedgerEntry, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_entries(self) -> TerminalTaskLedger:
+        identifiers = tuple(item.requirement_id for item in self.entries)
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("task ledger requirement IDs must be unique")
+        return self
 
 
 class TerminalVerificationContract(TerminalModel):
@@ -159,13 +237,54 @@ class TerminalVerificationContract(TerminalModel):
         return self
 
 
+class TerminalVerificationReceipt(TerminalModel):
+    """Runtime-observed receipt for one committed verification command."""
+
+    action_id: UUID
+    task_generation: int = Field(default=0, ge=0)
+    task_contract_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    verification_contract_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    command_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    result_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    covered_requirement_ids: tuple[str, ...] = Field(min_length=1)
+    execution_state: TerminalExecutionState
+    return_code: int | None = None
+    timed_out: bool = False
+    transport_failed: bool = False
+    passed: bool
+    observed_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def validate_observation(self) -> TerminalVerificationReceipt:
+        if len(set(self.covered_requirement_ids)) != len(
+            self.covered_requirement_ids
+        ):
+            raise ValueError("verification receipt coverage must be unique")
+        expected_pass = bool(
+            self.execution_state is TerminalExecutionState.COMPLETED
+            and self.return_code == 0
+            and not self.timed_out
+            and not self.transport_failed
+        )
+        if self.passed != expected_pass:
+            raise ValueError("verification receipt pass state is inconsistent")
+        return self
+
+
 class TerminalExecutionLimits(TerminalModel):
     default_timeout_sec: int = Field(default=120, ge=1)
     max_timeout_sec: int = Field(default=300, ge=1)
+    max_work_timeout_sec: int = Field(default=60, ge=1)
     max_verification_timeout_sec: int = Field(default=120, ge=1)
+    max_inspection_timeout_sec: int | None = Field(default=None, ge=1)
+    deadline_sequence: TerminalDeadlineSequence | None = None
+    max_inference_timeout_sec: float | None = Field(default=None, ge=0.0)
     final_repair_timeout_sec: int = Field(default=60, ge=1)
     cleanup_grace_seconds: float = Field(default=10.0, ge=0.0)
     timeout_admission_margin_seconds: float = Field(default=8.0, ge=0.0)
+    followup_inference_reserve_seconds: float = Field(default=0.0, ge=0.0)
+    verification_reserve_seconds: float = Field(default=0.0, ge=0.0)
+    deadline_cleanup_reserve_seconds: float = Field(default=0.0, ge=0.0)
     max_command_characters: int = Field(default=20_000, ge=1)
     max_environment_variables: int = Field(default=64, ge=0)
     max_environment_value_characters: int = Field(default=4096, ge=1)
@@ -178,6 +297,13 @@ class TerminalExecutionLimits(TerminalModel):
             raise ValueError(
                 "verification timeout cannot exceed maximum timeout"
             )
+        if self.max_work_timeout_sec > self.max_timeout_sec:
+            raise ValueError("work timeout cannot exceed maximum timeout")
+        if (
+            self.max_inspection_timeout_sec is not None
+            and self.max_inspection_timeout_sec > self.max_timeout_sec
+        ):
+            raise ValueError("inspection timeout cannot exceed maximum timeout")
         if self.final_repair_timeout_sec > self.max_timeout_sec:
             raise ValueError(
                 "final repair timeout cannot exceed maximum timeout"
@@ -220,10 +346,33 @@ class TerminalProposalRejection(TerminalModel):
 
 class TerminalVerifiedCheckpoint(TerminalModel):
     action_id: UUID
+    task_generation: int = Field(default=0, ge=0)
     call_key: str = Field(min_length=1, max_length=256)
     command_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     verification: TerminalVerificationContract
+    receipt: TerminalVerificationReceipt | None = None
     committed_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def validate_receipt(self) -> TerminalVerifiedCheckpoint:
+        if self.receipt is not None:
+            if self.receipt.action_id != self.action_id:
+                raise ValueError("checkpoint receipt action does not match")
+            if self.receipt.task_generation != self.task_generation:
+                raise ValueError("checkpoint receipt generation does not match")
+            if self.receipt.command_fingerprint != self.command_fingerprint:
+                raise ValueError("checkpoint receipt command does not match")
+            if self.receipt.verification_contract_fingerprint != terminal_fingerprint(
+                self.verification
+            ):
+                raise ValueError("checkpoint receipt verification does not match")
+            if self.receipt.covered_requirement_ids != (
+                self.verification.requirement_coverage
+            ):
+                raise ValueError("checkpoint receipt coverage does not match")
+            if not self.receipt.passed:
+                raise ValueError("checkpoint receipt must represent a pass")
+        return self
 
 
 class TerminalProcessReference(TerminalModel):
@@ -270,6 +419,22 @@ class TerminalExecResult(TerminalModel):
     @property
     def command_completed(self) -> bool:
         return self.execution_state is TerminalExecutionState.COMPLETED
+
+    @property
+    def settled(self) -> bool:
+        """Whether execution has a known final status without Runtime failure."""
+
+        return bool(
+            self.execution_state is TerminalExecutionState.COMPLETED
+            and not self.timed_out
+            and not self.transport_failed
+        )
+
+    @property
+    def succeeded(self) -> bool:
+        """Whether the command settled and returned a successful exit status."""
+
+        return bool(self.settled and self.return_code == 0)
 
 
 class TerminalExecutionPolicy(TerminalModel):
@@ -345,13 +510,57 @@ class TerminalSessionSnapshot(TerminalModel):
     inspection_commands: int = Field(default=0, ge=0)
     failed_verification_attempts: int = Field(default=0, ge=0)
     verification_corrections: int = Field(default=0, ge=0)
+    task_generation: int = Field(default=0, ge=0)
+    successful_work_generation: int | None = Field(default=None, ge=0)
+    pending_repair_receipt_id: UUID | None = None
+    repair_applied_action_id: UUID | None = None
     latest_failure_signatures: tuple[str, ...] = ()
     started_at: AwareDatetime = Field(default_factory=utc_now)
+    task_ledger: TerminalTaskLedger | None = None
+    latest_verification_receipt: TerminalVerificationReceipt | None = None
     verified_checkpoint: TerminalVerifiedCheckpoint | None = None
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     total_tokens: int = Field(default=0, ge=0)
     cost_usd: float = Field(default=0.0, ge=0.0)
+
+    @model_validator(mode="after")
+    def validate_verification_state(self) -> TerminalSessionSnapshot:
+        receipt = self.latest_verification_receipt
+        ledger = self.task_ledger
+        checkpoint = self.verified_checkpoint
+        if ledger is not None and ledger.generation != self.task_generation:
+            raise ValueError("task ledger generation does not match session")
+        if (
+            self.successful_work_generation is not None
+            and self.successful_work_generation != self.task_generation
+        ):
+            raise ValueError("successful work must belong to current generation")
+        if (
+            self.repair_applied_action_id is not None
+            and self.pending_repair_receipt_id is None
+        ):
+            raise ValueError("applied repair requires a pending repair receipt")
+        if self.pending_repair_receipt_id is not None:
+            if (
+                receipt is not None
+                and receipt.action_id == self.pending_repair_receipt_id
+                and receipt.passed
+            ):
+                raise ValueError("a passed receipt cannot remain pending repair")
+        if receipt is not None:
+            if ledger is None:
+                raise ValueError("verification receipt requires a task ledger")
+            if receipt.task_contract_fingerprint != ledger.contract_fingerprint:
+                raise ValueError("verification receipt task contract does not match")
+        if checkpoint is not None and checkpoint.receipt is not None:
+            if checkpoint.task_generation != self.task_generation:
+                raise ValueError("checkpoint generation does not match session")
+            if receipt != checkpoint.receipt:
+                raise ValueError(
+                    "checkpoint receipt must equal the latest verification receipt"
+                )
+        return self
 
 
 class TerminalHistoryItem(TerminalModel):

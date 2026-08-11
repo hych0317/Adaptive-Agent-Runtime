@@ -11,9 +11,12 @@ from adaptive_agent_runtime.core import Observation
 from applications.terminal_bench.models import (
     TerminalCommandRecord,
     TerminalExecResult,
+    TerminalExecutionState,
     TerminalPendingCommand,
     TerminalProposalRejection,
+    TerminalRequirement,
     TerminalSessionSnapshot,
+    TerminalTaskContract,
     TerminalTrialSummary,
     TerminalTurnProposal,
     TerminalTurnRequest,
@@ -33,6 +36,81 @@ class TerminalExecutionError(RuntimeError):
         super().__init__(message)
         self.command_started = command_started
         self.timed_out = timed_out
+
+
+_TIMEOUT_MARKERS = (
+    "timed out",
+    "time out",
+    "timeout after",
+    "timeout of",
+    "deadline exceeded",
+    "deadline expired",
+)
+
+
+def terminal_exception_indicates_timeout(exc: BaseException) -> bool:
+    """Recognize structured and wrapped timeout errors at an adapter boundary."""
+
+    for current in _exception_chain(exc):
+        if bool(getattr(current, "timed_out", False)):
+            return True
+        if isinstance(current, TimeoutError):
+            return True
+        class_name = current.__class__.__name__.lower().replace("_", "")
+        if "timeout" in class_name or "timedout" in class_name:
+            return True
+        detail = (str(current) or current.__class__.__name__).lower()
+        if any(marker in detail for marker in _TIMEOUT_MARKERS):
+            return True
+    return False
+
+
+def terminal_exception_outcome(
+    exc: BaseException,
+) -> tuple[TerminalExecutionState, bool]:
+    """Return execution certainty and a non-contradictory timeout flag."""
+
+    command_started: bool | None = None
+    for current in _exception_chain(exc):
+        candidate = getattr(current, "command_started", None)
+        if isinstance(candidate, bool):
+            command_started = candidate
+            break
+    state = (
+        TerminalExecutionState.FAILED_TO_START
+        if command_started is False
+        else TerminalExecutionState.IN_DOUBT
+    )
+    timed_out = bool(
+        state is TerminalExecutionState.IN_DOUBT
+        and terminal_exception_indicates_timeout(exc)
+    )
+    return state, timed_out
+
+
+def _exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
+    pending = [exc]
+    values: list[BaseException] = []
+    seen: set[int] = set()
+    while pending and len(values) < 16:
+        current = pending.pop(0)
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        values.append(current)
+        cause = current.__cause__
+        context = current.__context__
+        if cause is not None:
+            pending.append(cause)
+        elif context is not None and not current.__suppress_context__:
+            pending.append(context)
+        nested = getattr(current, "exceptions", ())
+        if isinstance(nested, tuple):
+            pending.extend(
+                item for item in nested if isinstance(item, BaseException)
+            )
+    return tuple(values)
 
 
 @runtime_checkable
@@ -63,6 +141,13 @@ class TerminalTrialJournal(Protocol):
     def trial_id(self) -> str: ...
 
     def snapshot(self) -> TerminalSessionSnapshot: ...
+
+    def bind_task_contract(
+        self,
+        requirements: tuple[TerminalRequirement, ...],
+    ) -> None: ...
+
+    def task_contract(self) -> TerminalTaskContract | None: ...
 
     def recent_records(self, limit: int) -> tuple[TerminalCommandRecord, ...]: ...
 

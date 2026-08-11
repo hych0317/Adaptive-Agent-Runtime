@@ -30,6 +30,7 @@ from adaptive_agent_runtime.tool_ecosystem.models import (
     ToolExecutionStatus,
     ToolInvocation,
     ToolObservation,
+    ToolProviderOutcome,
     ToolProviderResult,
     ToolTraceEntry,
     ToolTraceEvent,
@@ -211,7 +212,7 @@ class ManagedToolExecutor:
             )
             if not isinstance(result, ToolProviderResult):
                 raise TypeError("provider must return ToolProviderResult")
-            if result.succeeded:
+            if result.outcome is ToolProviderOutcome.SUCCEEDED:
                 return ToolAttempt(
                     attempt_number=attempt_number,
                     status=ToolAttemptStatus.SUCCEEDED,
@@ -221,9 +222,14 @@ class ManagedToolExecutor:
                 )
             return ToolAttempt(
                 attempt_number=attempt_number,
-                status=ToolAttemptStatus.FAILED,
+                status=(
+                    ToolAttemptStatus.TIMED_OUT
+                    if result.outcome is ToolProviderOutcome.TIMED_OUT
+                    else ToolAttemptStatus.FAILED
+                ),
                 started_at=started_at,
                 completed_at=utc_now(),
+                output=result.output,
                 error=result.error,
                 retryable=result.retryable,
             )
