@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "source_references": {
+    "baseline": {
+      "commit": "f1d38cbfde54146aef9344c691bed55235a35f76",
+      "job": "aar-tb21-core48-deadlinefix-terra-high-20260810-run1"
+    },
+    "candidate": {
+      "commit": "3db388ba0abc92154e98696c0db6c9cb44be5ebb",
+      "job": "aar-tb21-regression12-advisory-terra-high-20260812-run1"
+    }
+  },
+  "scenarios": {
+    "build-pmars-reconciliation-window": {
+      "source_task": "build-pmars",
+      "instruction": "Recover a bounded source build after an uncertain package operation.",
+      "elapsed_seconds": 609.0,
+      "remaining_seconds": 231.0,
+      "committed_commands": 6,
+      "task_generation": 1,
+      "reconciliation_rejections": 1,
+      "minimum_useful_emergency_inference_seconds": 45.0,
+      "expected_next_role": "inspect",
+      "expected_outcome": "execute"
+    },
+    "failed-verify-targeted-repair": {
+      "source_task": "fix-code-vulnerability",
+      "instruction": "Repair every explicitly observed verification failure before another check.",
+      "elapsed_seconds": 400.0,
+      "committed_commands": 3,
+      "task_generation": 1,
+      "failed_verification_attempts": 1,
+      "expected_sequence": "work_then_verify",
+      "expected_next_role": "work",
+      "expected_outcome": "execute"
+    },
+    "cancel-cleanup-coverage": {
+      "source_task": "cancel-async-tasks",
+      "instruction": "Implement an async API with bounded concurrency where cancellation must run every started task's cleanup code.",
+      "expected_hint_terms": [
+        "cancellation",
+        "cleanup"
+      ]
+    },
+    "public-api-signature-coverage": {
+      "source_task": "headless-terminal",
+      "instruction": "Implement a public send_keystrokes API whose wait_sec argument controls the post-input wait.",
+      "expected_hint_terms": [
+        "public api",
+        "signature"
+      ]
+    },
+    "exact-output-control": {
+      "source_task": "regex-log",
+      "instruction": "Create one artifact whose exact output format is independently verified.",
+      "expected_outcome": "success_locked",
+      "expected_commands": 2
+    },
+    "multi-consumer-control": {
+      "source_task": "polyglot-rust-c",
+      "instruction": "Create one source artifact that works with two independent consumers.",
+      "expected_outcome": "success_locked",
+      "expected_commands": 2
+    },
+    "immutable-host-path": {
+      "instruction": "Create one task-container artifact without using host inference paths.",
+      "expected_outcome": "fail",
+      "expected_commands": 0
+    }
+  }
+}
