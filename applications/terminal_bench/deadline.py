@@ -403,11 +403,13 @@ def allocate_profiled_terminal_deadline_sequence(
     """Continuously allocate one profile sequence and degrade if necessary.
 
     Future phases receive at least their minimum before the current turn may
-    grow. Between the aggregate minimum and preferred totals every phase is
-    interpolated by the same factor. Above preferred, surplus grows the
-    current action first and then current inference, without exceeding either
-    maximum. If the complete sequence does not fit, only the current legal
-    phase is considered and the Planner will select the next path after it.
+    grow. Once every minimum fits, the current inference and action grow
+    continuously to preferred before future phases receive preferred-time
+    growth. This keeps future minima intact without starving the only turn
+    that can make progress now. Above preferred, surplus grows the current
+    action first and then current inference, without exceeding either maximum.
+    If the complete sequence does not fit, only the current legal phase is
+    considered and the Planner will select the next path after it.
     """
 
     _require_nonnegative("cleanup_seconds", cleanup_seconds)
@@ -586,43 +588,56 @@ def _allocate_profiled_stages(
     minimum_total = sum(
         item.band.minimum_seconds + item.overhead_seconds for item in stages
     )
-    preferred_total = sum(
-        item.band.preferred_seconds + item.overhead_seconds for item in stages
-    )
     feasible = usable >= minimum_total
     allocated = [item.band.minimum_seconds for item in stages]
     if feasible:
-        if usable < preferred_total:
-            ratio = (usable - minimum_total) / (
-                preferred_total - minimum_total
-            )
-            allocated = [
-                item.band.minimum_seconds
-                + ratio
-                * (item.band.preferred_seconds - item.band.minimum_seconds)
-                for item in stages
-            ]
-        else:
-            allocated = [item.band.preferred_seconds for item in stages]
-            surplus = usable - preferred_total
-            growth_order = [
-                index
-                for index, item in enumerate(stages)
-                if item.current and item.stage is not TerminalDeadlineStage.INFERENCE
-            ] + [
-                index
-                for index, item in enumerate(stages)
-                if item.current and item.stage is TerminalDeadlineStage.INFERENCE
-            ]
-            for index in growth_order:
-                growth = min(
-                    surplus,
-                    stages[index].band.maximum_seconds - allocated[index],
+        surplus = usable - minimum_total
+        current_indexes = tuple(
+            index for index, item in enumerate(stages) if item.current
+        )
+        future_indexes = tuple(
+            index for index, item in enumerate(stages) if not item.current
+        )
+
+        def grow_together(indexes: tuple[int, ...]) -> None:
+            nonlocal surplus
+            gaps = tuple(
+                max(
+                    0.0,
+                    stages[index].band.preferred_seconds - allocated[index],
                 )
-                allocated[index] += growth
-                surplus -= growth
-                if surplus <= 0.0:
-                    break
+                for index in indexes
+            )
+            total_gap = sum(gaps)
+            if surplus <= 0.0 or total_gap <= 0.0:
+                return
+            growth = min(surplus, total_gap)
+            ratio = growth / total_gap
+            for index, gap in zip(indexes, gaps, strict=True):
+                allocated[index] += ratio * gap
+            surplus -= growth
+
+        grow_together(current_indexes)
+        grow_together(future_indexes)
+
+        growth_order = [
+            index
+            for index, item in enumerate(stages)
+            if item.current and item.stage is not TerminalDeadlineStage.INFERENCE
+        ] + [
+            index
+            for index, item in enumerate(stages)
+            if item.current and item.stage is TerminalDeadlineStage.INFERENCE
+        ]
+        for index in growth_order:
+            growth = min(
+                surplus,
+                stages[index].band.maximum_seconds - allocated[index],
+            )
+            allocated[index] += growth
+            surplus -= growth
+            if surplus <= 0.0:
+                break
 
     stage_allocations = tuple(
         TerminalDeadlineStageAllocation(

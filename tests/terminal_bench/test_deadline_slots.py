@@ -315,6 +315,31 @@ class TerminalProfileDeadlineSlotTests(unittest.TestCase):
         self.assertEqual(action_caps, tuple(sorted(action_caps)))
         self.assertEqual(inference_caps, tuple(sorted(inference_caps)))
 
+    def test_emergency_current_turn_reaches_preferred_before_future_growth(
+        self,
+    ) -> None:
+        slots = allocate_profiled_terminal_deadline_sequence(
+            sequence=(
+                TerminalDeadlineSequence.RECONCILE_THEN_WORK_VERIFY
+            ),
+            remaining_seconds=231.0,
+            profile=_PROFILE,
+            cleanup_seconds=18.0,
+            provider_grace_seconds=10.0,
+            emergency_mode=True,
+        )
+
+        self.assertTrue(slots.feasible)
+        self.assertTrue(slots.complete_sequence_feasible)
+        self.assertEqual(
+            slots.inference_limit_seconds,
+            _PROFILE.emergency_inference.preferred_seconds,
+        )
+        self.assertEqual(
+            slots.action_limit_seconds,
+            int(_PROFILE.reconciliation_inspection.preferred_seconds),
+        )
+
     def test_profile_reserves_future_minimum_and_stage_overheads(self) -> None:
         remaining = 200.0
         slots = allocate_profiled_terminal_deadline_sequence(

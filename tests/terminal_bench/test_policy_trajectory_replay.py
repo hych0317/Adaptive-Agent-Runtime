@@ -166,7 +166,6 @@ class TerminalPolicyTrajectoryReplayTests(unittest.IsolatedAsyncioTestCase):
             max_no_progress_seconds=None,
         )
 
-    @unittest.expectedFailure
     async def test_build_pmars_window_admits_useful_emergency_reconciliation(
         self,
     ) -> None:
