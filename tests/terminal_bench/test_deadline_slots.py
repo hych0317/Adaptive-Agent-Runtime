@@ -421,7 +421,7 @@ class TerminalDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await capability.propose(request)
         self.assertEqual(gateway.calls, 0)
 
-    async def test_production_timing_enters_finalization_without_work(
+    async def test_known_initial_state_prefers_direct_verify_in_finalization(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -445,16 +445,19 @@ class TerminalDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 )
 
                 self.assertTrue(request.finalization_mode)
-                self.assertFalse(request.verification_due)
+                self.assertTrue(request.verification_due)
                 self.assertIs(
                     request.execution_limits.deadline_sequence,
-                    TerminalDeadlineSequence.WORK_THEN_VERIFY,
+                    TerminalDeadlineSequence.DIRECT_VERIFY,
                 )
                 inference_cap = (
                     request.execution_limits.max_inference_timeout_sec or 0.0
                 )
-                self.assertGreaterEqual(inference_cap, 60.0)
-                self.assertLess(inference_cap, 62.0)
+                self.assertGreater(inference_cap, 0.0)
+                self.assertLessEqual(
+                    inference_cap,
+                    _TIMING.compact_preferred_seconds,
+                )
             finally:
                 app.close()
 
@@ -487,6 +490,7 @@ class TerminalDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         "started_at": utc_now() - timedelta(seconds=590),
                         "committed_commands": 2,
                         "task_generation": 1,
+                        "known_state_generation": 1,
                         "successful_work_generation": 1,
                     }
                 )
@@ -517,6 +521,7 @@ class TerminalDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 app.journal._session = app.journal.snapshot().model_copy(
                     update={
                         "in_doubt_reconciliation_required": True,
+                        "known_state_generation": None,
                         "reconciliation_state": (
                             TerminalReconciliationState.REQUIRED
                         ),
@@ -535,7 +540,7 @@ class TerminalDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
-    async def test_fresh_finalization_rejects_stale_inspection_proposal(
+    async def test_fresh_finalization_keeps_inspection_advisory(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -567,17 +572,13 @@ class TerminalDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
 
-                with self.assertRaisesRegex(
-                    ValueError,
-                    "inspection no longer fits",
-                ):
-                    app.runtime._planner._validate_intent(
-                        intent,
-                        session,
-                        finalization_mode=False,
-                        reconciliation_mode=False,
-                        required_requirements=requirements,
-                    )
+                app.runtime._planner._validate_intent(
+                    intent,
+                    session,
+                    finalization_mode=False,
+                    reconciliation_mode=False,
+                    required_requirements=requirements,
+                )
 
                 app.runtime._planner._validate_intent(
                     intent,
@@ -611,6 +612,7 @@ class TerminalDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         "started_at": utc_now() - timedelta(seconds=581),
                         "committed_commands": 1,
                         "task_generation": 2,
+                        "known_state_generation": None,
                         "successful_work_generation": None,
                     }
                 )
