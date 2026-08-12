@@ -11,6 +11,8 @@ from adaptive_agent_runtime.core import Observation
 from applications.terminal_bench.models import (
     TerminalCommandRecord,
     TerminalExecResult,
+    TerminalInferenceAttempt,
+    TerminalInferenceAttemptStats,
     TerminalExecutionState,
     TerminalPendingCommand,
     TerminalProposalRejection,
@@ -173,6 +175,13 @@ class TerminalTrialJournal(Protocol):
     def commit_observation(self, observation: Observation) -> None: ...
 
     def record_usage(self, proposal: TerminalTurnProposal) -> None: ...
+
+    def record_inference_attempt(
+        self,
+        attempt: TerminalInferenceAttempt,
+    ) -> None: ...
+
+    def inference_attempt_stats(self) -> TerminalInferenceAttemptStats: ...
 
     def completion_gate_error(self) -> str | None: ...
 

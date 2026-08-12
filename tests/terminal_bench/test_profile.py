@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from datetime import timedelta
@@ -12,7 +13,12 @@ from adaptive_agent_runtime.core import (
     AgentTask,
     RunStatus,
 )
-from adaptive_agent_runtime.llm import InferenceExecutionBudgetError, InferenceUsage
+from adaptive_agent_runtime.llm import (
+    InferenceBackendError,
+    InferenceExecutionBudgetError,
+    InferenceFailureCode,
+    InferenceUsage,
+)
 from adaptive_agent_runtime.tool_ecosystem.invocation_decision import (
     _validate_arguments,
 )
@@ -28,6 +34,8 @@ from applications.terminal_bench.models import (
     TerminalExecutionPolicy,
     TerminalExecutionState,
     TerminalSessionSnapshot,
+    TerminalInferenceAttemptMode,
+    TerminalInferenceAttemptOutcome,
     TerminalReconciliationState,
     TerminalTimeoutCapReason,
     TerminalTurnDraft,
@@ -74,6 +82,25 @@ class AlwaysTimeoutCapability:
     async def propose(self, request: TerminalTurnRequest) -> TerminalTurnProposal:
         self.requests.append(request)
         raise InferenceExecutionBudgetError("elapsed-time limit 360 seconds")
+
+
+class BackendUnavailableCapability:
+    module_id = "test.terminal_turn.backend_unavailable"
+
+    def __init__(self) -> None:
+        self.requests: list[TerminalTurnRequest] = []
+
+    async def propose(
+        self,
+        request: TerminalTurnRequest,
+    ) -> TerminalTurnProposal:
+        self.requests.append(request)
+        raise InferenceBackendError(
+            "test-target",
+            code=InferenceFailureCode.BACKEND_UNAVAILABLE,
+            message="sensitive endpoint detail must not enter the attempt event",
+            retryable=True,
+        )
 
 
 class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
@@ -1314,6 +1341,38 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(emergency_cap, first_cap)
                 self.assertLessEqual(emergency_cap, 60)
                 self.assertEqual(len(app.journal.records()), 2)
+                self.assertEqual(artifacts.summary.inference_attempt_count, 3)
+                self.assertEqual(artifacts.summary.inference_succeeded_count, 2)
+                self.assertEqual(artifacts.summary.inference_timeout_count, 1)
+                self.assertEqual(
+                    artifacts.summary.inference_transport_failure_count,
+                    0,
+                )
+                transcript = Path(directory) / "aar-transcript.jsonl"
+                attempt_events = [
+                    json.loads(line)
+                    for line in transcript.read_text(encoding="utf-8").splitlines()
+                    if json.loads(line)["kind"] == "inference.attempt"
+                ]
+                self.assertEqual(len(attempt_events), 3)
+                attempts = [item["payload"]["attempt"] for item in attempt_events]
+                self.assertEqual(
+                    attempts[0]["outcome"],
+                    TerminalInferenceAttemptOutcome.TIMED_OUT.value,
+                )
+                self.assertEqual(
+                    attempts[1]["mode"],
+                    TerminalInferenceAttemptMode.EMERGENCY.value,
+                )
+                replayed = JsonlTerminalTrialJournal(
+                    "trial-inference-delivery-retry",
+                    transcript,
+                )
+                self.assertEqual(
+                    replayed.inference_attempt_stats(),
+                    app.journal.inference_attempt_stats(),
+                )
+                self.assertTrue(replayed.trace_consistent)
             finally:
                 app.close()
 
@@ -1340,6 +1399,47 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(capability.requests[1].delivery_mode)
                 self.assertTrue(capability.requests[1].emergency_mode)
                 self.assertTrue(artifacts.summary.trace_consistent)
+                self.assertEqual(artifacts.summary.inference_attempt_count, 2)
+                self.assertEqual(artifacts.summary.inference_timeout_count, 2)
+                self.assertEqual(artifacts.summary.inference_succeeded_count, 0)
+            finally:
+                app.close()
+
+    async def test_inference_transport_failure_is_sanitized_and_counted(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = BackendUnavailableCapability()
+            app = build_terminal_application(
+                trial_id="trial-inference-transport-failure",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(),
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(max_no_progress_seconds=None),
+            )
+            try:
+                artifacts = await app.run("create an artifact")
+                self.assertFalse(artifacts.runtime_result.succeeded)
+                self.assertEqual(len(capability.requests), 1)
+                self.assertEqual(artifacts.summary.inference_attempt_count, 1)
+                self.assertEqual(
+                    artifacts.summary.inference_transport_failure_count,
+                    1,
+                )
+                transcript = Path(directory) / "aar-transcript.jsonl"
+                attempt_events = [
+                    json.loads(line)
+                    for line in transcript.read_text(encoding="utf-8").splitlines()
+                    if json.loads(line)["kind"] == "inference.attempt"
+                ]
+                self.assertEqual(len(attempt_events), 1)
+                attempt_payload = attempt_events[0]["payload"]["attempt"]
+                self.assertEqual(
+                    attempt_payload["outcome"],
+                    TerminalInferenceAttemptOutcome.TRANSPORT_FAILED.value,
+                )
+                serialized = json.dumps(attempt_events[0], sort_keys=True)
+                self.assertNotIn("sensitive endpoint detail", serialized)
             finally:
                 app.close()
 

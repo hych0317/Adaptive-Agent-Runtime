@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import posixpath
 import re
+from asyncio import CancelledError
 from collections.abc import Mapping
 from pathlib import Path
+from time import monotonic
 from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -21,7 +23,9 @@ from adaptive_agent_runtime.core import (
     RunTermination,
 )
 from adaptive_agent_runtime.llm import (
+    InferenceBackendError,
     InferenceCorrelation,
+    InferenceFailureCode,
     InferenceGateway,
     InferenceGatewayPolicy,
     InferenceRequest,
@@ -59,6 +63,10 @@ from applications.terminal_bench.models import (
     TerminalExecutionPolicy,
     TerminalExecutionLimits,
     TerminalExecutionState,
+    TerminalInferenceAttempt,
+    TerminalInferenceAttemptMode,
+    TerminalInferenceAttemptOutcome,
+    TerminalInferenceAttemptStats,
     TerminalPendingCommand,
     TerminalTimeoutCapReason,
     TerminalProposalRejection,
@@ -313,6 +321,7 @@ class JsonlTerminalTrialJournal:
         self._records: list[TerminalCommandRecord] = []
         self._agent_summary: str | None = None
         self._task_contract: TerminalTaskContract | None = None
+        self._inference_attempt_stats = TerminalInferenceAttemptStats()
         self._trace_consistent = True
         self._trace_error: str | None = None
         if self._path is not None:
@@ -662,6 +671,23 @@ class JsonlTerminalTrialJournal:
                 "session": self._session.model_dump(mode="json"),
             },
         )
+
+    def record_inference_attempt(self, attempt: TerminalInferenceAttempt) -> None:
+        stats = _advance_inference_attempt_stats(
+            self._inference_attempt_stats,
+            attempt,
+        )
+        self._inference_attempt_stats = stats
+        self._append(
+            "inference.attempt",
+            {
+                "attempt": attempt.model_dump(mode="json"),
+                "stats": stats.model_dump(mode="json"),
+            },
+        )
+
+    def inference_attempt_stats(self) -> TerminalInferenceAttemptStats:
+        return self._inference_attempt_stats
 
     def completion_gate_error(self) -> str | None:
         if not self._session.contract_coverage_complete:
@@ -1288,6 +1314,19 @@ class JsonlTerminalTrialJournal:
             self._pending = None
         elif kind == "inference.usage":
             self._session = TerminalSessionSnapshot.model_validate(payload["session"])
+        elif kind == "inference.attempt":
+            attempt = TerminalInferenceAttempt.model_validate(payload["attempt"])
+            stats = TerminalInferenceAttemptStats.model_validate(payload["stats"])
+            expected = _advance_inference_attempt_stats(
+                self._inference_attempt_stats,
+                attempt,
+            )
+            if stats != expected:
+                self._trace_consistent = False
+                raise RuntimeError(
+                    "terminal inference attempt aggregate is inconsistent"
+                )
+            self._inference_attempt_stats = stats
         elif kind == "agent.completion_rejected":
             self._session = TerminalSessionSnapshot.model_validate(payload["session"])
         elif kind == "agent.proposal_rejected":
@@ -2118,6 +2157,80 @@ def _terminal_model_payload(request: TerminalTurnRequest) -> dict[str, object]:
     return payload
 
 
+def _advance_inference_attempt_stats(
+    stats: TerminalInferenceAttemptStats,
+    attempt: TerminalInferenceAttempt,
+) -> TerminalInferenceAttemptStats:
+    counters = {
+        TerminalInferenceAttemptOutcome.SUCCEEDED: "succeeded_count",
+        TerminalInferenceAttemptOutcome.BUDGET_REJECTED: (
+            "budget_rejection_count"
+        ),
+        TerminalInferenceAttemptOutcome.TIMED_OUT: "timeout_count",
+        TerminalInferenceAttemptOutcome.TRANSPORT_FAILED: (
+            "transport_failure_count"
+        ),
+        TerminalInferenceAttemptOutcome.BACKEND_FAILED: (
+            "backend_failure_count"
+        ),
+        TerminalInferenceAttemptOutcome.CANCELLED: "cancelled_count",
+    }
+    counter = counters[attempt.outcome]
+    return TerminalInferenceAttemptStats.model_validate(
+        {
+            **stats.model_dump(mode="python"),
+            "attempt_count": stats.attempt_count + 1,
+            counter: getattr(stats, counter) + 1,
+            "elapsed_ms": stats.elapsed_ms + attempt.elapsed_ms,
+        }
+    )
+
+
+def _inference_attempt_mode(
+    request: TerminalTurnRequest,
+) -> TerminalInferenceAttemptMode:
+    if request.emergency_mode:
+        return TerminalInferenceAttemptMode.EMERGENCY
+    if request.reconciliation_mode:
+        return TerminalInferenceAttemptMode.RECONCILIATION
+    if request.repair_mode:
+        return TerminalInferenceAttemptMode.REPAIR
+    if request.verification_due:
+        return TerminalInferenceAttemptMode.VERIFICATION
+    if request.finalization_mode:
+        return TerminalInferenceAttemptMode.FINALIZATION
+    if request.delivery_mode:
+        return TerminalInferenceAttemptMode.DELIVERY
+    return TerminalInferenceAttemptMode.NORMAL
+
+
+def _inference_attempt_outcome(
+    exc: BaseException,
+) -> TerminalInferenceAttemptOutcome:
+    if isinstance(exc, CancelledError):
+        return TerminalInferenceAttemptOutcome.CANCELLED
+    if isinstance(exc, InferenceExecutionBudgetError):
+        reason = exc.reason.casefold()
+        if "elapsed-time limit" in reason or "timed out" in reason:
+            return TerminalInferenceAttemptOutcome.TIMED_OUT
+        return TerminalInferenceAttemptOutcome.BUDGET_REJECTED
+    if isinstance(exc, TimeoutError):
+        return TerminalInferenceAttemptOutcome.TIMED_OUT
+    if isinstance(exc, InferenceBackendError):
+        if exc.code is InferenceFailureCode.TIMEOUT:
+            return TerminalInferenceAttemptOutcome.TIMED_OUT
+        if exc.code in {
+            InferenceFailureCode.BACKEND_UNAVAILABLE,
+            InferenceFailureCode.PROCESS_FAILED,
+            InferenceFailureCode.PROTOCOL_ERROR,
+        }:
+            return TerminalInferenceAttemptOutcome.TRANSPORT_FAILED
+        return TerminalInferenceAttemptOutcome.BACKEND_FAILED
+    if isinstance(exc, (ConnectionError, OSError)):
+        return TerminalInferenceAttemptOutcome.TRANSPORT_FAILED
+    return TerminalInferenceAttemptOutcome.BACKEND_FAILED
+
+
 def _sanitized_rejected_draft(draft: TerminalTurnDraft) -> TerminalRejectedDraft:
     command = draft.command
     return TerminalRejectedDraft(
@@ -2285,6 +2398,39 @@ class TerminalSequentialPlanner:
             ),
         )
 
+    async def _propose_with_observation(
+        self,
+        request: TerminalTurnRequest,
+    ) -> TerminalTurnProposal:
+        started = monotonic()
+        try:
+            proposal = await self._capability.propose(request)
+        except (Exception, CancelledError) as exc:
+            elapsed_ms = max(0, int((monotonic() - started) * 1000))
+            self._journal.record_inference_attempt(
+                TerminalInferenceAttempt(
+                    mode=_inference_attempt_mode(request),
+                    outcome=_inference_attempt_outcome(exc),
+                    advertised_timeout_cap_sec=(
+                        request.execution_limits.max_inference_timeout_sec
+                    ),
+                    elapsed_ms=elapsed_ms,
+                )
+            )
+            raise
+        elapsed_ms = max(0, int((monotonic() - started) * 1000))
+        self._journal.record_inference_attempt(
+            TerminalInferenceAttempt(
+                mode=_inference_attempt_mode(request),
+                outcome=TerminalInferenceAttemptOutcome.SUCCEEDED,
+                advertised_timeout_cap_sec=(
+                    request.execution_limits.max_inference_timeout_sec
+                ),
+                elapsed_ms=elapsed_ms,
+            )
+        )
+        return proposal
+
     async def plan(self, state: AgentState) -> PlanDecision:
         await self.reconcile_observation(state)
         requirements = _task_requirements(state.task.description)
@@ -2397,7 +2543,7 @@ class TerminalSequentialPlanner:
                 )
             )
         try:
-            proposal = await self._capability.propose(request)
+            proposal = await self._propose_with_observation(request)
         except InferenceExecutionBudgetError as exc:
             if request.emergency_mode:
                 submission = self._deadline_submission_decision(
@@ -2443,7 +2589,7 @@ class TerminalSequentialPlanner:
                     "current inference and action do not fit",
                 ) from exc
             try:
-                proposal = await self._capability.propose(retry_request)
+                proposal = await self._propose_with_observation(retry_request)
             except InferenceExecutionBudgetError as retry_exc:
                 submission = self._deadline_submission_decision(
                     context="a second inference attempt",

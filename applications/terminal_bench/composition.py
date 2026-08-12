@@ -363,6 +363,7 @@ class TerminalSequentialApplication:
         )
         completed_at = utc_now()
         session = self.journal.snapshot()
+        inference_stats = self.journal.inference_attempt_stats()
         output = result.final_state.output
         agent_complete = bool(
             result.succeeded
@@ -381,6 +382,20 @@ class TerminalSequentialApplication:
             denial_count=session.denied_commands,
             timeout_count=session.timed_out_commands,
             in_doubt_count=session.in_doubt_commands,
+            inference_attempt_count=inference_stats.attempt_count,
+            inference_succeeded_count=inference_stats.succeeded_count,
+            inference_budget_rejection_count=(
+                inference_stats.budget_rejection_count
+            ),
+            inference_timeout_count=inference_stats.timeout_count,
+            inference_transport_failure_count=(
+                inference_stats.transport_failure_count
+            ),
+            inference_backend_failure_count=(
+                inference_stats.backend_failure_count
+            ),
+            inference_cancelled_count=inference_stats.cancelled_count,
+            inference_attempt_latency_ms=inference_stats.elapsed_ms,
             input_tokens=session.input_tokens,
             output_tokens=session.output_tokens,
             total_tokens=session.total_tokens,

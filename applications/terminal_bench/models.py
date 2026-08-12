@@ -80,6 +80,29 @@ class TerminalTimeoutCapReason(StrEnum):
     LEGACY_UNSPECIFIED = "legacy_unspecified"
 
 
+class TerminalInferenceAttemptMode(StrEnum):
+    """Planner phase attached to one actual proposal capability call."""
+
+    NORMAL = "normal"
+    DELIVERY = "delivery"
+    FINALIZATION = "finalization"
+    RECONCILIATION = "reconciliation"
+    REPAIR = "repair"
+    VERIFICATION = "verification"
+    EMERGENCY = "emergency"
+
+
+class TerminalInferenceAttemptOutcome(StrEnum):
+    """Sanitized outcome of one proposal capability call."""
+
+    SUCCEEDED = "succeeded"
+    BUDGET_REJECTED = "budget_rejected"
+    TIMED_OUT = "timed_out"
+    TRANSPORT_FAILED = "transport_failed"
+    BACKEND_FAILED = "backend_failed"
+    CANCELLED = "cancelled"
+
+
 class TerminalVerificationEvidence(StrEnum):
     OFFICIAL_TESTS = "official_tests"
     INDEPENDENT_CHECK = "independent_check"
@@ -916,6 +939,40 @@ class TerminalTurnProposal(TerminalModel):
     model_id: str | None = Field(default=None, min_length=1)
 
 
+class TerminalInferenceAttempt(TerminalModel):
+    """Bounded audit record for one actual proposal capability call."""
+
+    mode: TerminalInferenceAttemptMode
+    outcome: TerminalInferenceAttemptOutcome
+    advertised_timeout_cap_sec: float | None = Field(default=None, ge=0.0)
+    elapsed_ms: int = Field(ge=0)
+
+
+class TerminalInferenceAttemptStats(TerminalModel):
+    attempt_count: int = Field(default=0, ge=0)
+    succeeded_count: int = Field(default=0, ge=0)
+    budget_rejection_count: int = Field(default=0, ge=0)
+    timeout_count: int = Field(default=0, ge=0)
+    transport_failure_count: int = Field(default=0, ge=0)
+    backend_failure_count: int = Field(default=0, ge=0)
+    cancelled_count: int = Field(default=0, ge=0)
+    elapsed_ms: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_totals(self) -> TerminalInferenceAttemptStats:
+        classified = (
+            self.succeeded_count
+            + self.budget_rejection_count
+            + self.timeout_count
+            + self.transport_failure_count
+            + self.backend_failure_count
+            + self.cancelled_count
+        )
+        if classified != self.attempt_count:
+            raise ValueError("inference attempt outcome counts must equal total")
+        return self
+
+
 class TerminalCommandIntent(TerminalModel):
     """Runtime-resolved, fully explicit command carried by one Core Action."""
 
@@ -1031,6 +1088,14 @@ class TerminalTrialSummary(TerminalModel):
     denial_count: int = Field(ge=0)
     timeout_count: int = Field(ge=0)
     in_doubt_count: int = Field(ge=0)
+    inference_attempt_count: int = Field(default=0, ge=0)
+    inference_succeeded_count: int = Field(default=0, ge=0)
+    inference_budget_rejection_count: int = Field(default=0, ge=0)
+    inference_timeout_count: int = Field(default=0, ge=0)
+    inference_transport_failure_count: int = Field(default=0, ge=0)
+    inference_backend_failure_count: int = Field(default=0, ge=0)
+    inference_cancelled_count: int = Field(default=0, ge=0)
+    inference_attempt_latency_ms: int = Field(default=0, ge=0)
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     total_tokens: int = Field(ge=0)
@@ -1069,6 +1134,14 @@ class TerminalBenchmarkAnalysis(TerminalModel):
     denial_count: int = Field(ge=0)
     timeout_count: int = Field(ge=0)
     in_doubt_count: int = Field(ge=0)
+    inference_attempt_count: int = Field(default=0, ge=0)
+    inference_succeeded_count: int = Field(default=0, ge=0)
+    inference_budget_rejection_count: int = Field(default=0, ge=0)
+    inference_timeout_count: int = Field(default=0, ge=0)
+    inference_transport_failure_count: int = Field(default=0, ge=0)
+    inference_backend_failure_count: int = Field(default=0, ge=0)
+    inference_cancelled_count: int = Field(default=0, ge=0)
+    inference_attempt_latency_ms: int = Field(default=0, ge=0)
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     total_tokens: int = Field(ge=0)

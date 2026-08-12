@@ -37,6 +37,14 @@ def summary(*, agent_complete: bool = True) -> TerminalTrialSummary:
         denial_count=1,
         timeout_count=1,
         in_doubt_count=1,
+        inference_attempt_count=3,
+        inference_succeeded_count=2,
+        inference_budget_rejection_count=0,
+        inference_timeout_count=1,
+        inference_transport_failure_count=0,
+        inference_backend_failure_count=0,
+        inference_cancelled_count=0,
+        inference_attempt_latency_ms=987,
         input_tokens=10,
         output_tokens=4,
         total_tokens=14,
@@ -107,6 +115,32 @@ class HarborAndResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.timed_out)
         self.assertTrue(result.transport_failed)
         self.assertIs(result.execution_state, TerminalExecutionState.IN_DOUBT)
+
+    def test_regression12_manifest_is_fixed_and_unique(self) -> None:
+        manifest = (
+            Path(__file__).parents[2]
+            / "applications"
+            / "terminal_bench"
+            / "evaluation_sets"
+            / "regression12.txt"
+        )
+        tasks = tuple(
+            line.strip()
+            for line in manifest.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+        self.assertEqual(len(tasks), 12)
+        self.assertEqual(len(set(tasks)), 12)
+        self.assertEqual(
+            tasks[-4:],
+            (
+                "terminal-bench/regex-log",
+                "terminal-bench/db-wal-recovery",
+                "terminal-bench/nginx-request-logging",
+                "terminal-bench/prove-plus-comm",
+            ),
+        )
+        self.assertEqual(tasks[0], "terminal-bench/build-pmars")
 
     async def test_agent_context_uses_metadata_for_aar_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -188,6 +222,9 @@ class HarborAndResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(analysis.benchmark_pass)
         self.assertEqual(analysis.total_tokens, 17)
         self.assertEqual(analysis.latency_ms, 2000)
+        self.assertEqual(analysis.inference_attempt_count, 3)
+        self.assertEqual(analysis.inference_timeout_count, 1)
+        self.assertEqual(analysis.inference_attempt_latency_ms, 987)
 
     def test_agent_complete_does_not_count_as_benchmark_pass(self) -> None:
         analysis = TerminalResultAnalyzer().analyze(
@@ -200,6 +237,34 @@ class HarborAndResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(analysis.agent_complete)
         self.assertFalse(analysis.benchmark_pass)
         self.assertFalse(analysis.completion_matches_verifier)
+
+    def test_inference_transport_failure_is_infrastructure(self) -> None:
+        transport_summary = summary().model_copy(
+            update={
+                "runtime_status": "failed",
+                "inference_attempt_count": 1,
+                "inference_succeeded_count": 0,
+                "inference_timeout_count": 0,
+                "inference_transport_failure_count": 1,
+            }
+        )
+        analysis = TerminalResultAnalyzer().analyze(
+            harbor_trial_result={
+                "verifier_result": {"rewards": {"reward": 0}},
+                "agent_result": {},
+            },
+            aar_summary=transport_summary,
+        )
+
+        self.assertTrue(analysis.infrastructure_error)
+        self.assertIs(
+            analysis.outcome,
+            TerminalBenchmarkOutcome.INFRASTRUCTURE_ERROR,
+        )
+        self.assertIn(
+            "inference transport",
+            analysis.infrastructure_error_reason or "",
+        )
 
     def test_verifier_dependency_setup_timeout_is_infrastructure(self) -> None:
         analysis = analyze_verifier_timeout(

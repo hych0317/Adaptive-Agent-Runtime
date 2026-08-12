@@ -1,0 +1,12 @@
+terminal-bench/build-pmars
+terminal-bench/configure-git-webserver
+terminal-bench/fix-code-vulnerability
+terminal-bench/polyglot-rust-c
+terminal-bench/vulnerable-secret
+terminal-bench/cancel-async-tasks
+terminal-bench/headless-terminal
+terminal-bench/build-cython-ext
+terminal-bench/regex-log
+terminal-bench/db-wal-recovery
+terminal-bench/nginx-request-logging
+terminal-bench/prove-plus-comm

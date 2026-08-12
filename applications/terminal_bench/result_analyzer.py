@@ -57,6 +57,7 @@ class TerminalResultAnalyzer:
             trial,
             verifier_reward,
             verifier_text,
+            summary,
             timeout_attribution,
         )
         infrastructure_error = infrastructure_reason is not None
@@ -105,6 +106,20 @@ class TerminalResultAnalyzer:
             denial_count=summary.denial_count,
             timeout_count=summary.timeout_count,
             in_doubt_count=summary.in_doubt_count,
+            inference_attempt_count=summary.inference_attempt_count,
+            inference_succeeded_count=summary.inference_succeeded_count,
+            inference_budget_rejection_count=(
+                summary.inference_budget_rejection_count
+            ),
+            inference_timeout_count=summary.inference_timeout_count,
+            inference_transport_failure_count=(
+                summary.inference_transport_failure_count
+            ),
+            inference_backend_failure_count=(
+                summary.inference_backend_failure_count
+            ),
+            inference_cancelled_count=summary.inference_cancelled_count,
+            inference_attempt_latency_ms=summary.inference_attempt_latency_ms,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
@@ -161,6 +176,7 @@ def _infrastructure_error_reason(
     trial: Mapping[str, Any],
     verifier_reward: float | None,
     verifier_text: str,
+    summary: TerminalTrialSummary,
     timeout_attribution: TerminalVerifierTimeoutAttribution | None,
 ) -> str | None:
     if verifier_reward is not None and verifier_reward > 0.0:
@@ -169,6 +185,13 @@ def _infrastructure_error_reason(
         return (
             "verifier timeout occurred during dependency setup or an "
             "unavailable network path"
+        )
+    if (
+        summary.inference_transport_failure_count > 0
+        and summary.runtime_status != "completed"
+    ):
+        return (
+            "terminal inference transport failed before the Agent completed"
         )
     exception = trial.get("exception_info")
     if isinstance(exception, Mapping):
