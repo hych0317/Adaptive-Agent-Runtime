@@ -36,10 +36,12 @@ from applications.terminal_bench.contracts import (
     TerminalTurnProposalCapability,
 )
 from applications.terminal_bench.deadline import (
+    TerminalDeadlineBudgetProfile,
     TerminalDeadlineSequence,
     TerminalDeadlineSlots,
     TerminalInferenceTiming,
     allocate_deadline_slots,
+    allocate_profiled_terminal_deadline_sequence,
     allocate_terminal_deadline_sequence,
 )
 from applications.terminal_bench.models import (
@@ -1236,6 +1238,7 @@ class GatewayTerminalTurnProposalCapability:
         emergency_timeout_seconds: float = 90.0,
         minimum_timeout_seconds: float = 120.0,
         minimum_delivery_timeout_seconds: float = 60.0,
+        deadline_budget_profile: TerminalDeadlineBudgetProfile | None = None,
     ) -> None:
         self._gateway = gateway
         self._gateway_policy = gateway_policy
@@ -1245,6 +1248,20 @@ class GatewayTerminalTurnProposalCapability:
         self._emergency_max_output_tokens = emergency_max_output_tokens
         self._required_structured_output = required_structured_output
         self._strict_json_schema = strict_json_schema
+        self.deadline_budget_profile = deadline_budget_profile
+        if deadline_budget_profile is not None:
+            delivery_timeout_seconds = (
+                deadline_budget_profile.compact_inference.maximum_seconds
+            )
+            emergency_timeout_seconds = (
+                deadline_budget_profile.emergency_inference.maximum_seconds
+            )
+            minimum_timeout_seconds = (
+                deadline_budget_profile.normal_inference.minimum_seconds
+            )
+            minimum_delivery_timeout_seconds = (
+                deadline_budget_profile.compact_inference.minimum_seconds
+            )
         if delivery_timeout_seconds <= 0:
             raise ValueError("delivery inference timeout must be positive")
         self._delivery_timeout_seconds = delivery_timeout_seconds
@@ -1261,6 +1278,11 @@ class GatewayTerminalTurnProposalCapability:
         self._minimum_delivery_timeout_seconds = (
             minimum_delivery_timeout_seconds
         )
+        self._minimum_emergency_timeout_seconds = (
+            deadline_budget_profile.emergency_inference.minimum_seconds
+            if deadline_budget_profile is not None
+            else minimum_delivery_timeout_seconds
+        )
         if delivery_timeout_seconds < minimum_delivery_timeout_seconds:
             raise ValueError(
                 "delivery inference timeout cannot be below the minimum "
@@ -1274,12 +1296,27 @@ class GatewayTerminalTurnProposalCapability:
         configured_normal_timeout = gateway_policy.budget.max_elapsed_seconds
         self.deadline_timing = TerminalInferenceTiming(
             normal_preferred_seconds=(
-                configured_normal_timeout
-                if configured_normal_timeout is not None
-                else max(delivery_timeout_seconds, minimum_timeout_seconds)
+                deadline_budget_profile.normal_inference.preferred_seconds
+                if deadline_budget_profile is not None
+                else (
+                    configured_normal_timeout
+                    if configured_normal_timeout is not None
+                    else max(
+                        delivery_timeout_seconds,
+                        minimum_timeout_seconds,
+                    )
+                )
             ),
-            compact_preferred_seconds=delivery_timeout_seconds,
-            emergency_preferred_seconds=emergency_timeout_seconds,
+            compact_preferred_seconds=(
+                deadline_budget_profile.compact_inference.preferred_seconds
+                if deadline_budget_profile is not None
+                else delivery_timeout_seconds
+            ),
+            emergency_preferred_seconds=(
+                deadline_budget_profile.emergency_inference.preferred_seconds
+                if deadline_budget_profile is not None
+                else emergency_timeout_seconds
+            ),
             normal_minimum_seconds=minimum_timeout_seconds,
             compact_minimum_seconds=minimum_delivery_timeout_seconds,
         )
@@ -1630,16 +1667,19 @@ class GatewayTerminalTurnProposalCapability:
             )
         effective_timeout = gateway_policy.budget.max_elapsed_seconds
         minimum_timeout = (
-            self._minimum_delivery_timeout_seconds
-            if (
-                request.delivery_mode
-                or request.emergency_mode
-                or request.finalization_mode
-                or request.reconciliation_mode
-                or request.repair_mode
-                or request.verification_due
+            self._minimum_emergency_timeout_seconds
+            if request.emergency_mode
+            else (
+                self._minimum_delivery_timeout_seconds
+                if (
+                    request.delivery_mode
+                    or request.finalization_mode
+                    or request.reconciliation_mode
+                    or request.repair_mode
+                    or request.verification_due
+                )
+                else self._minimum_timeout_seconds
             )
-            else self._minimum_timeout_seconds
         )
         if (
             effective_timeout is not None
@@ -2028,11 +2068,20 @@ class TerminalSequentialPlanner:
         self._capability = capability
         self._journal = journal
         self._policy = policy or TerminalExecutionPolicy()
+        profile = getattr(capability, "deadline_budget_profile", None)
+        self._deadline_budget_profile = (
+            profile
+            if isinstance(profile, TerminalDeadlineBudgetProfile)
+            else None
+        )
         timing = getattr(capability, "deadline_timing", None)
         self._deadline_timing = (
             timing if isinstance(timing, TerminalInferenceTiming) else None
         )
-        self._uses_deadline_slots = self._deadline_timing is not None
+        self._uses_deadline_slots = bool(
+            self._deadline_budget_profile is not None
+            or self._deadline_timing is not None
+        )
 
     async def plan(self, state: AgentState) -> PlanDecision:
         await self.reconcile_observation(state)
@@ -2559,6 +2608,29 @@ class TerminalSequentialPlanner:
                     dynamic_timeout_sec,
                     self._policy.max_verification_timeout_sec,
                 )
+        profile = self._deadline_budget_profile
+        work_role_maximum = (
+            self._policy.final_repair_timeout_sec
+            if deadline_sequence is TerminalDeadlineSequence.WORK_THEN_VERIFY
+            else self._policy.max_timeout_sec
+        )
+        inspection_role_maximum = 30 if reconciliation_mode else 60
+        if profile is not None:
+            work_role_maximum = int(
+                (
+                    profile.final_work
+                    if deadline_sequence
+                    is TerminalDeadlineSequence.WORK_THEN_VERIFY
+                    else profile.normal_work
+                ).maximum_seconds
+            )
+            inspection_role_maximum = int(
+                (
+                    profile.reconciliation_inspection
+                    if reconciliation_mode
+                    else profile.normal_inspection
+                ).maximum_seconds
+            )
         return TerminalTurnRequest(
             run_id=state.run_id,
             task_id=state.task.task_id,
@@ -2577,13 +2649,16 @@ class TerminalSequentialPlanner:
                 max_timeout_sec=dynamic_timeout_sec,
                 max_work_timeout_sec=min(
                     dynamic_timeout_sec,
-                    self._policy.final_repair_timeout_sec,
+                    work_role_maximum,
                 ),
                 max_verification_timeout_sec=(
                     dynamic_verification_timeout_sec
                 ),
                 max_inspection_timeout_sec=(
-                    dynamic_timeout_sec
+                    min(
+                        dynamic_timeout_sec,
+                        inspection_role_maximum,
+                    )
                     if deadline_sequence
                     in {
                         TerminalDeadlineSequence.RECONCILE_THEN_WORK_VERIFY,
@@ -2669,6 +2744,24 @@ class TerminalSequentialPlanner:
         )
 
     def _effective_finalization_threshold_seconds(self) -> float:
+        profile = self._deadline_budget_profile
+        if profile is not None:
+            required = (
+                profile.compact_inference.minimum_seconds
+                + profile.model_cancellation_cleanup_seconds
+                + profile.final_work.minimum_seconds
+                + self._policy.provider_grace_sec
+                + profile.convergence_inference.minimum_seconds
+                + profile.model_cancellation_cleanup_seconds
+                + profile.verification.minimum_seconds
+                + self._policy.provider_grace_sec
+                + self._policy.cleanup_grace_seconds
+                + self._policy.timeout_admission_margin_seconds
+            )
+            return max(
+                self._policy.finalization_mode_threshold_seconds,
+                required,
+            )
         timing = self._deadline_timing
         if timing is None:
             return self._policy.finalization_mode_threshold_seconds
@@ -2701,7 +2794,32 @@ class TerminalSequentialPlanner:
         verification_due: bool = False,
         include_current_inference: bool = True,
         sequence: TerminalDeadlineSequence | None = None,
+        command_role: TerminalCommandRole | None = None,
     ) -> TerminalDeadlineSlots:
+        profile = self._deadline_budget_profile
+        if profile is not None:
+            return allocate_profiled_terminal_deadline_sequence(
+                sequence=sequence,
+                remaining_seconds=remaining_wall_clock_seconds,
+                profile=profile,
+                cleanup_seconds=(
+                    self._policy.cleanup_grace_seconds
+                    + self._policy.timeout_admission_margin_seconds
+                ),
+                provider_grace_seconds=float(self._policy.provider_grace_sec),
+                include_current_inference=include_current_inference,
+                emergency_mode=emergency_mode,
+                compact_mode=bool(
+                    delivery_mode
+                    or finalization_mode
+                    or reconciliation_mode
+                    or repair_mode
+                    or verification_due
+                ),
+                command_role=(
+                    None if command_role is None else command_role.value
+                ),
+            )
         compact = bool(
             delivery_mode
             or emergency_mode
@@ -2839,8 +2957,13 @@ class TerminalSequentialPlanner:
                 ),
                 sequence=effective_sequence,
                 include_current_inference=False,
+                command_role=command_role,
             )
-            return slots.action_limit_seconds or 0
+            return (
+                slots.action_limit_seconds or 0
+                if slots.feasible
+                else 0
+            )
         reserve = (
             self._policy.cleanup_grace_seconds
             + self._policy.timeout_admission_margin_seconds

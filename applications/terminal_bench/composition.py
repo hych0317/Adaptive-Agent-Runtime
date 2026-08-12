@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import monotonic
 from typing import Literal, cast
@@ -65,6 +65,10 @@ from adaptive_agent_runtime.decisioning import DecisionCheckpoint
 from applications.terminal_bench.contracts import (
     TerminalEnvironment,
     TerminalTurnProposalCapability,
+)
+from applications.terminal_bench.deadline import (
+    TerminalDeadlineBudgetProfile,
+    terra_high_deadline_budget_profile,
 )
 from applications.terminal_bench.executor import TerminalActionExecutor
 from applications.terminal_bench.models import (
@@ -305,10 +309,13 @@ class TerminalModelConfig:
     compact_max_output_tokens: int | None = 8192
     emergency_max_output_tokens: int | None = 4096
     inference_timeout_sec: float = 300.0
-    delivery_inference_timeout_sec: float = 180.0
-    emergency_inference_timeout_sec: float = 120.0
-    minimum_inference_timeout_sec: float = 120.0
-    minimum_delivery_inference_timeout_sec: float = 60.0
+    delivery_inference_timeout_sec: float = 120.0
+    emergency_inference_timeout_sec: float = 60.0
+    minimum_inference_timeout_sec: float = 45.0
+    minimum_delivery_inference_timeout_sec: float = 30.0
+    deadline_budget_profile: TerminalDeadlineBudgetProfile = field(
+        default_factory=terra_high_deadline_budget_profile
+    )
     deepseek_reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH
     deepseek_thinking: Literal["enabled", "disabled"] = "enabled"
     codex_executable: str = "codex"
@@ -660,6 +667,7 @@ def build_terminal_model_capability(
         minimum_delivery_timeout_seconds=(
             config.minimum_delivery_inference_timeout_sec
         ),
+        deadline_budget_profile=config.deadline_budget_profile,
     )
     return capability, inference
 

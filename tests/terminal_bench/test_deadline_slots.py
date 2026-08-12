@@ -16,7 +16,9 @@ from applications.terminal_bench.deadline import (
     TerminalDeadlineSequence,
     TerminalInferenceTiming,
     allocate_deadline_slots,
+    allocate_profiled_terminal_deadline_sequence,
     allocate_terminal_deadline_sequence,
+    terra_high_deadline_budget_profile,
 )
 from applications.terminal_bench.models import (
     TerminalCommandIntent,
@@ -47,10 +49,16 @@ _TIMING = TerminalInferenceTiming(
     normal_minimum_seconds=120.0,
     compact_minimum_seconds=60.0,
 )
+_PROFILE = terra_high_deadline_budget_profile()
+
 
 
 class _DeadlineScriptedCapability(ScriptedTerminalTurnCapability):
     deadline_timing = _TIMING
+
+class _ProfiledDeadlineScriptedCapability(ScriptedTerminalTurnCapability):
+    deadline_budget_profile = _PROFILE
+
 
 
 class _NeverCalledGateway:
@@ -278,6 +286,103 @@ class TerminalDeadlineSlotTests(unittest.TestCase):
             preferred_inference_seconds=300.0,
             preferred_action_seconds=120,
             maximum_action_seconds=300,
+        )
+
+        self.assertTrue(slots.feasible)
+        self.assertIsNone(slots.inference_limit_seconds)
+        self.assertIsNone(slots.action_limit_seconds)
+
+
+class TerminalProfileDeadlineSlotTests(unittest.TestCase):
+    def test_profile_sequence_interpolates_continuously(self) -> None:
+        remaining_values = (160.0, 200.0, 240.0)
+        slots = tuple(
+            allocate_profiled_terminal_deadline_sequence(
+                sequence=TerminalDeadlineSequence.WORK_THEN_VERIFY,
+                remaining_seconds=remaining,
+                profile=_PROFILE,
+                cleanup_seconds=18.0,
+                provider_grace_seconds=10.0,
+            )
+            for remaining in remaining_values
+        )
+
+        for item in slots:
+            self.assertTrue(item.feasible)
+            self.assertTrue(item.complete_sequence_feasible)
+        action_caps = tuple(item.action_limit_seconds for item in slots)
+        inference_caps = tuple(item.inference_limit_seconds for item in slots)
+        self.assertEqual(action_caps, tuple(sorted(action_caps)))
+        self.assertEqual(inference_caps, tuple(sorted(inference_caps)))
+
+    def test_profile_reserves_future_minimum_and_stage_overheads(self) -> None:
+        remaining = 200.0
+        slots = allocate_profiled_terminal_deadline_sequence(
+            sequence=TerminalDeadlineSequence.WORK_THEN_VERIFY,
+            remaining_seconds=remaining,
+            profile=_PROFILE,
+            cleanup_seconds=18.0,
+            provider_grace_seconds=10.0,
+        )
+
+        allocated = sum(
+            item.allocated_seconds + item.overhead_seconds
+            for item in slots.stage_allocations
+        )
+        self.assertAlmostEqual(allocated + slots.cleanup_seconds, remaining)
+        for item in slots.stage_allocations:
+            self.assertGreaterEqual(
+                item.allocated_seconds,
+                item.minimum_seconds,
+            )
+
+    def test_profile_degrades_to_current_phase_below_sequence_minimum(
+        self,
+    ) -> None:
+        slots = allocate_profiled_terminal_deadline_sequence(
+            sequence=TerminalDeadlineSequence.WORK_THEN_VERIFY,
+            remaining_seconds=127.0,
+            profile=_PROFILE,
+            cleanup_seconds=18.0,
+            provider_grace_seconds=10.0,
+        )
+
+        self.assertTrue(slots.feasible)
+        self.assertFalse(slots.complete_sequence_feasible)
+        self.assertEqual(
+            tuple(item.current for item in slots.stage_allocations),
+            (True, True),
+        )
+        self.assertEqual(slots.future_reserve_seconds, 18.0)
+
+    def test_profile_ample_budget_restores_long_work_capacity(self) -> None:
+        slots = allocate_profiled_terminal_deadline_sequence(
+            sequence=None,
+            remaining_seconds=840.0,
+            profile=_PROFILE,
+            cleanup_seconds=18.0,
+            provider_grace_seconds=10.0,
+        )
+        inspection = allocate_profiled_terminal_deadline_sequence(
+            sequence=None,
+            remaining_seconds=840.0,
+            profile=_PROFILE,
+            cleanup_seconds=18.0,
+            provider_grace_seconds=10.0,
+            command_role="inspect",
+        )
+
+        self.assertEqual(slots.action_limit_seconds, 300)
+        self.assertEqual(slots.inference_limit_seconds, 300.0)
+        self.assertEqual(inspection.action_limit_seconds, 60)
+
+    def test_profile_no_deadline_preserves_unbounded_compatibility(self) -> None:
+        slots = allocate_profiled_terminal_deadline_sequence(
+            sequence=None,
+            remaining_seconds=None,
+            profile=_PROFILE,
+            cleanup_seconds=18.0,
+            provider_grace_seconds=10.0,
         )
 
         self.assertTrue(slots.feasible)
@@ -519,6 +624,38 @@ class TerminalDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(
                     request.execution_limits.deadline_sequence,
                     TerminalDeadlineSequence.WORK_THEN_VERIFY,
+                )
+            finally:
+                app.close()
+
+    async def test_profiled_request_advertises_full_normal_work_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = build_terminal_application(
+                trial_id="deadline-profile-normal-work",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(),
+                proposal_capability=_ProfiledDeadlineScriptedCapability(),
+                policy=self._deadline_policy(),
+            )
+            try:
+                request = app.runtime._planner._turn_request(
+                    self._state("build a long-running artifact"),
+                    app.journal.snapshot(),
+                )
+
+                self.assertFalse(request.finalization_mode)
+                self.assertEqual(request.execution_limits.max_timeout_sec, 300)
+                self.assertEqual(
+                    request.execution_limits.max_work_timeout_sec,
+                    300,
+                )
+                self.assertEqual(
+                    request.execution_limits.max_inspection_timeout_sec,
+                    60,
+                )
+                self.assertEqual(
+                    request.execution_limits.max_inference_timeout_sec,
+                    300.0,
                 )
             finally:
                 app.close()

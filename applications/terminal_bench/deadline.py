@@ -57,6 +57,92 @@ class TerminalInferenceTiming:
 
 
 @dataclass(frozen=True, slots=True)
+class TerminalBudgetBand:
+    """One profile-local minimum, preferred, and maximum stage budget."""
+
+    minimum_seconds: float
+    preferred_seconds: float
+    maximum_seconds: float
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("minimum_seconds", self.minimum_seconds),
+            ("preferred_seconds", self.preferred_seconds),
+            ("maximum_seconds", self.maximum_seconds),
+        ):
+            if not isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
+        if self.preferred_seconds < self.minimum_seconds:
+            raise ValueError("preferred stage budget cannot be below minimum")
+        if self.maximum_seconds < self.preferred_seconds:
+            raise ValueError("maximum stage budget cannot be below preferred")
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalDeadlineBudgetProfile:
+    """Terminal-Bench profile budgets; these are not Core Runtime limits."""
+
+    normal_inference: TerminalBudgetBand
+    compact_inference: TerminalBudgetBand
+    emergency_inference: TerminalBudgetBand
+    normal_inspection: TerminalBudgetBand
+    reconciliation_inspection: TerminalBudgetBand
+    normal_work: TerminalBudgetBand
+    final_work: TerminalBudgetBand
+    convergence_inference: TerminalBudgetBand
+    verification: TerminalBudgetBand
+    model_cancellation_cleanup_seconds: float = 5.0
+
+    def __post_init__(self) -> None:
+        _require_nonnegative(
+            "model_cancellation_cleanup_seconds",
+            self.model_cancellation_cleanup_seconds,
+        )
+
+
+def terra_high_deadline_budget_profile(
+    *,
+    normal_inference_maximum_seconds: float = 300.0,
+) -> TerminalDeadlineBudgetProfile:
+    """Return the calibrated Terminal-Bench profile used by Terra-high evals."""
+
+    return TerminalDeadlineBudgetProfile(
+        normal_inference=TerminalBudgetBand(
+            minimum_seconds=45.0,
+            preferred_seconds=90.0,
+            maximum_seconds=normal_inference_maximum_seconds,
+        ),
+        compact_inference=TerminalBudgetBand(30.0, 60.0, 120.0),
+        emergency_inference=TerminalBudgetBand(20.0, 45.0, 60.0),
+        normal_inspection=TerminalBudgetBand(5.0, 20.0, 60.0),
+        reconciliation_inspection=TerminalBudgetBand(5.0, 15.0, 30.0),
+        normal_work=TerminalBudgetBand(5.0, 120.0, 300.0),
+        final_work=TerminalBudgetBand(5.0, 45.0, 60.0),
+        convergence_inference=TerminalBudgetBand(30.0, 60.0, 120.0),
+        verification=TerminalBudgetBand(15.0, 60.0, 120.0),
+    )
+
+
+class TerminalDeadlineStage(StrEnum):
+    INFERENCE = "inference"
+    INSPECT = "inspect"
+    WORK = "work"
+    FOLLOWUP_INFERENCE = "followup_inference"
+    VERIFY = "verify"
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalDeadlineStageAllocation:
+    stage: TerminalDeadlineStage
+    minimum_seconds: float
+    preferred_seconds: float
+    maximum_seconds: float
+    overhead_seconds: float
+    allocated_seconds: float
+    current: bool
+
+
+@dataclass(frozen=True, slots=True)
 class TerminalDeadlineSlots:
     sequence: TerminalDeadlineSequence | None
     remaining_seconds: float | None
@@ -72,6 +158,7 @@ class TerminalDeadlineSlots:
     action_limit_seconds: int | None
     feasible: bool
     complete_sequence_feasible: bool
+    stage_allocations: tuple[TerminalDeadlineStageAllocation, ...] = ()
 
     @property
     def future_reserve_seconds(self) -> float:
@@ -290,6 +377,315 @@ def allocate_terminal_deadline_sequence(
     return replace(
         degraded,
         complete_sequence_feasible=False,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _TerminalDeadlineStageSpec:
+    stage: TerminalDeadlineStage
+    band: TerminalBudgetBand
+    overhead_seconds: float
+    current: bool
+
+
+def allocate_profiled_terminal_deadline_sequence(
+    *,
+    sequence: TerminalDeadlineSequence | None,
+    remaining_seconds: float | None,
+    profile: TerminalDeadlineBudgetProfile,
+    cleanup_seconds: float,
+    provider_grace_seconds: float,
+    include_current_inference: bool = True,
+    emergency_mode: bool = False,
+    compact_mode: bool = False,
+    command_role: str | None = None,
+) -> TerminalDeadlineSlots:
+    """Continuously allocate one profile sequence and degrade if necessary.
+
+    Future phases receive at least their minimum before the current turn may
+    grow. Between the aggregate minimum and preferred totals every phase is
+    interpolated by the same factor. Above preferred, surplus grows the
+    current action first and then current inference, without exceeding either
+    maximum. If the complete sequence does not fit, only the current legal
+    phase is considered and the Planner will select the next path after it.
+    """
+
+    _require_nonnegative("cleanup_seconds", cleanup_seconds)
+    _require_nonnegative("provider_grace_seconds", provider_grace_seconds)
+    inference_band = (
+        profile.emergency_inference
+        if emergency_mode
+        else (
+            profile.compact_inference
+            if compact_mode or sequence is not None
+            else profile.normal_inference
+        )
+    )
+    action_stage, action_band = _current_action_band(
+        sequence=sequence,
+        command_role=command_role,
+        profile=profile,
+    )
+    stages: list[_TerminalDeadlineStageSpec] = []
+    if include_current_inference:
+        stages.append(
+            _TerminalDeadlineStageSpec(
+                stage=TerminalDeadlineStage.INFERENCE,
+                band=inference_band,
+                overhead_seconds=(
+                    profile.model_cancellation_cleanup_seconds
+                ),
+                current=True,
+            )
+        )
+    stages.append(
+        _TerminalDeadlineStageSpec(
+            stage=action_stage,
+            band=action_band,
+            overhead_seconds=provider_grace_seconds,
+            current=True,
+        )
+    )
+    stages.extend(
+        _future_stage_specs(
+            sequence=sequence,
+            profile=profile,
+            provider_grace_seconds=provider_grace_seconds,
+        )
+    )
+    full = _allocate_profiled_stages(
+        sequence=sequence,
+        remaining_seconds=remaining_seconds,
+        cleanup_seconds=cleanup_seconds,
+        stages=tuple(stages),
+        complete_sequence_feasible=True,
+    )
+    if full.feasible or remaining_seconds is None:
+        return full
+
+    current_only = tuple(item for item in stages if item.current)
+    degraded = _allocate_profiled_stages(
+        sequence=sequence,
+        remaining_seconds=remaining_seconds,
+        cleanup_seconds=cleanup_seconds,
+        stages=current_only,
+        complete_sequence_feasible=False,
+    )
+    return degraded
+
+
+def _current_action_band(
+    *,
+    sequence: TerminalDeadlineSequence | None,
+    command_role: str | None,
+    profile: TerminalDeadlineBudgetProfile,
+) -> tuple[TerminalDeadlineStage, TerminalBudgetBand]:
+    if sequence in {
+        TerminalDeadlineSequence.RECONCILE_THEN_WORK_VERIFY,
+        TerminalDeadlineSequence.RECONCILE_THEN_VERIFY,
+    }:
+        return (
+            TerminalDeadlineStage.INSPECT,
+            profile.reconciliation_inspection,
+        )
+    if sequence is TerminalDeadlineSequence.DIRECT_VERIFY:
+        return TerminalDeadlineStage.VERIFY, profile.verification
+    if sequence is TerminalDeadlineSequence.WORK_THEN_VERIFY:
+        return TerminalDeadlineStage.WORK, profile.final_work
+    if command_role == "inspect":
+        return TerminalDeadlineStage.INSPECT, profile.normal_inspection
+    if command_role == "verify":
+        return TerminalDeadlineStage.VERIFY, profile.verification
+    return TerminalDeadlineStage.WORK, profile.normal_work
+
+
+def _future_stage_specs(
+    *,
+    sequence: TerminalDeadlineSequence | None,
+    profile: TerminalDeadlineBudgetProfile,
+    provider_grace_seconds: float,
+) -> tuple[_TerminalDeadlineStageSpec, ...]:
+    inference = _TerminalDeadlineStageSpec(
+        stage=TerminalDeadlineStage.FOLLOWUP_INFERENCE,
+        band=profile.convergence_inference,
+        overhead_seconds=profile.model_cancellation_cleanup_seconds,
+        current=False,
+    )
+    work = _TerminalDeadlineStageSpec(
+        stage=TerminalDeadlineStage.WORK,
+        band=profile.final_work,
+        overhead_seconds=provider_grace_seconds,
+        current=False,
+    )
+    verify = _TerminalDeadlineStageSpec(
+        stage=TerminalDeadlineStage.VERIFY,
+        band=profile.verification,
+        overhead_seconds=provider_grace_seconds,
+        current=False,
+    )
+    if sequence is TerminalDeadlineSequence.RECONCILE_THEN_WORK_VERIFY:
+        return inference, work, inference, verify
+    if sequence in {
+        TerminalDeadlineSequence.RECONCILE_THEN_VERIFY,
+        TerminalDeadlineSequence.WORK_THEN_VERIFY,
+    }:
+        return inference, verify
+    if sequence is TerminalDeadlineSequence.DIRECT_VERIFY:
+        return ()
+    return inference, verify
+
+
+def _allocate_profiled_stages(
+    *,
+    sequence: TerminalDeadlineSequence | None,
+    remaining_seconds: float | None,
+    cleanup_seconds: float,
+    stages: tuple[_TerminalDeadlineStageSpec, ...],
+    complete_sequence_feasible: bool,
+) -> TerminalDeadlineSlots:
+    current_inference = next(
+        (
+            item
+            for item in stages
+            if item.current and item.stage is TerminalDeadlineStage.INFERENCE
+        ),
+        None,
+    )
+    current_action = next(
+        (
+            item
+            for item in stages
+            if item.current and item.stage is not TerminalDeadlineStage.INFERENCE
+        ),
+        None,
+    )
+    assert current_action is not None
+    if remaining_seconds is None:
+        return TerminalDeadlineSlots(
+            sequence=sequence,
+            remaining_seconds=None,
+            minimum_inference_seconds=(
+                0.0 if current_inference is None else current_inference.band.minimum_seconds
+            ),
+            preferred_inference_seconds=(
+                0.0 if current_inference is None else current_inference.band.preferred_seconds
+            ),
+            minimum_action_seconds=max(1, floor(current_action.band.minimum_seconds)),
+            preferred_action_seconds=max(1, floor(current_action.band.preferred_seconds)),
+            maximum_action_seconds=max(1, floor(current_action.band.maximum_seconds)),
+            followup_inference_seconds=0.0,
+            verification_seconds=0.0,
+            cleanup_seconds=cleanup_seconds,
+            inference_limit_seconds=None,
+            action_limit_seconds=None,
+            feasible=True,
+            complete_sequence_feasible=True,
+        )
+    _require_nonnegative("remaining_seconds", remaining_seconds)
+    usable = max(0.0, remaining_seconds - cleanup_seconds)
+    minimum_total = sum(
+        item.band.minimum_seconds + item.overhead_seconds for item in stages
+    )
+    preferred_total = sum(
+        item.band.preferred_seconds + item.overhead_seconds for item in stages
+    )
+    feasible = usable >= minimum_total
+    allocated = [item.band.minimum_seconds for item in stages]
+    if feasible:
+        if usable < preferred_total:
+            ratio = (usable - minimum_total) / (
+                preferred_total - minimum_total
+            )
+            allocated = [
+                item.band.minimum_seconds
+                + ratio
+                * (item.band.preferred_seconds - item.band.minimum_seconds)
+                for item in stages
+            ]
+        else:
+            allocated = [item.band.preferred_seconds for item in stages]
+            surplus = usable - preferred_total
+            growth_order = [
+                index
+                for index, item in enumerate(stages)
+                if item.current and item.stage is not TerminalDeadlineStage.INFERENCE
+            ] + [
+                index
+                for index, item in enumerate(stages)
+                if item.current and item.stage is TerminalDeadlineStage.INFERENCE
+            ]
+            for index in growth_order:
+                growth = min(
+                    surplus,
+                    stages[index].band.maximum_seconds - allocated[index],
+                )
+                allocated[index] += growth
+                surplus -= growth
+                if surplus <= 0.0:
+                    break
+
+    stage_allocations = tuple(
+        TerminalDeadlineStageAllocation(
+            stage=item.stage,
+            minimum_seconds=item.band.minimum_seconds,
+            preferred_seconds=item.band.preferred_seconds,
+            maximum_seconds=item.band.maximum_seconds,
+            overhead_seconds=item.overhead_seconds,
+            allocated_seconds=value,
+            current=item.current,
+        )
+        for item, value in zip(stages, allocated, strict=True)
+    )
+    inference_limit = (
+        0.0
+        if current_inference is None
+        else next(
+            item.allocated_seconds
+            for item in stage_allocations
+            if item.current and item.stage is TerminalDeadlineStage.INFERENCE
+        )
+    )
+    action_limit = floor(
+        next(
+            item.allocated_seconds
+            for item in stage_allocations
+            if item.current and item.stage is not TerminalDeadlineStage.INFERENCE
+        )
+    )
+    future_inference = sum(
+        item.allocated_seconds + item.overhead_seconds
+        for item in stage_allocations
+        if not item.current
+        and item.stage is TerminalDeadlineStage.FOLLOWUP_INFERENCE
+    )
+    future_actions = sum(
+        item.allocated_seconds + item.overhead_seconds
+        for item in stage_allocations
+        if not item.current
+        and item.stage is not TerminalDeadlineStage.FOLLOWUP_INFERENCE
+    )
+    return TerminalDeadlineSlots(
+        sequence=sequence,
+        remaining_seconds=remaining_seconds,
+        minimum_inference_seconds=(
+            0.0 if current_inference is None else current_inference.band.minimum_seconds
+        ),
+        preferred_inference_seconds=(
+            0.0 if current_inference is None else current_inference.band.preferred_seconds
+        ),
+        minimum_action_seconds=max(1, floor(current_action.band.minimum_seconds)),
+        preferred_action_seconds=max(1, floor(current_action.band.preferred_seconds)),
+        maximum_action_seconds=max(1, floor(current_action.band.maximum_seconds)),
+        followup_inference_seconds=future_inference,
+        verification_seconds=future_actions,
+        cleanup_seconds=cleanup_seconds,
+        inference_limit_seconds=inference_limit,
+        action_limit_seconds=action_limit,
+        feasible=bool(feasible and action_limit >= 1),
+        complete_sequence_feasible=bool(
+            feasible and complete_sequence_feasible
+        ),
+        stage_allocations=stage_allocations,
     )
 
 

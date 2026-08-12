@@ -195,13 +195,17 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(config.compact_max_output_tokens, 8192)
         self.assertEqual(config.emergency_max_output_tokens, 4096)
         self.assertEqual(config.inference_timeout_sec, 300.0)
-        self.assertEqual(config.delivery_inference_timeout_sec, 180.0)
-        self.assertEqual(config.emergency_inference_timeout_sec, 120.0)
-        self.assertEqual(config.minimum_inference_timeout_sec, 120.0)
+        self.assertEqual(config.delivery_inference_timeout_sec, 120.0)
+        self.assertEqual(config.emergency_inference_timeout_sec, 60.0)
+        self.assertEqual(config.minimum_inference_timeout_sec, 45.0)
         self.assertEqual(
             config.minimum_delivery_inference_timeout_sec,
-            60.0,
+            30.0,
         )
+        profile = config.deadline_budget_profile
+        self.assertEqual(profile.normal_inference.preferred_seconds, 90.0)
+        self.assertEqual(profile.normal_work.maximum_seconds, 300.0)
+        self.assertEqual(profile.verification.minimum_seconds, 15.0)
         self.assertEqual(
             config.deepseek_reasoning_effort,
             ReasoningEffort.HIGH,
