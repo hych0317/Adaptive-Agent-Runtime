@@ -34,6 +34,18 @@
       "expected_next_role": "work",
       "expected_outcome": "execute"
     },
+    "observed-failure-recovery-window": {
+      "source_task": "vulnerable-secret",
+      "source_job": "aar-tb21-regression12-p1-terra-high-20260812-run1",
+      "instruction": "Recover after a settled work command reports a concrete failure.",
+      "committed_commands": 1,
+      "task_generation": 1,
+      "known_state_generation": 1,
+      "failure_signature": "command returned non-zero status 1",
+      "expected_recovery_mode": true,
+      "expected_inference_cap_seconds": 300.0,
+      "expected_work_cap_seconds": 300
+    },
     "cancel-cleanup-coverage": {
       "source_task": "cancel-async-tasks",
       "instruction": "Implement an async API with bounded concurrency where cancellation must run every started task's cleanup code.",

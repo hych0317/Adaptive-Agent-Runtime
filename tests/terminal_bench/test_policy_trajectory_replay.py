@@ -125,6 +125,7 @@ class TerminalPolicyTrajectoryFixtureTests(unittest.TestCase):
             {
                 "build-pmars-reconciliation-window",
                 "failed-verify-targeted-repair",
+                "observed-failure-recovery-window",
                 "cancel-cleanup-coverage",
                 "public-api-signature-coverage",
                 "exact-output-control",
@@ -221,6 +222,54 @@ class TerminalPolicyTrajectoryReplayTests(unittest.IsolatedAsyncioTestCase):
                     .execution_limits.max_inference_timeout_sec
                     or 0.0,
                     capability.minimum_useful_seconds,
+                )
+            finally:
+                app.close()
+
+    async def test_observed_failure_retains_a_full_recovery_inference_window(
+        self,
+    ) -> None:
+        scenario = _scenario("observed-failure-recovery-window")
+        with tempfile.TemporaryDirectory() as directory:
+            app = build_terminal_application(
+                trial_id="trajectory-observed-failure-recovery-window",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(),
+                proposal_capability=_ProfiledScriptedCapability(),
+                policy=self._policy(),
+            )
+            try:
+                app.journal._session = app.journal.snapshot().model_copy(
+                    update={
+                        "committed_commands": int(
+                            scenario["committed_commands"]
+                        ),
+                        "task_generation": int(scenario["task_generation"]),
+                        "known_state_generation": int(
+                            scenario["known_state_generation"]
+                        ),
+                        "latest_failure_signatures": (
+                            str(scenario["failure_signature"]),
+                        ),
+                    }
+                )
+
+                request = app.runtime._planner._turn_request(
+                    self._state(str(scenario["instruction"])),
+                    app.journal.snapshot(),
+                )
+
+                self.assertIs(
+                    request.recovery_mode,
+                    scenario["expected_recovery_mode"],
+                )
+                self.assertEqual(
+                    request.execution_limits.max_inference_timeout_sec,
+                    scenario["expected_inference_cap_seconds"],
+                )
+                self.assertEqual(
+                    request.execution_limits.max_work_timeout_sec,
+                    scenario["expected_work_cap_seconds"],
                 )
             finally:
                 app.close()

@@ -2892,7 +2892,6 @@ class TerminalSequentialPlanner:
                 reconciliation_mode=reconciliation_mode,
                 repair_mode=repair_mode,
                 verification_due=verification_due,
-                recovery_mode=recovery_mode,
                 sequence=deadline_sequence,
             )
             if deadline_slots.action_limit_seconds is not None:
@@ -3088,7 +3087,6 @@ class TerminalSequentialPlanner:
         reconciliation_mode: bool = False,
         repair_mode: bool = False,
         verification_due: bool = False,
-        recovery_mode: bool = False,
         include_current_inference: bool = True,
         sequence: TerminalDeadlineSequence | None = None,
         command_role: TerminalCommandRole | None = None,
@@ -3112,7 +3110,6 @@ class TerminalSequentialPlanner:
                     or reconciliation_mode
                     or repair_mode
                     or verification_due
-                    or recovery_mode
                 ),
                 command_role=(
                     None if command_role is None else command_role.value
@@ -3125,7 +3122,6 @@ class TerminalSequentialPlanner:
             or reconciliation_mode
             or repair_mode
             or verification_due
-            or recovery_mode
         )
         timing = self._deadline_timing
         if timing is None:

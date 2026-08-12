@@ -733,7 +733,7 @@ class TerminalDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
-    async def test_observed_failure_compacts_inference_but_preserves_work_cap(
+    async def test_observed_failure_preserves_normal_inference_and_work_caps(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -764,9 +764,9 @@ class TerminalDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(request.finalization_mode)
                 self.assertTrue(request.recovery_mode)
                 self.assertIsNone(request.execution_limits.deadline_sequence)
-                self.assertLessEqual(
-                    request.execution_limits.max_inference_timeout_sec or 0.0,
-                    _PROFILE.compact_inference.maximum_seconds,
+                self.assertEqual(
+                    request.execution_limits.max_inference_timeout_sec,
+                    _PROFILE.normal_inference.maximum_seconds,
                 )
                 self.assertEqual(
                     request.execution_limits.max_work_timeout_sec,
