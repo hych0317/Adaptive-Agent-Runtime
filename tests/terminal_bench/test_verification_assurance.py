@@ -16,6 +16,7 @@ from applications.terminal_bench.models import (
 )
 from applications.terminal_bench.planner import (
     _contract_coverage_gaps,
+    _known_reconciliation_mutation,
     _task_requirements,
     _terminal_behavior_hints,
     _terminal_model_payload,
@@ -48,6 +49,27 @@ def self_check_contract() -> TerminalVerificationContract:
         ),
         validation_methods=("synthetic end-to-end assertion",),
     )
+
+
+class TerminalReconciliationMutationTests(unittest.TestCase):
+    def test_descriptor_redirection_remains_read_only(self) -> None:
+        for command in (
+            "ps aux 2>&1 | grep worker",
+            "printf diagnostic 1>&2",
+            "printf diagnostic >&2",
+            "test -e /app/result 2>/dev/null",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(_known_reconciliation_mutation(command))
+
+    def test_file_redirection_remains_mutating(self) -> None:
+        for command in (
+            "printf data > output.txt",
+            "printf error 2> error.log",
+            "printf more >> output.txt",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNotNone(_known_reconciliation_mutation(command))
 
 
 class TerminalVerificationAssuranceTests(unittest.IsolatedAsyncioTestCase):

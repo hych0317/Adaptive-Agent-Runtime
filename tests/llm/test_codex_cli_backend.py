@@ -176,6 +176,15 @@ def codex_failed_jsonl(message: str) -> str:
     return "\n".join(json.dumps(event) for event in events)
 
 
+def codex_error_jsonl(message: str) -> str:
+    events = (
+        {"type": "thread.started", "thread_id": "thread-error"},
+        {"type": "turn.started"},
+        {"type": "error", "message": message},
+    )
+    return "\n".join(json.dumps(event) for event in events)
+
+
 def cli_profile(
     *,
     tool_intent: bool = False,
@@ -469,6 +478,82 @@ class CodexCLIInferenceBackendTests(unittest.IsolatedAsyncioTestCase):
         for argv, _, workspace, _, _ in execution_calls:
             self.assertIn('model_reasoning_effort="max"', argv)
             self.assertFalse(Path(workspace).exists())
+
+    async def test_transient_error_event_uses_existing_failed_turn_retry(
+        self,
+    ) -> None:
+        transport = RecordingProcessTransport(
+            executions=(
+                ProcessResult(
+                    exit_code=0,
+                    stdout=codex_error_jsonl(
+                        "Reconnecting... 2/5 (stream disconnected before "
+                        "completion: failed to lookup address information: Try again)"
+                    ),
+                ),
+                ProcessResult(
+                    exit_code=0,
+                    stdout=codex_jsonl('{"conclusions":["Recovered"]}'),
+                ),
+            )
+        )
+        backend = CodexCLIInferenceBackend(
+            cli_profile(),
+            CodexCLIInferenceConfig(),
+            transport,
+        )
+
+        response = await backend.invoke(reasoning_request())
+
+        self.assertEqual(response.output, {"conclusions": ("Recovered",)})
+        execution_calls = [call for call in transport.calls if "exec" in call[0]]
+        self.assertEqual(len(execution_calls), 2)
+
+    async def test_transient_error_event_stops_after_existing_retry_limit(
+        self,
+    ) -> None:
+        transport = RecordingProcessTransport(
+            executions=(
+                ProcessResult(
+                    exit_code=0,
+                    stdout=codex_error_jsonl("connection reset by peer"),
+                ),
+                ProcessResult(
+                    exit_code=0,
+                    stdout=codex_error_jsonl("connection reset by peer"),
+                ),
+            )
+        )
+        backend = CodexCLIInferenceBackend(
+            cli_profile(),
+            CodexCLIInferenceConfig(),
+            transport,
+        )
+
+        with self.assertRaisesRegex(BackendProtocolError, "connection reset"):
+            await backend.invoke(reasoning_request())
+
+        execution_calls = [call for call in transport.calls if "exec" in call[0]]
+        self.assertEqual(len(execution_calls), 2)
+
+    async def test_nontransient_error_event_is_not_retried(self) -> None:
+        transport = RecordingProcessTransport(
+            execution=ProcessResult(
+                exit_code=0,
+                stdout=codex_error_jsonl("response schema mismatch"),
+            )
+        )
+        backend = CodexCLIInferenceBackend(
+            cli_profile(),
+            CodexCLIInferenceConfig(),
+            transport,
+        )
+
+        with self.assertRaisesRegex(BackendProtocolError, "schema mismatch"):
+            await backend.invoke(reasoning_request())
+
+        execution_calls = [call for call in transport.calls if "exec" in call[0]]
+        self.assertEqual(len(execution_calls), 1)
 
     async def test_internal_action_event_is_rejected(self) -> None:
         transport = RecordingProcessTransport(

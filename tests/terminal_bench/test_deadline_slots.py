@@ -70,21 +70,21 @@ class TerminalDeadlineSlotTests(unittest.TestCase):
         cases = (
             (
                 TerminalDeadlineSequence.RECONCILE_THEN_WORK_VERIFY,
-                438.0,
+                378.0,
                 60,
-                300.0,
+                240.0,
             ),
             (
                 TerminalDeadlineSequence.RECONCILE_THEN_VERIFY,
-                318.0,
+                258.0,
                 60,
-                180.0,
+                120.0,
             ),
             (
                 TerminalDeadlineSequence.WORK_THEN_VERIFY,
-                318.0,
+                258.0,
                 60,
-                180.0,
+                120.0,
             ),
             (
                 TerminalDeadlineSequence.DIRECT_VERIFY,
@@ -102,6 +102,11 @@ class TerminalDeadlineSlotTests(unittest.TestCase):
                     minimum_inference_seconds=60.0,
                     preferred_inference_seconds=180.0,
                     followup_inference_seconds=60.0,
+                    verification_timeout_seconds=(
+                        120
+                        if sequence is TerminalDeadlineSequence.DIRECT_VERIFY
+                        else 60
+                    ),
                     cleanup_seconds=18.0,
                 )
 
@@ -109,6 +114,34 @@ class TerminalDeadlineSlotTests(unittest.TestCase):
                 self.assertIs(slots.sequence, sequence)
                 self.assertEqual(slots.action_limit_seconds, action_cap)
                 self.assertEqual(slots.future_reserve_seconds, future_reserve + 18.0)
+
+    def test_work_then_verify_fits_exact_258_second_boundary(self) -> None:
+        slots = allocate_terminal_deadline_sequence(
+            sequence=TerminalDeadlineSequence.WORK_THEN_VERIFY,
+            remaining_seconds=258.0,
+            minimum_inference_seconds=60.0,
+            preferred_inference_seconds=180.0,
+            followup_inference_seconds=60.0,
+            verification_timeout_seconds=60,
+            cleanup_seconds=18.0,
+        )
+
+        self.assertTrue(slots.feasible)
+        self.assertEqual(slots.inference_limit_seconds, 60.0)
+        self.assertEqual(slots.action_limit_seconds, 60)
+        self.assertEqual(slots.future_reserve_seconds, 138.0)
+
+        direct = allocate_terminal_deadline_sequence(
+            sequence=TerminalDeadlineSequence.DIRECT_VERIFY,
+            remaining_seconds=198.0,
+            minimum_inference_seconds=60.0,
+            preferred_inference_seconds=180.0,
+            followup_inference_seconds=60.0,
+            verification_timeout_seconds=120,
+            cleanup_seconds=18.0,
+        )
+        self.assertTrue(direct.feasible)
+        self.assertEqual(direct.action_limit_seconds, 120)
 
     def test_repair_then_verify_fits_exact_318_second_boundary(self) -> None:
         slots = allocate_deadline_slots(
@@ -264,7 +297,7 @@ class TerminalDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
             try:
                 app.journal._session = app.journal.snapshot().model_copy(
                     update={
-                        "started_at": utc_now() - timedelta(seconds=522),
+                        "started_at": utc_now() - timedelta(seconds=581),
                     }
                 )
                 request = app.runtime._planner._turn_request(
@@ -377,7 +410,7 @@ class TerminalDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
             try:
                 session = app.journal.snapshot().model_copy(
                     update={
-                        "started_at": utc_now() - timedelta(seconds=522),
+                        "started_at": utc_now() - timedelta(seconds=581),
                         "successful_work_generation": 0,
                     }
                 )
@@ -436,7 +469,7 @@ class TerminalDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 ]
                 app.journal._session = app.journal.snapshot().model_copy(
                     update={
-                        "started_at": utc_now() - timedelta(seconds=522),
+                        "started_at": utc_now() - timedelta(seconds=581),
                         "committed_commands": 1,
                         "task_generation": 2,
                         "successful_work_generation": None,

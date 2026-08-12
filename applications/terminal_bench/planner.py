@@ -1843,7 +1843,11 @@ _MUTATING_RECONCILIATION_PATTERNS = (
         r"(?im)(?:^|[;&|]\s*)(?:rm|mv|cp|install|apt(?:-get)?|apk|dnf|yum|"
         r"pip3?|sed\s+-i|perl\s+-[A-Za-z]*i|tee)\b"
     ),
-    re.compile(r"(?m)(?:^|\s)(?:>>?|2>)\s*(?!/dev/null(?:\s|$))\S+"),
+    re.compile(
+        r"(?m)(?:^|\s)[0-9]*>>?\s*"
+        r"(?!&[0-9]+(?:\s|$|[;&|]))"
+        r"(?!/dev/null(?:\s|$|[;&|]))\S+"
+    ),
 )
 _TEMP_ROOT_ASSIGNMENT = re.compile(
     r"(?m)^\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*)="
@@ -2668,11 +2672,15 @@ class TerminalSequentialPlanner:
         timing = self._deadline_timing
         if timing is None:
             return self._policy.finalization_mode_threshold_seconds
+        future_verification_seconds = min(
+            self._policy.final_repair_timeout_sec,
+            self._policy.max_verification_timeout_sec,
+        )
         required = (
             timing.compact_minimum_seconds
             + self._policy.final_repair_timeout_sec
             + timing.compact_minimum_seconds
-            + self._policy.max_verification_timeout_sec
+            + future_verification_seconds
             + self._policy.cleanup_grace_seconds
             + self._policy.timeout_admission_margin_seconds
         )
@@ -2732,6 +2740,11 @@ class TerminalSequentialPlanner:
                 work_timeout_seconds=self._policy.final_repair_timeout_sec,
                 verification_timeout_seconds=(
                     self._policy.max_verification_timeout_sec
+                    if sequence is TerminalDeadlineSequence.DIRECT_VERIFY
+                    else min(
+                        self._policy.final_repair_timeout_sec,
+                        self._policy.max_verification_timeout_sec,
+                    )
                 ),
                 reconciliation_timeout_seconds=(
                     self._policy.final_repair_timeout_sec

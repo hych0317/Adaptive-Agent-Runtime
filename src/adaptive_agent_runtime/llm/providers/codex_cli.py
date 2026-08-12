@@ -89,6 +89,13 @@ _DEFAULT_ENVIRONMENT = (
     "all_proxy",
     "no_proxy",
 )
+_TRANSIENT_CODEX_ERROR_MARKERS = (
+    "stream disconnected before completion",
+    "failed to lookup address information",
+    "connection reset",
+    "connection closed",
+    "temporarily unavailable",
+)
 _FORBIDDEN_ITEM_TYPES = {
     "commandexecution",
     "filechange",
@@ -537,6 +544,11 @@ def _codex_event_detail(event: Mapping[str, Any]) -> str:
     return encoded[:512]
 
 
+def _codex_error_is_transient(detail: str) -> bool:
+    lowered = detail.lower()
+    return any(marker in lowered for marker in _TRANSIENT_CODEX_ERROR_MARKERS)
+
+
 def _normalize_jsonl(
     profile: InferenceTargetProfile,
     request: InferenceRequest,
@@ -575,10 +587,13 @@ def _normalize_jsonl(
                 "Codex CLI reported a failed turn: " + _codex_event_detail(event),
             )
         if event_type == "error":
-            raise BackendProtocolError(
-                profile.target_id,
-                "Codex CLI error event: " + _codex_event_detail(event),
+            detail = _codex_event_detail(event)
+            error_type = (
+                _CodexTurnFailedError
+                if _codex_error_is_transient(detail)
+                else BackendProtocolError
             )
+            raise error_type(profile.target_id, "Codex CLI error event: " + detail)
         if event_type in {"item.started", "item.completed"}:
             item = event.get("item")
             if isinstance(item, Mapping):
