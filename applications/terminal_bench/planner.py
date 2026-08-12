@@ -161,6 +161,25 @@ def _generation_state_is_known(session: TerminalSessionSnapshot) -> bool:
     )
 
 
+def _has_unresolved_verification_failure(
+    session: TerminalSessionSnapshot,
+) -> bool:
+    """Return true only for a settled failed VERIFY that remains unresolved."""
+
+    receipt = session.latest_verification_receipt
+    return bool(
+        receipt is not None
+        and session.pending_repair_receipt_id is not None
+        and receipt.action_id == session.pending_repair_receipt_id
+        and not receipt.passed
+        and receipt.execution_state is TerminalExecutionState.COMPLETED
+        and receipt.return_code not in (None, 0)
+        and not receipt.timed_out
+        and not receipt.transport_failed
+        and session.latest_failure_signatures
+    )
+
+
 def _verification_assurance(
     verification: object,
     result: TerminalExecResult | None = None,
@@ -770,6 +789,31 @@ class JsonlTerminalTrialJournal:
             },
         )
 
+    def mark_submitted_known_failed(self, summary: str) -> None:
+        gate_error = self.submission_gate_error()
+        if gate_error is not None:
+            raise RuntimeError(f"terminal submission rejected: {gate_error}")
+        if not _has_unresolved_verification_failure(self._session):
+            raise RuntimeError(
+                "terminal known-failed submission requires an unresolved "
+                "settled verification failure"
+            )
+        self._agent_summary = summary
+        self._session = self._session.model_copy(
+            update={
+                "completion_disposition": (
+                    TerminalCompletionDisposition.SUBMITTED_KNOWN_FAILED
+                )
+            }
+        )
+        self._append(
+            "agent.submitted_known_failed",
+            {
+                "summary": summary,
+                "session": self._session.model_dump(mode="json"),
+            },
+        )
+
     def record_completion_rejection(self, reason: str) -> None:
         if not reason:
             raise ValueError("completion rejection reason is required")
@@ -1257,6 +1301,11 @@ class JsonlTerminalTrialJournal:
                     payload["session"]
                 )
         elif kind == "agent.submitted_unverified":
+            self._agent_summary = str(payload["summary"])
+            self._session = TerminalSessionSnapshot.model_validate(
+                payload["session"]
+            )
+        elif kind == "agent.submitted_known_failed":
             self._agent_summary = str(payload["summary"])
             self._session = TerminalSessionSnapshot.model_validate(
                 payload["session"]
@@ -1988,6 +2037,36 @@ def _terminal_behavior_hints(
             "Profile the representative slow path first, optimize the measured "
             "bottleneck, then benchmark cold unseen inputs with a safety margin."
         )
+    if any(
+        marker in text
+        for marker in (
+            "cancellation",
+            "cancelled",
+            "canceled",
+            "cleanup",
+            "finally",
+        )
+    ):
+        hints.append(
+            "For cancellation-sensitive concurrency, verify that every started "
+            "operation observes cancellation and runs its cleanup or finally path."
+        )
+    if any(
+        marker in text
+        for marker in (
+            "public api",
+            "public method",
+            "public function",
+            "signature",
+            "argument",
+            "parameter",
+        )
+    ):
+        hints.append(
+            "For a public API change, inspect the declared signature and all call "
+            "sites; preserve names and defaults and exercise each argument's "
+            "observable behavior."
+        )
     return tuple(hints)
 
 
@@ -2122,7 +2201,7 @@ class TerminalSequentialPlanner:
             or self._deadline_timing is not None
         )
 
-    def _submit_unverified_if_safe(
+    def _submit_stable_state_if_safe(
         self,
         *,
         summary: str,
@@ -2130,14 +2209,22 @@ class TerminalSequentialPlanner:
     ) -> PlanDecision | None:
         if self._journal.submission_gate_error() is not None:
             return None
-        self._journal.mark_submitted_unverified(summary)
+        session = self._journal.snapshot()
+        known_failed = _has_unresolved_verification_failure(session)
+        disposition = (
+            TerminalCompletionDisposition.SUBMITTED_KNOWN_FAILED
+            if known_failed
+            else TerminalCompletionDisposition.SUBMITTED_UNVERIFIED
+        )
+        if known_failed:
+            self._journal.mark_submitted_known_failed(summary)
+        else:
+            self._journal.mark_submitted_unverified(summary)
         return PlanDecision.complete(
             output={
                 "profile": AAR_TERMINAL_SEQUENTIAL_PROFILE,
                 "agent_complete": False,
-                "completion_disposition": (
-                    TerminalCompletionDisposition.SUBMITTED_UNVERIFIED.value
-                ),
+                "completion_disposition": disposition.value,
                 "summary": summary,
             },
             reason=reason,
@@ -2148,7 +2235,7 @@ class TerminalSequentialPlanner:
         *,
         context: str,
     ) -> PlanDecision | None:
-        return self._submit_unverified_if_safe(
+        return self._submit_stable_state_if_safe(
             summary=(
                 "The Runtime preserved the latest known container state when "
                 f"the remaining deadline could not safely admit {context}; "
@@ -2247,7 +2334,7 @@ class TerminalSequentialPlanner:
             )
         budget_error = self._budget_error(session, allow_command_limit=False)
         if budget_error is not None:
-            submission = self._submit_unverified_if_safe(
+            submission = self._submit_stable_state_if_safe(
                 summary=(
                     "The Runtime preserved the latest known container state "
                     f"after {budget_error}; artifacts were submitted for Harbor "
@@ -2339,7 +2426,7 @@ class TerminalSequentialPlanner:
             allow_exact_limit=True,
         )
         if budget_error is not None:
-            submission = self._submit_unverified_if_safe(
+            submission = self._submit_stable_state_if_safe(
                 summary=(
                     "The Runtime preserved the latest known container state "
                     f"after {budget_error}; artifacts were submitted for Harbor "
@@ -2392,7 +2479,7 @@ class TerminalSequentialPlanner:
                 session.completion_rejections
                 >= self._policy.max_completion_rejections
             ):
-                submission = self._submit_unverified_if_safe(
+                submission = self._submit_stable_state_if_safe(
                     summary=(
                         "The Agent requested completion without evidence eligible "
                         "for SUCCESS_LOCKED; the known state was submitted for "
@@ -2434,7 +2521,7 @@ class TerminalSequentialPlanner:
                 reason="Persist completion blocker and return it to the Planner.",
             )
         if session.committed_commands >= self._policy.max_commands:
-            submission = self._submit_unverified_if_safe(
+            submission = self._submit_stable_state_if_safe(
                 summary=(
                     "The Runtime preserved the latest known container state after "
                     "the command budget was exhausted; artifacts were submitted "

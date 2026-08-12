@@ -107,6 +107,7 @@ class TerminalCompletionDisposition(StrEnum):
     IN_PROGRESS = "in_progress"
     SUCCESS_LOCKED = "success_locked"
     SUBMITTED_UNVERIFIED = "submitted_unverified"
+    SUBMITTED_KNOWN_FAILED = "submitted_known_failed"
 
 
 class TerminalReconciliationState(StrEnum):
@@ -745,15 +746,18 @@ class TerminalSessionSnapshot(TerminalModel):
             raise ValueError("success_locked requires a verified checkpoint")
         if (
             self.completion_disposition
-            is TerminalCompletionDisposition.SUBMITTED_UNVERIFIED
+            in {
+                TerminalCompletionDisposition.SUBMITTED_UNVERIFIED,
+                TerminalCompletionDisposition.SUBMITTED_KNOWN_FAILED,
+            }
         ):
             if self.in_doubt_reconciliation_required:
                 raise ValueError(
-                    "submitted_unverified cannot retain unresolved IN_DOUBT state"
+                    "submitted state cannot retain unresolved IN_DOUBT state"
                 )
             if self.known_state_generation != self.task_generation:
                 raise ValueError(
-                    "submitted_unverified requires a known current generation"
+                    "submitted state requires a known current generation"
                 )
             if (
                 receipt is not None
@@ -771,7 +775,26 @@ class TerminalSessionSnapshot(TerminalModel):
                 )
             ):
                 raise ValueError(
-                    "trusted evidence must not use submitted_unverified"
+                    "trusted evidence must not use a submitted disposition"
+                )
+        if (
+            self.completion_disposition
+            is TerminalCompletionDisposition.SUBMITTED_KNOWN_FAILED
+        ):
+            if (
+                receipt is None
+                or self.pending_repair_receipt_id is None
+                or receipt.action_id != self.pending_repair_receipt_id
+                or receipt.passed
+                or receipt.execution_state is not TerminalExecutionState.COMPLETED
+                or receipt.return_code in (None, 0)
+                or receipt.timed_out
+                or receipt.transport_failed
+                or not self.latest_failure_signatures
+            ):
+                raise ValueError(
+                    "submitted_known_failed requires a settled unresolved "
+                    "verification failure"
                 )
         if self.contract_coverage_complete and self.contract_unmapped_fragments:
             raise ValueError(

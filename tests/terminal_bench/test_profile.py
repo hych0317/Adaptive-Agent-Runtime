@@ -27,6 +27,7 @@ from applications.terminal_bench.models import (
     TerminalCompletionDisposition,
     TerminalExecutionPolicy,
     TerminalExecutionState,
+    TerminalSessionSnapshot,
     TerminalReconciliationState,
     TerminalTimeoutCapReason,
     TerminalTurnDraft,
@@ -35,7 +36,10 @@ from applications.terminal_bench.models import (
     TerminalVerificationContract,
     utc_now,
 )
-from applications.terminal_bench.planner import _identifies_official_test_source
+from applications.terminal_bench.planner import (
+    JsonlTerminalTrialJournal,
+    _identifies_official_test_source,
+)
 from applications.terminal_bench.tools import terminal_provider_metadata
 from tests.terminal_bench.fakes import (
     FakeTerminalEnvironment,
@@ -963,11 +967,38 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(artifacts.summary.agent_complete)
                 self.assertIs(
                     artifacts.summary.completion_disposition,
-                    TerminalCompletionDisposition.SUBMITTED_UNVERIFIED,
+                    TerminalCompletionDisposition.SUBMITTED_KNOWN_FAILED,
                 )
                 self.assertEqual(artifacts.summary.command_count, 2)
+                session = app.journal.snapshot()
+                self.assertIsNotNone(session.pending_repair_receipt_id)
+                self.assertTrue(session.latest_failure_signatures)
+                replayed = JsonlTerminalTrialJournal(
+                    "trial-failed-verification",
+                    Path(directory) / "aar-transcript.jsonl",
+                )
+                self.assertIs(
+                    replayed.snapshot().completion_disposition,
+                    TerminalCompletionDisposition.SUBMITTED_KNOWN_FAILED,
+                )
+                self.assertTrue(replayed.trace_consistent)
             finally:
                 app.close()
+
+    def test_legacy_submitted_unverified_session_remains_loadable(self) -> None:
+        session = TerminalSessionSnapshot.model_validate(
+            {
+                "trial_id": "legacy-unverified",
+                "completion_disposition": "submitted_unverified",
+                "task_generation": 0,
+                "known_state_generation": 0,
+            }
+        )
+
+        self.assertIs(
+            session.completion_disposition,
+            TerminalCompletionDisposition.SUBMITTED_UNVERIFIED,
+        )
 
     async def test_failed_verification_allows_changed_read_only_reverify(
         self,

@@ -133,7 +133,6 @@ class TerminalPolicyTrajectoryFixtureTests(unittest.TestCase):
             },
         )
 
-    @unittest.expectedFailure
     def test_cancel_cleanup_requirement_has_behavior_coverage(self) -> None:
         scenario = _scenario("cancel-cleanup-coverage")
         requirements = _task_requirements(str(scenario["instruction"]))
@@ -141,7 +140,6 @@ class TerminalPolicyTrajectoryFixtureTests(unittest.TestCase):
         for term in scenario["expected_hint_terms"]:
             self.assertIn(str(term), hints)
 
-    @unittest.expectedFailure
     def test_public_api_signature_has_behavior_coverage(self) -> None:
         scenario = _scenario("public-api-signature-coverage")
         requirements = _task_requirements(str(scenario["instruction"]))
