@@ -2048,8 +2048,10 @@ def _terminal_behavior_hints(
         )
     ):
         hints.append(
-            "For cancellation-sensitive concurrency, verify that every started "
-            "operation observes cancellation and runs its cleanup or finally path."
+            "For cancellation-sensitive concurrency, test below, at, and above "
+            "the concurrency limit; interrupt while queued work remains, assert "
+            "that no queued work starts after cancellation, and assert that the "
+            "cleanup count equals the number of started operations."
         )
     if any(
         marker in text
@@ -2064,8 +2066,44 @@ def _terminal_behavior_hints(
     ):
         hints.append(
             "For a public API change, inspect the declared signature and all call "
-            "sites; preserve names and defaults and exercise each argument's "
-            "observable behavior."
+            "sites; preserve names and defaults, then exercise each argument's "
+            "observable behavior from a fresh process."
+        )
+    if any(
+        marker in text
+        for marker in ("server", "service", "background", "daemon", "port")
+    ):
+        hints.append(
+            "For a server or background-service contract, validate its detached "
+            "lifecycle from a fresh process and reach the actual endpoint from an "
+            "independent command; configuration or process existence alone is "
+            "insufficient."
+        )
+    if any(
+        marker in text
+        for marker in (
+            "polyglot",
+            "toolchain",
+            "multiple languages",
+            "each compiler",
+            "every compiler",
+        )
+    ):
+        hints.append(
+            "For an artifact consumed by multiple languages or compilers, compile "
+            "and execute the same artifact with every required toolchain; detect "
+            "declared dependencies before treating one successful consumer as "
+            "proof for the others."
+        )
+    if any(
+        marker in text
+        for marker in ("cwe", "vulnerability", "security flaw", "security report")
+    ):
+        hints.append(
+            "For vulnerability repair, derive weakness identifiers from observed "
+            "source or test evidence, run a focused regression for the repaired "
+            "defect before the broad suite, and keep the report aligned with the "
+            "actual code change."
         )
     return tuple(hints)
 
@@ -2749,16 +2787,70 @@ class TerminalSequentialPlanner:
             >= self._policy.max_wall_clock_seconds
             * self._policy.delivery_mode_fraction
         )
+        repair_mode = bool(
+            session.pending_repair_receipt_id is not None
+            and session.repair_applied_action_id is None
+        )
+        verification_due = bool(
+            has_verifiable_state
+            and not reconciliation_mode
+            and (
+                (
+                    has_successful_work
+                    and session.pending_repair_receipt_id is None
+                )
+                or session.reconciliation_state
+                is TerminalReconciliationState.STABLE_UNVERIFIED
+                or session.repair_applied_action_id is not None
+                or (
+                    finalization_mode
+                    and session.pending_repair_receipt_id is None
+                )
+            )
+        )
+        artifact_first_mode = not any(
+            item.intent.command_role
+            in (TerminalCommandRole.WORK, TerminalCommandRole.VERIFY)
+            for item in all_records
+        )
+        artifact_inspection_limit = self._policy.max_artifact_first_inspections
+        artifact_recovery = bool(
+            artifact_first_mode
+            and artifact_inspection_limit is not None
+            and session.inspection_commands >= artifact_inspection_limit
+        )
+        recovery_mode = bool(
+            self._recovery_mode(state)
+            or session.latest_failure_signatures
+            or force_emergency
+            or delivery_mode
+            or finalization_mode
+            or reconciliation_mode
+            or repair_mode
+            or verification_due
+            or artifact_recovery
+        )
         compact_context = bool(
-            delivery_mode or finalization_mode or reconciliation_mode
+            delivery_mode
+            or finalization_mode
+            or reconciliation_mode
+            or repair_mode
+            or verification_due
+            or recovery_mode
         )
         context_record_limit = (
-            self._policy.max_delivery_context_records
+            min(
+                self._policy.max_context_records,
+                self._policy.max_delivery_context_records,
+            )
             if compact_context
             else self._policy.max_context_records
         )
         context_output_limit = (
-            self._policy.max_delivery_context_output_characters
+            min(
+                self._policy.max_context_output_characters,
+                self._policy.max_delivery_context_output_characters,
+            )
             if compact_context
             else self._policy.max_context_output_characters
         )
@@ -2778,23 +2870,6 @@ class TerminalSequentialPlanner:
             if self._policy.max_cost_usd is None
             else max(0.0, self._policy.max_cost_usd - session.cost_usd)
         )
-        repair_mode = bool(
-            session.pending_repair_receipt_id is not None
-            and session.repair_applied_action_id is None
-        )
-        verification_due = bool(
-            has_verifiable_state
-            and not reconciliation_mode
-            and (
-                session.reconciliation_state
-                is TerminalReconciliationState.STABLE_UNVERIFIED
-                or session.repair_applied_action_id is not None
-                or (
-                    finalization_mode
-                    and session.pending_repair_receipt_id is None
-                )
-            )
-        )
         deadline_sequence: TerminalDeadlineSequence | None = None
         if self._uses_deadline_slots:
             if reconciliation_mode:
@@ -2807,28 +2882,6 @@ class TerminalSequentialPlanner:
                 deadline_sequence = TerminalDeadlineSequence.DIRECT_VERIFY
             elif finalization_mode or repair_mode:
                 deadline_sequence = TerminalDeadlineSequence.WORK_THEN_VERIFY
-        artifact_first_mode = not any(
-            item.intent.command_role
-            in (TerminalCommandRole.WORK, TerminalCommandRole.VERIFY)
-            for item in all_records
-        )
-        artifact_inspection_limit = (
-            self._policy.max_artifact_first_inspections
-        )
-        artifact_recovery = bool(
-            artifact_first_mode
-            and artifact_inspection_limit is not None
-            and session.inspection_commands >= artifact_inspection_limit
-        )
-        recovery_mode = bool(
-            self._recovery_mode(state)
-            or delivery_mode
-            or finalization_mode
-            or reconciliation_mode
-            or repair_mode
-            or verification_due
-            or artifact_recovery
-        )
         deadline_slots: TerminalDeadlineSlots | None = None
         if self._uses_deadline_slots:
             deadline_slots = self._deadline_slots(
@@ -2839,6 +2892,7 @@ class TerminalSequentialPlanner:
                 reconciliation_mode=reconciliation_mode,
                 repair_mode=repair_mode,
                 verification_due=verification_due,
+                recovery_mode=recovery_mode,
                 sequence=deadline_sequence,
             )
             if deadline_slots.action_limit_seconds is not None:
@@ -3034,6 +3088,7 @@ class TerminalSequentialPlanner:
         reconciliation_mode: bool = False,
         repair_mode: bool = False,
         verification_due: bool = False,
+        recovery_mode: bool = False,
         include_current_inference: bool = True,
         sequence: TerminalDeadlineSequence | None = None,
         command_role: TerminalCommandRole | None = None,
@@ -3057,6 +3112,7 @@ class TerminalSequentialPlanner:
                     or reconciliation_mode
                     or repair_mode
                     or verification_due
+                    or recovery_mode
                 ),
                 command_role=(
                     None if command_role is None else command_role.value
@@ -3069,6 +3125,7 @@ class TerminalSequentialPlanner:
             or reconciliation_mode
             or repair_mode
             or verification_due
+            or recovery_mode
         )
         timing = self._deadline_timing
         if timing is None:

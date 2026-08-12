@@ -360,6 +360,41 @@ class TerminalVerificationAssuranceTests(unittest.IsolatedAsyncioTestCase):
             any("terminal-bench" in hint.lower() for hint in hints)
         )
 
+    def test_behavior_hints_cover_generic_runtime_boundaries(self) -> None:
+        requirements = _task_requirements(
+            "Support cancellation with max concurrent workers and cleanup. "
+            "Expose a public API that starts a background server on a port. "
+            "The same polyglot artifact must compile with every required toolchain. "
+            "Repair the reported CWE vulnerability and produce a security report."
+        )
+
+        hints = _terminal_behavior_hints(requirements)
+        joined = "\n".join(hints).lower()
+
+        self.assertIn("below, at, and above", joined)
+        self.assertIn("queued work", joined)
+        self.assertIn("cleanup count", joined)
+        self.assertIn("fresh process", joined)
+        self.assertIn("detached lifecycle", joined)
+        self.assertIn("actual endpoint", joined)
+        self.assertIn("every required toolchain", joined)
+        self.assertIn("same artifact", joined)
+        self.assertIn("observed source or test evidence", joined)
+        self.assertIn("focused regression", joined)
+        self.assertFalse(any("terminal-bench" in hint.lower() for hint in hints))
+        self.assertFalse(
+            any(
+                task_name in hint.lower()
+                for hint in hints
+                for task_name in (
+                    "cancel-async-tasks",
+                    "headless-terminal",
+                    "polyglot-rust-c",
+                    "fix-code-vulnerability",
+                )
+            )
+        )
+
     def test_task_provided_independent_claim_is_not_automatically_trusted(
         self,
     ) -> None:

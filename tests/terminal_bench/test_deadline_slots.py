@@ -687,6 +687,94 @@ class TerminalDeadlineIntegrationTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
+    async def test_successful_work_prefers_direct_verify_before_finalization(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = build_terminal_application(
+                trial_id="deadline-successful-work-direct-verify",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(),
+                proposal_capability=_ProfiledDeadlineScriptedCapability(),
+                policy=self._deadline_policy(),
+            )
+            try:
+                app.journal._records = [
+                    self._record(
+                        app.journal.trial_id,
+                        "successful-work",
+                        TerminalCommandRole.WORK,
+                    )
+                ]
+                app.journal._session = app.journal.snapshot().model_copy(
+                    update={
+                        "committed_commands": 1,
+                        "task_generation": 1,
+                        "known_state_generation": 1,
+                        "successful_work_generation": 1,
+                    }
+                )
+
+                request = app.runtime._planner._turn_request(
+                    self._state("create and verify an artifact"),
+                    app.journal.snapshot(),
+                )
+
+                self.assertFalse(request.finalization_mode)
+                self.assertTrue(request.verification_due)
+                self.assertIs(
+                    request.execution_limits.deadline_sequence,
+                    TerminalDeadlineSequence.DIRECT_VERIFY,
+                )
+                self.assertLessEqual(
+                    request.execution_limits.max_inference_timeout_sec or 0.0,
+                    _PROFILE.compact_inference.maximum_seconds,
+                )
+            finally:
+                app.close()
+
+    async def test_observed_failure_compacts_inference_but_preserves_work_cap(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = build_terminal_application(
+                trial_id="deadline-failure-compact-recovery",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(),
+                proposal_capability=_ProfiledDeadlineScriptedCapability(),
+                policy=self._deadline_policy(),
+            )
+            try:
+                app.journal._session = app.journal.snapshot().model_copy(
+                    update={
+                        "committed_commands": 1,
+                        "task_generation": 1,
+                        "known_state_generation": 1,
+                        "latest_failure_signatures": (
+                            "command returned non-zero status 1",
+                        ),
+                    }
+                )
+
+                request = app.runtime._planner._turn_request(
+                    self._state("repair a failed artifact build"),
+                    app.journal.snapshot(),
+                )
+
+                self.assertFalse(request.finalization_mode)
+                self.assertTrue(request.recovery_mode)
+                self.assertIsNone(request.execution_limits.deadline_sequence)
+                self.assertLessEqual(
+                    request.execution_limits.max_inference_timeout_sec or 0.0,
+                    _PROFILE.compact_inference.maximum_seconds,
+                )
+                self.assertEqual(
+                    request.execution_limits.max_work_timeout_sec,
+                    300,
+                )
+            finally:
+                app.close()
+
     @staticmethod
     def _deadline_policy() -> TerminalExecutionPolicy:
         return TerminalExecutionPolicy(
