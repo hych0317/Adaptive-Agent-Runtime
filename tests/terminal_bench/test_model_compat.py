@@ -28,9 +28,11 @@ from applications.terminal_bench.composition import (
     build_terminal_model_capability,
 )
 from applications.terminal_bench.models import (
+    TerminalCommandIntent,
     TerminalExecutionPolicy,
     TerminalRequirement,
     TerminalSessionSnapshot,
+    TerminalTimeoutCapReason,
     TerminalTurnRequest,
 )
 from applications.terminal_bench.planner import (
@@ -119,6 +121,29 @@ def _turn_request() -> TerminalTurnRequest:
 
 
 class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
+    def test_legacy_intent_replays_with_applied_timeout_unchanged(self) -> None:
+        intent = TerminalCommandIntent.model_validate(
+            {
+                "trial_id": "legacy-trial",
+                "call_key": "legacy-call",
+                "command": "true",
+                "timeout_sec": 37,
+            }
+        )
+
+        self.assertEqual(intent.timeout_sec, 37)
+        self.assertIsNone(intent.requested_timeout_sec)
+        self.assertIsNone(intent.advertised_timeout_cap_sec)
+        self.assertEqual(
+            intent.timeout_cap_reason,
+            TerminalTimeoutCapReason.LEGACY_UNSPECIFIED,
+        )
+        replayed = TerminalCommandIntent.model_validate(
+            intent.model_dump(mode="json")
+        )
+        self.assertEqual(replayed.timeout_sec, 37)
+        self.assertEqual(replayed, intent)
+
     async def test_instruction_scopes_repairs_and_verification(self) -> None:
         gateway = _RecordingGateway(
             {"decision": "complete", "summary": "Task complete"}
@@ -330,7 +355,7 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(env_object["required"], [])
         self.assertFalse(env_object["additionalProperties"])
         timeout_integer = properties["timeout_sec"]["anyOf"][0]
-        self.assertEqual(timeout_integer["maximum"], 300)
+        self.assertNotIn("maximum", timeout_integer)
         verification = schema["$defs"]["TerminalVerificationContract"]
         self.assertEqual(
             set(verification["required"]),
@@ -470,7 +495,7 @@ class TerminalModelCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             ("call_key", "command", "command_role"),
         )
         timeout_integer = schema["properties"]["timeout_sec"]["anyOf"][0]
-        self.assertEqual(timeout_integer["maximum"], 300)
+        self.assertNotIn("maximum", timeout_integer)
         instruction = valid_gateway.request.input["instruction"]
         self.assertIn("absent from payload.used_call_keys", instruction)
         self.assertIn("never '.' or another relative path", instruction)

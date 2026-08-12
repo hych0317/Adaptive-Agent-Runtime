@@ -70,6 +70,16 @@ class TerminalCommandRole(StrEnum):
     VERIFY = "verify"
 
 
+class TerminalTimeoutCapReason(StrEnum):
+    """Why the authoritative applied timeout differs from the draft."""
+
+    MODEL_REQUESTED = "model_requested"
+    RUNTIME_DEFAULT = "runtime_default"
+    ADVERTISED_CAP = "advertised_cap"
+    FRESH_DEADLINE_CAP = "fresh_deadline_cap"
+    LEGACY_UNSPECIFIED = "legacy_unspecified"
+
+
 class TerminalVerificationEvidence(StrEnum):
     OFFICIAL_TESTS = "official_tests"
     INDEPENDENT_CHECK = "independent_check"
@@ -752,6 +762,11 @@ class TerminalHistoryItem(TerminalModel):
     cwd: str | None = None
     environment_keys: tuple[str, ...] = ()
     timeout_sec: int = Field(ge=1)
+    requested_timeout_sec: int | None = Field(default=None, ge=1)
+    advertised_timeout_cap_sec: int | None = Field(default=None, ge=1)
+    timeout_cap_reason: TerminalTimeoutCapReason = (
+        TerminalTimeoutCapReason.LEGACY_UNSPECIFIED
+    )
     verification: TerminalVerificationContract | None = None
     execution_state: TerminalExecutionState
     return_code: int | None = None
@@ -857,9 +872,23 @@ class TerminalCommandIntent(TerminalModel):
     cwd: str | None = Field(default=None, min_length=1, max_length=4096)
     env: dict[str, str] = Field(default_factory=dict)
     timeout_sec: int = Field(ge=1)
+    requested_timeout_sec: int | None = Field(default=None, ge=1)
+    advertised_timeout_cap_sec: int | None = Field(default=None, ge=1)
+    timeout_cap_reason: TerminalTimeoutCapReason = (
+        TerminalTimeoutCapReason.LEGACY_UNSPECIFIED
+    )
     command_role: TerminalCommandRole = TerminalCommandRole.WORK
     process_reference: TerminalProcessReference | None = None
     verification: TerminalVerificationContract | None = None
+
+    @model_validator(mode="after")
+    def validate_timeout_audit(self) -> TerminalCommandIntent:
+        if (
+            self.advertised_timeout_cap_sec is not None
+            and self.timeout_sec > self.advertised_timeout_cap_sec
+        ):
+            raise ValueError("applied timeout cannot exceed advertised cap")
+        return self
 
     def tool_arguments(self) -> dict[str, Any]:
         return {
@@ -919,6 +948,11 @@ class TerminalCommandRecord(TerminalModel):
             cwd=self.intent.cwd,
             environment_keys=tuple(sorted(self.intent.env)),
             timeout_sec=self.intent.timeout_sec,
+            requested_timeout_sec=self.intent.requested_timeout_sec,
+            advertised_timeout_cap_sec=(
+                self.intent.advertised_timeout_cap_sec
+            ),
+            timeout_cap_reason=self.intent.timeout_cap_reason,
             verification=self.intent.verification,
             execution_state=self.result.execution_state,
             return_code=self.result.return_code,

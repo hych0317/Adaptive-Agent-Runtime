@@ -60,6 +60,7 @@ from applications.terminal_bench.models import (
     TerminalExecutionLimits,
     TerminalExecutionState,
     TerminalPendingCommand,
+    TerminalTimeoutCapReason,
     TerminalProposalRejection,
     TerminalProcessReference,
     TerminalReconciliationReceipt,
@@ -1525,7 +1526,6 @@ class GatewayTerminalTurnProposalCapability:
             },
             response_schema=_terminal_turn_response_schema(
                 strict=self._strict_json_schema,
-                max_timeout_sec=request.execution_limits.max_timeout_sec,
             ),
             requirements=InferenceRequirements(
                 required_structured_output=self._required_structured_output,
@@ -1726,6 +1726,7 @@ class GatewayTerminalTurnProposalCapability:
 def _terminal_turn_response_schema(
     *, strict: bool = False, max_timeout_sec: int | None = None
 ) -> dict[str, JsonValue]:
+    del max_timeout_sec
     schema = cast(
         dict[str, JsonValue],
         TerminalTurnDraft.model_json_schema(mode="validation"),
@@ -1733,16 +1734,6 @@ def _terminal_turn_response_schema(
     properties = schema.get("properties")
     if isinstance(properties, dict):
         properties.pop("rationale", None)
-        timeout_schema = properties.get("timeout_sec")
-        if max_timeout_sec is not None and isinstance(timeout_schema, dict):
-            variants = timeout_schema.get("anyOf")
-            if isinstance(variants, list):
-                for variant in variants:
-                    if (
-                        isinstance(variant, dict)
-                        and variant.get("type") == "integer"
-                    ):
-                        variant["maximum"] = max_timeout_sec
     required = schema.get("required")
     if isinstance(required, list):
         schema["required"] = [item for item in required if item != "rationale"]
@@ -2304,7 +2295,12 @@ class TerminalSequentialPlanner:
             intent = self._resolve_intent(
                 draft,
                 session,
-                max_timeout_sec=request.execution_limits.max_timeout_sec,
+                execution_limits=request.execution_limits,
+                finalization_mode=request.finalization_mode,
+                reconciliation_mode=request.reconciliation_mode,
+                deadline_sequence=(
+                    request.execution_limits.deadline_sequence
+                ),
             )
             self._validate_intent(
                 intent,
@@ -2983,7 +2979,10 @@ class TerminalSequentialPlanner:
         draft: TerminalTurnDraft,
         session: TerminalSessionSnapshot,
         *,
-        max_timeout_sec: int | None = None,
+        execution_limits: TerminalExecutionLimits,
+        finalization_mode: bool = False,
+        reconciliation_mode: bool = False,
+        deadline_sequence: TerminalDeadlineSequence | None = None,
     ) -> TerminalCommandIntent:
         assert (
             draft.call_key is not None
@@ -2997,14 +2996,50 @@ class TerminalSequentialPlanner:
             else dict(session.environment)
         )
         default_timeout_sec = self._policy.default_timeout_sec
-        if draft.command_role is TerminalCommandRole.VERIFY:
-            default_timeout_sec = min(
-                default_timeout_sec,
-                self._policy.max_verification_timeout_sec,
+        role_cap = {
+            TerminalCommandRole.WORK: execution_limits.max_work_timeout_sec,
+            TerminalCommandRole.VERIFY: (
+                execution_limits.max_verification_timeout_sec
+            ),
+            TerminalCommandRole.INSPECT: (
+                execution_limits.max_inspection_timeout_sec
+                or execution_limits.max_timeout_sec
+            ),
+        }[draft.command_role]
+        advertised_cap = min(execution_limits.max_timeout_sec, role_cap)
+        default_timeout_sec = min(default_timeout_sec, advertised_cap)
+        requested_timeout_sec = draft.timeout_sec
+        candidate_timeout = (
+            requested_timeout_sec
+            if requested_timeout_sec is not None
+            else default_timeout_sec
+        )
+        applied_cap = advertised_cap
+        fresh_deadline_cap: int | None = None
+        if draft.command_role in {
+            TerminalCommandRole.INSPECT,
+            TerminalCommandRole.VERIFY,
+        }:
+            fresh_deadline_cap = self._deadline_timeout_limit(
+                session,
+                command_role=draft.command_role,
+                finalization_mode=finalization_mode,
+                deadline_sequence=deadline_sequence,
             )
-        if max_timeout_sec is not None:
-            default_timeout_sec = min(default_timeout_sec, max_timeout_sec)
-        timeout_sec = draft.timeout_sec or default_timeout_sec
+            if fresh_deadline_cap is not None:
+                applied_cap = min(applied_cap, max(1, fresh_deadline_cap))
+        timeout_sec = min(candidate_timeout, applied_cap)
+        if timeout_sec < candidate_timeout:
+            timeout_cap_reason = (
+                TerminalTimeoutCapReason.FRESH_DEADLINE_CAP
+                if fresh_deadline_cap is not None
+                and fresh_deadline_cap < advertised_cap
+                else TerminalTimeoutCapReason.ADVERTISED_CAP
+            )
+        elif requested_timeout_sec is None:
+            timeout_cap_reason = TerminalTimeoutCapReason.RUNTIME_DEFAULT
+        else:
+            timeout_cap_reason = TerminalTimeoutCapReason.MODEL_REQUESTED
         return TerminalCommandIntent(
             trial_id=session.trial_id,
             call_key=draft.call_key,
@@ -3012,6 +3047,9 @@ class TerminalSequentialPlanner:
             cwd=cwd,
             env=environment,
             timeout_sec=timeout_sec,
+            requested_timeout_sec=requested_timeout_sec,
+            advertised_timeout_cap_sec=advertised_cap,
+            timeout_cap_reason=timeout_cap_reason,
             command_role=draft.command_role,
             process_reference=draft.process_reference,
             verification=draft.verification,
@@ -3215,92 +3253,6 @@ class TerminalSequentialPlanner:
                 field="command_role",
                 rejected_value=intent.command_role.value,
                 expected="work before verify",
-            )
-        if intent.timeout_sec > self._policy.max_timeout_sec:
-            raise _TerminalProposalValidationError(
-                code="terminal.timeout.above_maximum",
-                message="timeout exceeds Runtime maximum",
-                field="timeout_sec",
-                rejected_value=intent.timeout_sec,
-                expected=f"an integer from 1 through {self._policy.max_timeout_sec}",
-            )
-        if (
-            effective_sequence is TerminalDeadlineSequence.WORK_THEN_VERIFY
-            and intent.command_role is TerminalCommandRole.WORK
-            and intent.timeout_sec
-            > min(
-                self._policy.max_timeout_sec,
-                self._policy.final_repair_timeout_sec,
-            )
-        ):
-            raise _TerminalProposalValidationError(
-                code="terminal.finalization.repair_timeout_above_maximum",
-                message="finalization repair exceeds the reserved short repair slot",
-                field="timeout_sec",
-                rejected_value=intent.timeout_sec,
-                expected=(
-                    "an integer from 1 through "
-                    f"{min(self._policy.max_timeout_sec, self._policy.final_repair_timeout_sec)}"
-                ),
-            )
-        if (
-            effective_sequence
-            in {
-                TerminalDeadlineSequence.RECONCILE_THEN_WORK_VERIFY,
-                TerminalDeadlineSequence.RECONCILE_THEN_VERIFY,
-            }
-            and intent.command_role is TerminalCommandRole.INSPECT
-            and intent.timeout_sec > self._policy.final_repair_timeout_sec
-        ):
-            raise _TerminalProposalValidationError(
-                code="terminal.reconciliation.timeout_above_maximum",
-                message="reconciliation inspection exceeds its bounded slot",
-                field="timeout_sec",
-                rejected_value=intent.timeout_sec,
-                expected=(
-                    "an integer from 1 through "
-                    f"{self._policy.final_repair_timeout_sec}"
-                ),
-            )
-        if (
-            intent.command_role is TerminalCommandRole.VERIFY
-            and intent.timeout_sec > self._policy.max_verification_timeout_sec
-        ):
-            raise _TerminalProposalValidationError(
-                code="terminal.verification.timeout_above_maximum",
-                message=(
-                    "verification timeout exceeds the bounded verification "
-                    "maximum"
-                ),
-                field="timeout_sec",
-                rejected_value=intent.timeout_sec,
-                expected=(
-                    "an integer from 1 through "
-                    f"{self._policy.max_verification_timeout_sec} for verify"
-                ),
-            )
-        deadline_timeout_sec = self._deadline_timeout_limit(
-            session,
-            command_role=intent.command_role,
-            finalization_mode=finalization_mode,
-            deadline_sequence=effective_sequence,
-        )
-        if (
-            deadline_timeout_sec is not None
-            and intent.timeout_sec > deadline_timeout_sec
-        ):
-            raise _TerminalProposalValidationError(
-                code="terminal.timeout.insufficient_deadline",
-                message=(
-                    "timeout no longer fits the remaining Run wall-clock "
-                    "budget and cleanup grace"
-                ),
-                field="timeout_sec",
-                rejected_value=intent.timeout_sec,
-                expected=(
-                    "an integer from 1 through "
-                    f"{deadline_timeout_sec}; use the shortest viable command"
-                ),
             )
         if len(intent.env) > self._policy.max_environment_variables:
             raise _TerminalProposalValidationError(

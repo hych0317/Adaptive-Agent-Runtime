@@ -25,6 +25,7 @@ from applications.terminal_bench.models import (
     TerminalCommandRole,
     TerminalExecutionPolicy,
     TerminalExecutionState,
+    TerminalTimeoutCapReason,
     TerminalTurnDraft,
     TerminalTurnProposal,
     TerminalTurnRequest,
@@ -353,7 +354,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
-    async def test_deadline_is_corrected_before_pending_save(self) -> None:
+    async def test_deadline_timeout_is_clamped_before_pending_save(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             environment = FakeTerminalEnvironment(
                 completed_result(stdout="corrected"),
@@ -368,11 +369,6 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                         "sleep 1",
                         call_key="too-wide",
                         timeout_sec=30,
-                    ),
-                    execute_draft(
-                        "printf corrected",
-                        call_key="corrected",
-                        timeout_sec=1,
                     ),
                     verify_draft("true", timeout_sec=1),
                 ),
@@ -392,14 +388,18 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(environment.calls), 2)
                 self.assertIsNone(app.journal.pending())
                 self.assertTrue(artifacts.summary.trace_consistent)
-                transcript = Path(directory, "aar-transcript.jsonl").read_text(
-                    encoding="utf-8"
+                record = app.journal.records()[0]
+                self.assertEqual(record.intent.requested_timeout_sec, 30)
+                self.assertEqual(
+                    record.intent.timeout_sec,
+                    record.intent.advertised_timeout_cap_sec,
                 )
-                self.assertIn(
-                    '"code": "terminal.timeout.insufficient_deadline"',
-                    transcript,
+                self.assertLess(record.intent.timeout_sec, 30)
+                self.assertEqual(
+                    record.intent.timeout_cap_reason,
+                    TerminalTimeoutCapReason.ADVERTISED_CAP,
                 )
-                self.assertNotIn('"kind": "pending.abandoned"', transcript)
+                self.assertEqual(app.journal.snapshot().proposal_rejections, 0)
             finally:
                 app.close()
 
@@ -603,18 +603,13 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
-    async def test_timeout_above_runtime_maximum_is_correctable(self) -> None:
+    async def test_timeout_above_runtime_maximum_is_clamped_locally(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             capability = ScriptedTerminalTurnCapability(
                 execute_draft(
                     "long-build",
                     call_key="invalid-timeout",
                     timeout_sec=301,
-                ),
-                execute_draft(
-                    "bounded-build",
-                    call_key="bounded-timeout",
-                    timeout_sec=300,
                 ),
                 verify_draft("test -f /app/result"),
                 complete_draft(),
@@ -634,12 +629,58 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 artifacts = await app.run("build with a bounded timeout")
                 self.assertTrue(artifacts.runtime_result.succeeded)
                 self.assertEqual(len(environment.calls), 2)
-                self.assertEqual(environment.calls[0].command, "bounded-build")
-                rejection = capability.requests[1].session.last_proposal_rejection
-                self.assertIsNotNone(rejection)
-                assert rejection is not None
-                self.assertEqual(rejection.code, "terminal.timeout.above_maximum")
-                self.assertEqual(rejection.rejected_value, "301")
+                self.assertEqual(environment.calls[0].command, "long-build")
+                record = app.journal.records()[0]
+                self.assertEqual(record.intent.requested_timeout_sec, 301)
+                self.assertEqual(record.intent.advertised_timeout_cap_sec, 300)
+                self.assertEqual(record.intent.timeout_sec, 300)
+                self.assertEqual(
+                    record.intent.timeout_cap_reason,
+                    TerminalTimeoutCapReason.ADVERTISED_CAP,
+                )
+                self.assertEqual(app.journal.snapshot().proposal_rejections, 0)
+                self.assertEqual(len(capability.requests), 2)
+            finally:
+                app.close()
+
+    async def test_verification_timeout_is_clamped_without_replanning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft("create-artifact", call_key="work-1"),
+                verify_draft(
+                    "test -f /app/result",
+                    call_key="verify-wide",
+                    timeout_sec=300,
+                ),
+            )
+            environment = FakeTerminalEnvironment(
+                completed_result(stdout="built"),
+                completed_result(stdout="verified"),
+            )
+            app = build_terminal_application(
+                trial_id="trial-verify-timeout-clamp",
+                logs_dir=directory,
+                environment=environment,
+                proposal_capability=capability,
+            )
+            try:
+                artifacts = await app.run("build and verify an artifact")
+
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertEqual(len(environment.calls), 2)
+                verify_record = app.journal.records()[1]
+                self.assertEqual(verify_record.intent.requested_timeout_sec, 300)
+                self.assertEqual(
+                    verify_record.intent.advertised_timeout_cap_sec,
+                    120,
+                )
+                self.assertEqual(verify_record.intent.timeout_sec, 120)
+                self.assertEqual(
+                    verify_record.intent.timeout_cap_reason,
+                    TerminalTimeoutCapReason.ADVERTISED_CAP,
+                )
+                self.assertEqual(app.journal.snapshot().proposal_rejections, 0)
+                self.assertEqual(len(capability.requests), 2)
             finally:
                 app.close()
 
@@ -1180,7 +1221,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
-    async def test_deadline_timeout_is_corrected_before_core_termination(
+    async def test_deadline_timeout_is_clamped_before_core_termination(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1189,11 +1230,6 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     "slow-repair",
                     call_key="work-too-wide",
                     timeout_sec=300,
-                ),
-                execute_draft(
-                    "quick-repair",
-                    call_key="work-corrected",
-                    timeout_sec=60,
                 ),
                 verify_draft("test -e /app", timeout_sec=60),
             )
@@ -1220,7 +1256,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertTrue(artifacts.runtime_result.succeeded)
                 self.assertEqual(len(environment.calls), 2)
-                self.assertEqual(session.proposal_rejections, 1)
+                self.assertEqual(session.proposal_rejections, 0)
                 self.assertEqual(
                     capability.requests[0]
                     .execution_limits.timeout_admission_margin_seconds,
@@ -1230,12 +1266,16 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     capability.requests[0].execution_limits.max_timeout_sec,
                     172,
                 )
-                transcript = Path(directory, "aar-transcript.jsonl").read_text(
-                    encoding="utf-8"
+                record = app.journal.records()[0]
+                self.assertEqual(record.intent.requested_timeout_sec, 300)
+                self.assertEqual(
+                    record.intent.timeout_sec,
+                    record.intent.advertised_timeout_cap_sec,
                 )
-                self.assertIn(
-                    '"code": "terminal.timeout.insufficient_deadline"',
-                    transcript,
+                self.assertLessEqual(record.intent.timeout_sec, 172)
+                self.assertEqual(
+                    record.intent.timeout_cap_reason,
+                    TerminalTimeoutCapReason.ADVERTISED_CAP,
                 )
                 self.assertTrue(artifacts.summary.trace_consistent)
             finally:
@@ -1287,11 +1327,6 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     call_key="work-too-wide",
                     timeout_sec=180,
                 ),
-                execute_draft(
-                    "bounded-repair",
-                    call_key="work-bounded",
-                    timeout_sec=60,
-                ),
                 verify_draft(
                     "test -e /app",
                     call_key="verification-1",
@@ -1302,7 +1337,6 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 trial_id="trial-finalization-reserve",
                 logs_dir=directory,
                 environment=FakeTerminalEnvironment(
-                    completed_result(),
                     completed_result(),
                     completed_result(),
                 ),
@@ -1319,14 +1353,14 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 artifacts = await app.run("repair and verify the artifact")
 
                 self.assertTrue(artifacts.runtime_result.succeeded)
-                self.assertEqual(len(app.journal.records()), 3)
-                self.assertEqual(app.journal.snapshot().proposal_rejections, 1)
-                transcript = Path(directory, "aar-transcript.jsonl").read_text(
-                    encoding="utf-8"
-                )
-                self.assertIn(
-                    '"code": "terminal.timeout.insufficient_deadline"',
-                    transcript,
+                records = app.journal.records()
+                self.assertEqual(len(records), 3)
+                self.assertEqual(app.journal.snapshot().proposal_rejections, 0)
+                self.assertEqual(records[1].intent.requested_timeout_sec, 180)
+                self.assertEqual(records[1].intent.timeout_sec, 180)
+                self.assertEqual(
+                    records[1].intent.timeout_cap_reason,
+                    TerminalTimeoutCapReason.MODEL_REQUESTED,
                 )
             finally:
                 app.close()
