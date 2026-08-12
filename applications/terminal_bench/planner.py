@@ -718,38 +718,23 @@ class JsonlTerminalTrialJournal:
         return None
 
     def submission_gate_error(self) -> str | None:
-        """Return None only for a successful but non-trusted final verification."""
+        """Return None when the persisted container state is safe to submit."""
 
-        if not self._records:
-            return "no committed verification command exists"
-        record = self._records[-1]
-        if record.intent.command_role is not TerminalCommandRole.VERIFY:
-            return "the last committed command is not marked verify"
-        if not _current_generation_is_verifiable(self._session):
+        if not self.trace_consistent:
+            return "submission trace is inconsistent or has a pending Action"
+        if self._session.in_doubt_reconciliation_required:
+            return "submission has unresolved IN_DOUBT state"
+        if not _generation_state_is_known(self._session):
             return "submission has no stable current-generation task state"
-        if not record.result.succeeded or record.intent.verification is None:
-            return "the latest verification did not pass"
+        if self._session.verified_checkpoint is not None:
+            return "a verified checkpoint must use the success lock"
         receipt = self._session.latest_verification_receipt
-        ledger = self._session.task_ledger
-        if receipt is None or ledger is None:
-            return "submission has no verification receipt and requirement ledger"
-        if receipt.action_id != record.action_id or not receipt.passed:
-            return "submission receipt does not match the latest verification"
-        if receipt.assurance is TerminalEvidenceAssurance.TRUSTED:
-            return "trusted verification must use the success lock"
-        required_ids = {item.requirement_id for item in ledger.entries}
-        if set(receipt.covered_requirement_ids) != required_ids:
-            return "submission receipt does not cover the task contract"
-        if any(
-            item.state is not TerminalRequirementState.SATISFIED
-            or item.assurance is not TerminalEvidenceAssurance.SELF_CHECKED
-            or item.evidence_provenance is not receipt.evidence_provenance
-            or item.artifact_fingerprints != receipt.artifact_fingerprints
-            or item.latest_evidence_action_id != receipt.action_id
-            or item.evidence_generation != self._session.task_generation
-            for item in ledger.entries
+        if (
+            receipt is not None
+            and receipt.passed
+            and receipt.assurance is TerminalEvidenceAssurance.TRUSTED
         ):
-            return "submission ledger is not self-checked by the latest receipt"
+            return "trusted verification must use the success lock"
         return None
 
     def mark_submitted_unverified(self, summary: str) -> None:
@@ -2113,6 +2098,44 @@ class TerminalSequentialPlanner:
             or self._deadline_timing is not None
         )
 
+    def _submit_unverified_if_safe(
+        self,
+        *,
+        summary: str,
+        reason: str,
+    ) -> PlanDecision | None:
+        if self._journal.submission_gate_error() is not None:
+            return None
+        self._journal.mark_submitted_unverified(summary)
+        return PlanDecision.complete(
+            output={
+                "profile": AAR_TERMINAL_SEQUENTIAL_PROFILE,
+                "agent_complete": False,
+                "completion_disposition": (
+                    TerminalCompletionDisposition.SUBMITTED_UNVERIFIED.value
+                ),
+                "summary": summary,
+            },
+            reason=reason,
+        )
+
+    def _deadline_submission_decision(
+        self,
+        *,
+        context: str,
+    ) -> PlanDecision | None:
+        return self._submit_unverified_if_safe(
+            summary=(
+                "The Runtime preserved the latest known container state when "
+                f"the remaining deadline could not safely admit {context}; "
+                "artifacts were submitted for Harbor verification."
+            ),
+            reason=(
+                "Submit the known state without another model or command after "
+                "deadline-aware allocation selected the shortest safe path."
+            ),
+        )
+
     async def plan(self, state: AgentState) -> PlanDecision:
         await self.reconcile_observation(state)
         requirements = _task_requirements(state.task.description)
@@ -2179,6 +2202,7 @@ class TerminalSequentialPlanner:
             )
         if (
             session.latest_verification_receipt is not None
+            and session.latest_verification_receipt.passed
             and self._journal.submission_gate_error() is None
         ):
             summary = (
@@ -2199,12 +2223,39 @@ class TerminalSequentialPlanner:
             )
         budget_error = self._budget_error(session, allow_command_limit=False)
         if budget_error is not None:
+            submission = self._submit_unverified_if_safe(
+                summary=(
+                    "The Runtime preserved the latest known container state "
+                    f"after {budget_error}; artifacts were submitted for Harbor "
+                    "verification."
+                ),
+                reason="Submit known state instead of starting an unavailable turn.",
+            )
+            if submission is not None:
+                return submission
             return PlanDecision.fail(error=budget_error)
         request = self._turn_request(state, session)
+        if request.execution_limits.max_inference_timeout_sec == 0:
+            submission = self._deadline_submission_decision(
+                context="another inference",
+            )
+            if submission is not None:
+                return submission
+            return PlanDecision.fail(
+                error=(
+                    "terminal deadline cannot admit another inference and the "
+                    "current state is unsafe to submit"
+                )
+            )
         try:
             proposal = await self._capability.propose(request)
         except InferenceExecutionBudgetError as exc:
             if request.emergency_mode:
+                submission = self._deadline_submission_decision(
+                    context="another emergency inference",
+                )
+                if submission is not None:
+                    return submission
                 raise RunBudgetExhaustedError(
                     "active_execution",
                     "terminal emergency inference budget exhausted: "
@@ -2222,11 +2273,21 @@ class TerminalSequentialPlanner:
             deadline_timing = self._deadline_timing
             if (
                 self._uses_deadline_slots
-                and deadline_timing is not None
                 and retry_inference_cap is not None
-                and retry_inference_cap
-                < deadline_timing.compact_minimum_seconds
+                and (
+                    retry_inference_cap <= 0
+                    or (
+                        deadline_timing is not None
+                        and retry_inference_cap
+                        < deadline_timing.compact_minimum_seconds
+                    )
+                )
             ):
+                submission = self._deadline_submission_decision(
+                    context="the emergency inference minimum",
+                )
+                if submission is not None:
+                    return submission
                 raise RunBudgetExhaustedError(
                     "active_execution",
                     "terminal emergency inference budget exhausted: minimum "
@@ -2235,6 +2296,11 @@ class TerminalSequentialPlanner:
             try:
                 proposal = await self._capability.propose(retry_request)
             except InferenceExecutionBudgetError as retry_exc:
+                submission = self._deadline_submission_decision(
+                    context="a second inference attempt",
+                )
+                if submission is not None:
+                    return submission
                 raise RunBudgetExhaustedError(
                     "active_execution",
                     "terminal emergency inference budget exhausted: "
@@ -2249,6 +2315,16 @@ class TerminalSequentialPlanner:
             allow_exact_limit=True,
         )
         if budget_error is not None:
+            submission = self._submit_unverified_if_safe(
+                summary=(
+                    "The Runtime preserved the latest known container state "
+                    f"after {budget_error}; artifacts were submitted for Harbor "
+                    "verification."
+                ),
+                reason="Submit known state without executing an over-budget proposal.",
+            )
+            if submission is not None:
+                return submission
             return PlanDecision.fail(error=budget_error)
         draft = proposal.draft
         if (
@@ -2292,6 +2368,16 @@ class TerminalSequentialPlanner:
                 session.completion_rejections
                 >= self._policy.max_completion_rejections
             ):
+                submission = self._submit_unverified_if_safe(
+                    summary=(
+                        "The Agent requested completion without evidence eligible "
+                        "for SUCCESS_LOCKED; the known state was submitted for "
+                        "Harbor verification."
+                    ),
+                    reason="Submit known state without another completion retry.",
+                )
+                if submission is not None:
+                    return submission
                 return PlanDecision.fail(
                     error=f"terminal completion rejected: {gate_error}",
                     reason=(
@@ -2324,6 +2410,16 @@ class TerminalSequentialPlanner:
                 reason="Persist completion blocker and return it to the Planner.",
             )
         if session.committed_commands >= self._policy.max_commands:
+            submission = self._submit_unverified_if_safe(
+                summary=(
+                    "The Runtime preserved the latest known container state after "
+                    "the command budget was exhausted; artifacts were submitted "
+                    "for Harbor verification."
+                ),
+                reason="Submit known state without exceeding the command budget.",
+            )
+            if submission is not None:
+                return submission
             return PlanDecision.fail(
                 error=(
                     "terminal command budget exhausted "

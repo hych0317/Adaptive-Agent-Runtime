@@ -19,12 +19,15 @@ from adaptive_agent_runtime.tool_ecosystem.invocation_decision import (
 
 from applications.terminal_bench.composition import build_terminal_application
 from applications.terminal_bench.contracts import TerminalExecutionError
+from applications.terminal_bench.deadline import terra_high_deadline_budget_profile
 from applications.terminal_bench.models import (
     TERMINAL_COMMAND_ACTION,
     TerminalCommandIntent,
     TerminalCommandRole,
+    TerminalCompletionDisposition,
     TerminalExecutionPolicy,
     TerminalExecutionState,
+    TerminalReconciliationState,
     TerminalTimeoutCapReason,
     TerminalTurnDraft,
     TerminalTurnProposal,
@@ -879,7 +882,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
-    async def test_exact_token_budget_blocks_another_model_turn(self) -> None:
+    async def test_exact_token_budget_submits_known_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             capability = ScriptedTerminalTurnCapability(
                 execute_draft("create-artifact"),
@@ -895,17 +898,18 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             )
             try:
                 artifacts = await app.run("create an artifact")
-                self.assertFalse(artifacts.runtime_result.succeeded)
-                self.assertEqual(
-                    artifacts.runtime_result.final_state.error,
-                    "terminal model token budget exhausted",
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertFalse(artifacts.summary.agent_complete)
+                self.assertIs(
+                    artifacts.summary.completion_disposition,
+                    TerminalCompletionDisposition.SUBMITTED_UNVERIFIED,
                 )
                 self.assertEqual(len(capability.requests), 1)
                 self.assertEqual(len(environment.calls), 1)
             finally:
                 app.close()
 
-    async def test_over_budget_model_turn_does_not_execute_command(self) -> None:
+    async def test_over_budget_model_turn_submits_without_command(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             capability = ScriptedTerminalTurnCapability(
                 execute_draft("create-artifact"),
@@ -921,17 +925,20 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             )
             try:
                 artifacts = await app.run("create an artifact")
-                self.assertFalse(artifacts.runtime_result.succeeded)
-                self.assertEqual(
-                    artifacts.runtime_result.final_state.error,
-                    "terminal model token budget exhausted",
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertFalse(artifacts.summary.agent_complete)
+                self.assertIs(
+                    artifacts.summary.completion_disposition,
+                    TerminalCompletionDisposition.SUBMITTED_UNVERIFIED,
                 )
                 self.assertEqual(len(capability.requests), 1)
                 self.assertEqual(len(environment.calls), 0)
             finally:
                 app.close()
 
-    async def test_failed_verification_does_not_allow_complete(self) -> None:
+    async def test_failed_verification_complete_submits_without_success_claim(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             app = build_terminal_application(
                 trial_id="trial-failed-verification",
@@ -949,12 +956,13 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             )
             try:
                 artifacts = await app.run("create and validate an artifact")
-                self.assertFalse(artifacts.runtime_result.succeeded)
+                self.assertTrue(artifacts.runtime_result.succeeded)
                 self.assertFalse(artifacts.summary.agent_complete)
-                self.assertIn(
-                    "verification command returned a non-zero status",
-                    artifacts.runtime_result.final_state.error or "",
+                self.assertIs(
+                    artifacts.summary.completion_disposition,
+                    TerminalCompletionDisposition.SUBMITTED_UNVERIFIED,
                 )
+                self.assertEqual(artifacts.summary.command_count, 2)
             finally:
                 app.close()
 
@@ -1229,6 +1237,9 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 execute_draft("create-artifact"),
                 verify_draft("test -e /app"),
             )
+            capability.deadline_budget_profile = (
+                terra_high_deadline_budget_profile()
+            )
             app = build_terminal_application(
                 trial_id="trial-inference-delivery-retry",
                 logs_dir=directory,
@@ -1237,7 +1248,10 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     completed_result(),
                 ),
                 proposal_capability=capability,
-                policy=TerminalExecutionPolicy(max_no_progress_seconds=None),
+                policy=TerminalExecutionPolicy(
+                    max_wall_clock_seconds=840,
+                    max_no_progress_seconds=None,
+                ),
             )
             try:
                 artifacts = await app.run("create and validate an artifact")
@@ -1246,11 +1260,19 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(capability.requests[1].delivery_mode)
                 self.assertTrue(capability.requests[1].emergency_mode)
                 self.assertTrue(capability.requests[1].recovery_mode)
+                first_cap = capability.requests[0].execution_limits.max_inference_timeout_sec
+                emergency_cap = capability.requests[1].execution_limits.max_inference_timeout_sec
+                self.assertIsNotNone(first_cap)
+                self.assertIsNotNone(emergency_cap)
+                assert first_cap is not None
+                assert emergency_cap is not None
+                self.assertLess(emergency_cap, first_cap)
+                self.assertLessEqual(emergency_cap, 60)
                 self.assertEqual(len(app.journal.records()), 2)
             finally:
                 app.close()
 
-    async def test_repeated_inference_timeout_is_controlled_termination(self) -> None:
+    async def test_repeated_inference_timeout_submits_known_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             capability = AlwaysTimeoutCapability()
             app = build_terminal_application(
@@ -1262,19 +1284,96 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             )
             try:
                 artifacts = await app.run("create an artifact")
-                state = artifacts.runtime_result.final_state
-                self.assertEqual(state.status, RunStatus.TERMINATED)
-                self.assertIsNone(state.error)
-                self.assertIsNotNone(state.termination)
-                assert state.termination is not None
-                self.assertEqual(
-                    state.termination.primary_reason.value,
-                    "active_execution_budget",
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertFalse(artifacts.summary.agent_complete)
+                self.assertIs(
+                    artifacts.summary.completion_disposition,
+                    TerminalCompletionDisposition.SUBMITTED_UNVERIFIED,
                 )
                 self.assertEqual(len(capability.requests), 2)
                 self.assertFalse(capability.requests[0].delivery_mode)
                 self.assertTrue(capability.requests[1].delivery_mode)
                 self.assertTrue(capability.requests[1].emergency_mode)
+                self.assertTrue(artifacts.summary.trace_consistent)
+            finally:
+                app.close()
+
+    async def test_deadline_pressure_submits_without_model_call(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft("too-late", call_key="work-1"),
+            )
+            capability.deadline_budget_profile = (
+                terra_high_deadline_budget_profile()
+            )
+            app = build_terminal_application(
+                trial_id="trial-deadline-submit",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(),
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(
+                    max_wall_clock_seconds=840,
+                    max_no_progress_seconds=None,
+                ),
+            )
+            app.journal._session = app.journal.snapshot().model_copy(
+                update={"started_at": utc_now() - timedelta(seconds=830)}
+            )
+            try:
+                artifacts = await app.run("preserve the current artifact")
+
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertFalse(artifacts.summary.agent_complete)
+                self.assertIs(
+                    artifacts.summary.completion_disposition,
+                    TerminalCompletionDisposition.SUBMITTED_UNVERIFIED,
+                )
+                self.assertEqual(len(capability.requests), 0)
+                self.assertEqual(len(app.journal.records()), 0)
+                self.assertTrue(artifacts.summary.trace_consistent)
+            finally:
+                app.close()
+
+    async def test_deadline_pressure_never_submits_unresolved_in_doubt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft(
+                    "inspect-state",
+                    call_key="inspect-1",
+                    command_role=TerminalCommandRole.INSPECT,
+                ),
+            )
+            capability.deadline_budget_profile = (
+                terra_high_deadline_budget_profile()
+            )
+            app = build_terminal_application(
+                trial_id="trial-in-doubt-deadline",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(),
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(
+                    max_wall_clock_seconds=840,
+                    max_no_progress_seconds=None,
+                ),
+            )
+            app.journal._session = app.journal.snapshot().model_copy(
+                update={
+                    "started_at": utc_now() - timedelta(seconds=830),
+                    "known_state_generation": None,
+                    "in_doubt_reconciliation_required": True,
+                    "reconciliation_state": TerminalReconciliationState.REQUIRED,
+                }
+            )
+            try:
+                artifacts = await app.run("preserve the uncertain artifact")
+
+                self.assertFalse(artifacts.runtime_result.succeeded)
+                self.assertIs(
+                    artifacts.summary.completion_disposition,
+                    TerminalCompletionDisposition.IN_PROGRESS,
+                )
+                self.assertEqual(len(capability.requests), 0)
+                self.assertEqual(len(app.journal.records()), 0)
                 self.assertTrue(artifacts.summary.trace_consistent)
             finally:
                 app.close()

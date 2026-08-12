@@ -747,11 +747,19 @@ class TerminalSessionSnapshot(TerminalModel):
             self.completion_disposition
             is TerminalCompletionDisposition.SUBMITTED_UNVERIFIED
         ):
-            if receipt is None or not receipt.passed:
+            if self.in_doubt_reconciliation_required:
                 raise ValueError(
-                    "submitted_unverified requires a passed verification receipt"
+                    "submitted_unverified cannot retain unresolved IN_DOUBT state"
                 )
-            if receipt.assurance is TerminalEvidenceAssurance.TRUSTED:
+            if self.known_state_generation != self.task_generation:
+                raise ValueError(
+                    "submitted_unverified requires a known current generation"
+                )
+            if (
+                receipt is not None
+                and receipt.passed
+                and receipt.assurance is TerminalEvidenceAssurance.TRUSTED
+            ):
                 raise ValueError(
                     "trusted evidence must not use submitted_unverified"
                 )
