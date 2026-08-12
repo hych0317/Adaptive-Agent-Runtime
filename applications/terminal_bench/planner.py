@@ -2150,8 +2150,8 @@ class TerminalSequentialPlanner:
             ):
                 raise RunBudgetExhaustedError(
                     "active_execution",
-                    "terminal emergency inference budget exhausted: full "
-                    "emergency action and verification sequence does not fit",
+                    "terminal emergency inference budget exhausted: minimum "
+                    "current inference and action do not fit",
                 ) from exc
             try:
                 proposal = await self._capability.propose(retry_request)

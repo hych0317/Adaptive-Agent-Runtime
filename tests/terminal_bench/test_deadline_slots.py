@@ -127,6 +127,7 @@ class TerminalDeadlineSlotTests(unittest.TestCase):
         )
 
         self.assertTrue(slots.feasible)
+        self.assertTrue(slots.complete_sequence_feasible)
         self.assertEqual(slots.inference_limit_seconds, 60.0)
         self.assertEqual(slots.action_limit_seconds, 60)
         self.assertEqual(slots.future_reserve_seconds, 138.0)
@@ -176,6 +177,38 @@ class TerminalDeadlineSlotTests(unittest.TestCase):
         self.assertEqual(slots.inference_limit_seconds, 60.0)
         self.assertEqual(slots.action_limit_seconds, 42)
 
+    def test_named_sequence_degrades_without_a_199_second_cliff(self) -> None:
+        exact = allocate_terminal_deadline_sequence(
+            sequence=TerminalDeadlineSequence.WORK_THEN_VERIFY,
+            remaining_seconds=199.0,
+            minimum_inference_seconds=60.0,
+            preferred_inference_seconds=180.0,
+            followup_inference_seconds=60.0,
+            verification_timeout_seconds=60,
+            cleanup_seconds=18.0,
+        )
+        degraded = allocate_terminal_deadline_sequence(
+            sequence=TerminalDeadlineSequence.WORK_THEN_VERIFY,
+            remaining_seconds=198.0,
+            minimum_inference_seconds=60.0,
+            preferred_inference_seconds=180.0,
+            followup_inference_seconds=60.0,
+            verification_timeout_seconds=60,
+            cleanup_seconds=18.0,
+        )
+
+        self.assertTrue(exact.feasible)
+        self.assertTrue(exact.complete_sequence_feasible)
+        self.assertEqual(exact.action_limit_seconds, 1)
+        self.assertTrue(degraded.feasible)
+        self.assertFalse(degraded.complete_sequence_feasible)
+        self.assertEqual(degraded.action_limit_seconds, 60)
+        self.assertGreaterEqual(
+            degraded.inference_limit_seconds or 0.0,
+            60.0,
+        )
+        self.assertEqual(degraded.future_reserve_seconds, 18.0)
+
     def test_sequence_is_infeasible_without_one_action_second(self) -> None:
         slots = allocate_deadline_slots(
             remaining_seconds=258.0,
@@ -189,6 +222,7 @@ class TerminalDeadlineSlotTests(unittest.TestCase):
         )
 
         self.assertFalse(slots.feasible)
+        self.assertFalse(slots.complete_sequence_feasible)
         self.assertEqual(slots.action_limit_seconds, 0)
 
     def test_direct_verification_uses_remaining_action_capacity(self) -> None:

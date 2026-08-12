@@ -8,7 +8,7 @@ again by the post-inference Action Gate.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from math import floor, isfinite
 
@@ -71,6 +71,7 @@ class TerminalDeadlineSlots:
     inference_limit_seconds: float | None
     action_limit_seconds: int | None
     feasible: bool
+    complete_sequence_feasible: bool
 
     @property
     def future_reserve_seconds(self) -> float:
@@ -153,6 +154,7 @@ def allocate_deadline_slots(
             inference_limit_seconds=None,
             action_limit_seconds=None,
             feasible=True,
+            complete_sequence_feasible=True,
         )
     _require_nonnegative("remaining_seconds", remaining_seconds)
 
@@ -200,6 +202,7 @@ def allocate_deadline_slots(
         inference_limit_seconds=inference_limit,
         action_limit_seconds=action_limit,
         feasible=feasible,
+        complete_sequence_feasible=feasible,
     )
 
 
@@ -257,7 +260,7 @@ def allocate_terminal_deadline_sequence(
     if not include_current_inference:
         minimum_inference_seconds = 0.0
         preferred_inference_seconds = 0.0
-    return allocate_deadline_slots(
+    full_sequence = allocate_deadline_slots(
         remaining_seconds=remaining_seconds,
         minimum_inference_seconds=minimum_inference_seconds,
         preferred_inference_seconds=preferred_inference_seconds,
@@ -267,6 +270,26 @@ def allocate_terminal_deadline_sequence(
         verification_seconds=reserved_actions,
         cleanup_seconds=cleanup_seconds,
         sequence=sequence,
+    )
+    if full_sequence.feasible or remaining_seconds is None:
+        return full_sequence
+
+    # A future repair/verification reserve is a scheduling preference, not a
+    # reason to discard a current action that still fits safely.  Admit the
+    # shortest current phase while preserving cleanup; the Planner will
+    # refresh remaining time and select the next legal sequence afterwards.
+    degraded = allocate_deadline_slots(
+        remaining_seconds=remaining_seconds,
+        minimum_inference_seconds=minimum_inference_seconds,
+        preferred_inference_seconds=preferred_inference_seconds,
+        preferred_action_seconds=current_action,
+        maximum_action_seconds=current_action,
+        cleanup_seconds=cleanup_seconds,
+        sequence=sequence,
+    )
+    return replace(
+        degraded,
+        complete_sequence_feasible=False,
     )
 
 
