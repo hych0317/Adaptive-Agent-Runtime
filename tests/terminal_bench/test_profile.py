@@ -958,9 +958,103 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
-    async def test_failed_verification_requires_work_before_reverify(
+    async def test_failed_verification_allows_changed_read_only_reverify(
         self,
     ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft("create-artifact", call_key="work-1"),
+                verify_draft("assert-artifact", call_key="verification-1"),
+                verify_draft(
+                    "assert-artifact-with-fresh-input",
+                    call_key="verification-2",
+                ),
+            )
+            app = build_terminal_application(
+                trial_id="trial-repair-before-reverify",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(),
+                    completed_result(return_code=1, stderr="assertion failed"),
+                    completed_result(stdout="fresh verification passed"),
+                ),
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(
+                    max_proposal_rejections=0,
+                    max_no_progress_seconds=None,
+                ),
+            )
+            try:
+                artifacts = await app.run("create and validate an artifact")
+
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertEqual(artifacts.summary.command_count, 3)
+                self.assertTrue(capability.requests[2].repair_mode)
+                self.assertEqual(
+                    app.journal.snapshot().proposal_rejections,
+                    0,
+                )
+                self.assertTrue(artifacts.summary.trace_consistent)
+            finally:
+                app.close()
+
+    async def test_settled_nonzero_work_allows_read_only_verify(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft("best-effort-repair", call_key="work-1"),
+                verify_draft("official-check", call_key="verification-1"),
+            )
+            app = build_terminal_application(
+                trial_id="trial-nonzero-work-verify",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(return_code=1, stderr="partial repair"),
+                    completed_result(stdout="artifact is valid"),
+                ),
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(max_no_progress_seconds=None),
+            )
+            try:
+                artifacts = await app.run("repair and validate an artifact")
+                session = app.journal.snapshot()
+
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertEqual(artifacts.summary.command_count, 2)
+                self.assertEqual(session.task_generation, 1)
+                self.assertEqual(session.known_state_generation, 1)
+                self.assertIsNone(session.successful_work_generation)
+                self.assertEqual(session.proposal_rejections, 0)
+                self.assertTrue(artifacts.summary.trace_consistent)
+            finally:
+                app.close()
+
+    async def test_known_initial_generation_allows_direct_verify(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                verify_draft("official-check", call_key="verification-1"),
+            )
+            app = build_terminal_application(
+                trial_id="trial-initial-direct-verify",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(stdout="existing artifact is valid"),
+                ),
+                proposal_capability=capability,
+            )
+            try:
+                artifacts = await app.run("validate the existing artifact")
+                session = app.journal.snapshot()
+
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertEqual(artifacts.summary.command_count, 1)
+                self.assertEqual(session.task_generation, 0)
+                self.assertEqual(session.known_state_generation, 0)
+                self.assertIsNone(session.successful_work_generation)
+                self.assertEqual(session.proposal_rejections, 0)
+            finally:
+                app.close()
+
+    async def test_unchanged_failed_verify_retry_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             capability = ScriptedTerminalTurnCapability(
                 execute_draft("create-artifact", call_key="work-1"),
@@ -968,7 +1062,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 verify_draft("assert-artifact", call_key="verification-2"),
             )
             app = build_terminal_application(
-                trial_id="trial-repair-before-reverify",
+                trial_id="trial-unchanged-reverify",
                 logs_dir=directory,
                 environment=FakeTerminalEnvironment(
                     completed_result(),
@@ -988,9 +1082,8 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     RunStatus.FAILED,
                 )
                 self.assertEqual(artifacts.summary.command_count, 2)
-                self.assertTrue(capability.requests[2].repair_mode)
                 self.assertIn(
-                    "targeted work correction",
+                    "command, inputs, or evidence changes",
                     artifacts.runtime_result.final_state.error or "",
                 )
             finally:
@@ -1281,7 +1374,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
-    async def test_finalization_forces_verification_after_successful_work(
+    async def test_finalization_advises_verification_without_blocking_work(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1310,8 +1403,8 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 artifacts = await app.run("create and verify the artifact")
 
                 self.assertTrue(artifacts.runtime_result.succeeded)
-                self.assertEqual(len(app.journal.records()), 2)
-                self.assertEqual(app.journal.snapshot().proposal_rejections, 1)
+                self.assertEqual(len(app.journal.records()), 3)
+                self.assertEqual(app.journal.snapshot().proposal_rejections, 0)
                 self.assertTrue(capability.requests[1].finalization_mode)
                 self.assertTrue(capability.requests[1].verification_due)
                 self.assertTrue(capability.requests[2].verification_due)
@@ -1453,7 +1546,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
-    async def test_artifact_first_requires_work_after_one_inspection(
+    async def test_artifact_first_recovery_is_advisory(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1489,8 +1582,8 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     artifacts.runtime_result.final_state.status,
                     RunStatus.FAILED,
                 )
-                self.assertEqual(len(environment.calls), 1)
-                self.assertEqual(len(capability.requests), 2)
+                self.assertEqual(len(environment.calls), 2)
+                self.assertEqual(len(capability.requests), 3)
                 self.assertTrue(
                     capability.requests[0].artifact_first_mode
                 )
@@ -1499,14 +1592,10 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     capability.requests[1].artifact_first_mode
                 )
                 self.assertTrue(capability.requests[1].recovery_mode)
-                self.assertIn(
-                    "artifact-producing or targeted repair command",
-                    artifacts.runtime_result.final_state.error or "",
-                )
             finally:
                 app.close()
 
-    async def test_consecutive_unique_inspections_enter_recovery_mode(self) -> None:
+    async def test_consecutive_inspection_recovery_is_advisory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             environment = FakeTerminalEnvironment(
                 completed_result(stdout="first"),
@@ -1554,13 +1643,13 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     artifacts.runtime_result.final_state.status,
                     RunStatus.FAILED,
                 )
-                self.assertEqual(len(environment.calls), 3)
-                self.assertEqual(app.journal.snapshot().consecutive_inspections, 3)
+                self.assertEqual(len(environment.calls), 4)
+                self.assertEqual(app.journal.snapshot().consecutive_inspections, 4)
                 self.assertTrue(capability.requests[-1].recovery_mode)
             finally:
                 app.close()
 
-    async def test_total_inspections_enter_recovery_across_work_commands(self) -> None:
+    async def test_total_inspection_recovery_is_advisory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             drafts: list[TerminalTurnDraft] = []
             results = []
@@ -1606,10 +1695,10 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     artifacts.runtime_result.final_state.status,
                     RunStatus.FAILED,
                 )
-                self.assertEqual(len(app.journal.records()), 10)
+                self.assertEqual(len(app.journal.records()), 11)
                 session = app.journal.snapshot()
-                self.assertEqual(session.inspection_commands, 5)
-                self.assertEqual(session.consecutive_inspections, 0)
+                self.assertEqual(session.inspection_commands, 6)
+                self.assertEqual(session.consecutive_inspections, 1)
                 self.assertTrue(capability.requests[-1].recovery_mode)
             finally:
                 app.close()

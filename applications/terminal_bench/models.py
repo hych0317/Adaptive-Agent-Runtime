@@ -646,6 +646,7 @@ class TerminalSessionSnapshot(TerminalModel):
     failed_verification_attempts: int = Field(default=0, ge=0)
     verification_corrections: int = Field(default=0, ge=0)
     task_generation: int = Field(default=0, ge=0)
+    known_state_generation: int | None = Field(default=0, ge=0)
     successful_work_generation: int | None = Field(default=None, ge=0)
     pending_repair_receipt_id: UUID | None = None
     repair_applied_action_id: UUID | None = None
@@ -676,6 +677,12 @@ class TerminalSessionSnapshot(TerminalModel):
                 migrated["reconciliation_state"] = (
                     TerminalReconciliationState.REQUIRED.value
                 )
+            if (
+                "known_state_generation" not in migrated
+                and not migrated.get("in_doubt_reconciliation_required", False)
+            ):
+                task_generation = migrated.get("task_generation", 0)
+                migrated["known_state_generation"] = task_generation
             return migrated
         return value
 
@@ -686,6 +693,11 @@ class TerminalSessionSnapshot(TerminalModel):
         checkpoint = self.verified_checkpoint
         if ledger is not None and ledger.generation != self.task_generation:
             raise ValueError("task ledger generation does not match session")
+        if (
+            self.known_state_generation is not None
+            and self.known_state_generation != self.task_generation
+        ):
+            raise ValueError("known state must belong to current generation")
         if (
             self.successful_work_generation is not None
             and self.successful_work_generation != self.task_generation

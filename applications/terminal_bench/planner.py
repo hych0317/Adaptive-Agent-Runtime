@@ -144,6 +144,23 @@ def _current_generation_has_successful_work(
     )
 
 
+def _generation_state_is_known(session: TerminalSessionSnapshot) -> bool:
+    if (
+        session.known_state_generation is not None
+        and session.known_state_generation == session.task_generation
+    ):
+        return True
+    if _current_generation_has_successful_work(session):
+        return True
+    receipt = session.latest_reconciliation_receipt
+    return bool(
+        session.reconciliation_state
+        is TerminalReconciliationState.STABLE_UNVERIFIED
+        and receipt is not None
+        and receipt.task_generation == session.task_generation
+    )
+
+
 def _verification_assurance(
     verification: object,
     result: TerminalExecResult | None = None,
@@ -212,15 +229,7 @@ def _runtime_artifact_fingerprints(
 def _current_generation_is_verifiable(
     session: TerminalSessionSnapshot,
 ) -> bool:
-    if _current_generation_has_successful_work(session):
-        return True
-    receipt = session.latest_reconciliation_receipt
-    return bool(
-        session.reconciliation_state
-        is TerminalReconciliationState.STABLE_UNVERIFIED
-        and receipt is not None
-        and receipt.task_generation == session.task_generation
-    )
+    return _generation_state_is_known(session)
 
 
 def _ledger_projection(
@@ -252,11 +261,12 @@ def _ledger_projection(
 
 def _legacy_generation_state(
     records: tuple[TerminalCommandRecord, ...],
-) -> tuple[int, int | None]:
+) -> tuple[int, int | None, int | None]:
     """Derive generation state only while migrating a pre-contract trace."""
 
     generation = 0
     successful_generation: int | None = None
+    known_generation: int | None = 0
     for record in records:
         if record.intent.command_role is not TerminalCommandRole.WORK:
             continue
@@ -264,7 +274,8 @@ def _legacy_generation_state(
             continue
         generation += 1
         successful_generation = generation if record.result.succeeded else None
-    return generation, successful_generation
+        known_generation = generation if record.result.settled else None
+    return generation, successful_generation, known_generation
 
 
 class JsonlTerminalTrialJournal:
@@ -357,9 +368,11 @@ class JsonlTerminalTrialJournal:
         if self._session.task_ledger is not None:
             self._trace_consistent = False
             raise RuntimeError("terminal task ledger has no persisted contract")
-        generation, successful_work_generation = _legacy_generation_state(
-            tuple(self._records)
-        )
+        (
+            generation,
+            successful_work_generation,
+            known_state_generation,
+        ) = _legacy_generation_state(tuple(self._records))
         ledger = TerminalTaskLedger(
             contract_version=contract.contract_version,
             contract_fingerprint=contract_fingerprint,
@@ -470,6 +483,7 @@ class JsonlTerminalTrialJournal:
         self._session = self._session.model_copy(
             update={
                 "task_generation": generation,
+                "known_state_generation": known_state_generation,
                 "successful_work_generation": successful_work_generation,
                 "task_ledger": ledger,
                 "latest_verification_receipt": verification_receipt,
@@ -863,6 +877,7 @@ class JsonlTerminalTrialJournal:
             references.append(record.intent.process_reference)
         task_ledger = session.task_ledger
         task_generation = session.task_generation
+        known_state_generation = session.known_state_generation
         successful_work_generation = session.successful_work_generation
         pending_repair_receipt_id = session.pending_repair_receipt_id
         repair_applied_action_id = session.repair_applied_action_id
@@ -873,6 +888,9 @@ class JsonlTerminalTrialJournal:
         )
         if work_changed_state:
             task_generation += 1
+            known_state_generation = (
+                task_generation if result.settled else None
+            )
             successful_work_generation = (
                 task_generation if result.succeeded else None
             )
@@ -1051,6 +1069,7 @@ class JsonlTerminalTrialJournal:
             reconciliation_required = True
             reconciliation_state = TerminalReconciliationState.REQUIRED
             reconciliation_receipt = None
+            known_state_generation = None
         elif (
             reconciliation_required
             and record.intent.command_role is TerminalCommandRole.INSPECT
@@ -1058,6 +1077,7 @@ class JsonlTerminalTrialJournal:
         ):
             reconciliation_required = False
             reconciliation_state = TerminalReconciliationState.STABLE_UNVERIFIED
+            known_state_generation = task_generation
             reconciliation_receipt = TerminalReconciliationReceipt(
                 action_id=record.action_id,
                 task_generation=task_generation,
@@ -1092,6 +1112,7 @@ class JsonlTerminalTrialJournal:
             "consecutive_inspections": consecutive_inspections,
             "inspection_commands": inspection_commands,
             "task_generation": task_generation,
+            "known_state_generation": known_state_generation,
             "successful_work_generation": successful_work_generation,
             "pending_repair_receipt_id": pending_repair_receipt_id,
             "repair_applied_action_id": repair_applied_action_id,
@@ -1138,6 +1159,24 @@ class JsonlTerminalTrialJournal:
                 raise RuntimeError(
                     f"invalid terminal transcript at line {line_number}"
                 ) from exc
+        if (
+            self._session.known_state_generation is None
+            and not self._session.in_doubt_reconciliation_required
+        ):
+            latest_work = next(
+                (
+                    record
+                    for record in reversed(self._records)
+                    if record.intent.command_role is TerminalCommandRole.WORK
+                ),
+                None,
+            )
+            if latest_work is not None and latest_work.result.settled:
+                self._session = self._session.model_copy(
+                    update={
+                        "known_state_generation": self._session.task_generation
+                    }
+                )
 
     def _replay_event(self, kind: str, payload: Any) -> None:
         if kind == "task.contract.bound":
@@ -3068,6 +3107,13 @@ class TerminalSequentialPlanner:
         deadline_sequence: TerminalDeadlineSequence | None = None,
         required_requirements: tuple[TerminalRequirement, ...],
     ) -> None:
+        del (
+            recovery_mode,
+            repair_mode,
+            verification_due,
+            finalization_mode,
+            deadline_sequence,
+        )
         if session.verified_checkpoint is not None:
             raise _TerminalProposalValidationError(
                 code="terminal.verified_state.locked",
@@ -3078,71 +3124,6 @@ class TerminalSequentialPlanner:
                 field="decision",
                 rejected_value="execute",
                 expected="complete",
-            )
-        fresh_remaining = self._remaining_wall_clock_seconds(session)
-        fresh_finalization = bool(
-            self._uses_deadline_slots
-            and fresh_remaining is not None
-            and (
-                finalization_mode
-                or fresh_remaining
-                <= self._effective_finalization_threshold_seconds()
-            )
-        )
-        effective_sequence = deadline_sequence
-        if effective_sequence is None and fresh_finalization:
-            if reconciliation_mode:
-                effective_sequence = (
-                    TerminalDeadlineSequence.RECONCILE_THEN_VERIFY
-                    if _current_generation_has_successful_work(session)
-                    else TerminalDeadlineSequence.RECONCILE_THEN_WORK_VERIFY
-                )
-            else:
-                effective_sequence = (
-                    TerminalDeadlineSequence.DIRECT_VERIFY
-                    if intent.command_role is TerminalCommandRole.VERIFY
-                    else TerminalDeadlineSequence.WORK_THEN_VERIFY
-                )
-        expected_role = {
-            TerminalDeadlineSequence.RECONCILE_THEN_WORK_VERIFY: (
-                TerminalCommandRole.INSPECT
-            ),
-            TerminalDeadlineSequence.RECONCILE_THEN_VERIFY: (
-                TerminalCommandRole.INSPECT
-            ),
-            TerminalDeadlineSequence.WORK_THEN_VERIFY: TerminalCommandRole.WORK,
-            TerminalDeadlineSequence.DIRECT_VERIFY: TerminalCommandRole.VERIFY,
-        }.get(effective_sequence)
-        if (
-            expected_role is not None
-            and intent.command_role is not expected_role
-            and not (
-                fresh_finalization
-                and not reconciliation_mode
-                and intent.command_role is TerminalCommandRole.INSPECT
-            )
-        ):
-            raise _TerminalProposalValidationError(
-                code="terminal.deadline.sequence_role_mismatch",
-                message="command role does not match the admitted deadline sequence",
-                field="command_role",
-                rejected_value=intent.command_role.value,
-                expected=expected_role.value,
-            )
-        if (
-            fresh_finalization
-            and not reconciliation_mode
-            and intent.command_role is TerminalCommandRole.INSPECT
-        ):
-            raise _TerminalProposalValidationError(
-                code="terminal.finalization.inspect_disallowed",
-                message=(
-                    "inspection no longer fits before the reserved work and "
-                    "verification sequence"
-                ),
-                field="command_role",
-                rejected_value=intent.command_role.value,
-                expected="work or verify",
             )
         if len(intent.command) > self._policy.max_command_characters:
             raise _TerminalProposalValidationError(
@@ -3199,60 +3180,18 @@ class TerminalSequentialPlanner:
                     ),
                 )
         if (
-            repair_mode
-            and not reconciliation_mode
-            and intent.command_role is not TerminalCommandRole.WORK
-        ):
-            raise _TerminalProposalValidationError(
-                code="terminal.verification.repair_required",
-                message=(
-                    "the latest failed verification requires a targeted work "
-                    "correction before another verification"
-                ),
-                field="command_role",
-                rejected_value=intent.command_role.value,
-                expected="work",
-            )
-        if (
-            verification_due
-            and not reconciliation_mode
-            and intent.command_role is not TerminalCommandRole.VERIFY
-        ):
-            raise _TerminalProposalValidationError(
-                code="terminal.verification.due",
-                message=(
-                    "a successful verification correction must be followed by "
-                    "independent verification before more task-state changes"
-                ),
-                field="command_role",
-                rejected_value=intent.command_role.value,
-                expected="verify",
-            )
-        if (
-            recovery_mode
-            and not reconciliation_mode
-            and intent.command_role is TerminalCommandRole.INSPECT
-        ):
-            raise _TerminalProposalValidationError(
-                code="terminal.recovery.inspect_disallowed",
-                message="recovery mode requires an artifact-producing or targeted repair command",
-                field="command_role",
-                rejected_value=intent.command_role.value,
-                expected="work or verify",
-            )
-        if (
             intent.command_role is TerminalCommandRole.VERIFY
-            and not _current_generation_is_verifiable(session)
+            and not _generation_state_is_known(session)
         ):
             raise _TerminalProposalValidationError(
-                code="terminal.verification.no_current_generation_work",
+                code="terminal.verification.unknown_generation_state",
                 message=(
-                    "direct verification requires valid successful work in "
-                    "the current task generation"
+                    "read-only verification requires a known current-generation "
+                    "task state"
                 ),
                 field="command_role",
                 rejected_value=intent.command_role.value,
-                expected="work before verify",
+                expected="settled work or successful read-only reconciliation",
             )
         if len(intent.env) > self._policy.max_environment_variables:
             raise _TerminalProposalValidationError(
@@ -3388,6 +3327,44 @@ class TerminalSequentialPlanner:
                     rejected_value="<sources>",
                     expected="an official test path or command",
                 )
+            if (
+                session.pending_repair_receipt_id is not None
+                and session.repair_applied_action_id is None
+            ):
+                previous = next(
+                    (
+                        record
+                        for record in reversed(
+                            self._journal.recent_records(
+                                self._policy.max_commands
+                            )
+                        )
+                        if record.action_id
+                        == session.pending_repair_receipt_id
+                    ),
+                    None,
+                )
+                if (
+                    previous is not None
+                    and previous.intent.command_role
+                    is TerminalCommandRole.VERIFY
+                    and previous.intent.verification is not None
+                    and previous.intent.command == intent.command
+                    and previous.intent.cwd == intent.cwd
+                    and previous.intent.env == intent.env
+                    and terminal_fingerprint(previous.intent.verification)
+                    == terminal_fingerprint(intent.verification)
+                ):
+                    raise _TerminalProposalValidationError(
+                        code="terminal.verification.unchanged_retry",
+                        message=(
+                            "a failed verification may be retried without work "
+                            "only when its command, inputs, or evidence changes"
+                        ),
+                        field="verification",
+                        rejected_value="unchanged",
+                        expected="changed read-only verification evidence",
+                    )
         elif intent.verification is not None:
             raise _TerminalProposalValidationError(
                 code="terminal.verification.unexpected",

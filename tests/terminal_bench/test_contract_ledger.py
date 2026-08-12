@@ -420,6 +420,7 @@ class TerminalTaskLedgerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(advanced.task_generation, 0)
+        self.assertEqual(advanced.known_state_generation, 0)
         self.assertEqual(advanced.successful_work_generation, 0)
         assert advanced.task_ledger is not None
         self.assertEqual(advanced.task_ledger.generation, 0)
@@ -443,6 +444,7 @@ class TerminalTaskLedgerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(advanced.task_generation, 1)
+        self.assertEqual(advanced.known_state_generation, 1)
         self.assertIsNone(advanced.successful_work_generation)
         assert advanced.task_ledger is not None
         self.assertEqual(advanced.task_ledger.generation, 1)
@@ -565,6 +567,7 @@ class TerminalTaskLedgerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         return session.model_copy(
             update={
                 "task_ledger": ledger,
+                "known_state_generation": 0,
                 "successful_work_generation": 0,
             }
         )
