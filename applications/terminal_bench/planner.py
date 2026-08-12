@@ -733,6 +733,19 @@ class JsonlTerminalTrialJournal:
             receipt is not None
             and receipt.passed
             and receipt.assurance is TerminalEvidenceAssurance.TRUSTED
+            and self._session.contract_coverage_complete
+            and self._session.task_ledger is not None
+            and set(receipt.covered_requirement_ids)
+            == {
+                item.requirement_id
+                for item in self._session.task_ledger.entries
+            }
+            and all(
+                item.state is TerminalRequirementState.SATISFIED
+                and item.assurance is TerminalEvidenceAssurance.TRUSTED
+                and item.evidence_generation == self._session.task_generation
+                for item in self._session.task_ledger.entries
+            )
         ):
             return "trusted verification must use the success lock"
         return None
@@ -1002,6 +1015,17 @@ class JsonlTerminalTrialJournal:
             and record.intent.verification is not None
             and verification_receipt is not None
             and verification_receipt.assurance is TerminalEvidenceAssurance.TRUSTED
+            and session.contract_coverage_complete
+            and task_ledger is not None
+            and set(verification_receipt.covered_requirement_ids)
+            == {item.requirement_id for item in task_ledger.entries}
+            and all(
+                item.state is TerminalRequirementState.SATISFIED
+                and item.assurance is TerminalEvidenceAssurance.TRUSTED
+                and item.latest_evidence_action_id == record.action_id
+                and item.evidence_generation == task_generation
+                for item in task_ledger.entries
+            )
         ):
             verified_checkpoint = TerminalVerifiedCheckpoint(
                 action_id=record.action_id,
@@ -3209,6 +3233,7 @@ class TerminalSequentialPlanner:
             verification_due,
             finalization_mode,
             deadline_sequence,
+            required_requirements,
         )
         if session.verified_checkpoint is not None:
             raise _TerminalProposalValidationError(
@@ -3320,19 +3345,9 @@ class TerminalSequentialPlanner:
                 ),
             )
         if intent.command_role is TerminalCommandRole.VERIFY:
-            if intent.verification is None:
-                raise _TerminalProposalValidationError(
-                    code="terminal.verification.contract_missing",
-                    message="verify command requires an independent evidence contract",
-                    field="verification",
-                    rejected_value=None,
-                    expected=(
-                        "official_tests or independent_check evidence with "
-                        "sources, artifact paths, and state_policy=read_only"
-                    ),
-                )
             if (
-                intent.verification.state_policy
+                intent.verification is not None
+                and intent.verification.state_policy
                 is not TerminalVerificationStatePolicy.READ_ONLY
             ):
                 raise _TerminalProposalValidationError(
@@ -3341,47 +3356,6 @@ class TerminalSequentialPlanner:
                     field="verification.state_policy",
                     rejected_value=intent.verification.state_policy.value,
                     expected="read_only",
-                )
-            required_ids = {
-                item.requirement_id for item in required_requirements
-            }
-            covered_ids = set(intent.verification.requirement_coverage)
-            unknown = sorted(covered_ids.difference(required_ids))
-            missing = sorted(required_ids.difference(covered_ids))
-            if unknown or missing:
-                details: list[str] = []
-                if missing:
-                    details.append("missing " + ", ".join(missing))
-                if unknown:
-                    details.append("unknown " + ", ".join(unknown))
-                raise _TerminalProposalValidationError(
-                    code="terminal.verification.requirements_incomplete",
-                    message=(
-                        "verification requirement coverage is incomplete: "
-                        + "; ".join(details)
-                    ),
-                    field="verification.requirement_coverage",
-                    rejected_value=", ".join(intent.verification.requirement_coverage),
-                    expected="every requirement_id from payload.requirements exactly once",
-                )
-            if (
-                _requires_performance_protocol(required_requirements)
-                and intent.verification.evidence_kind.value
-                != "official_tests"
-                and intent.verification.performance_protocol
-                is not TerminalPerformanceProtocol.COLD_UNIQUE_INPUTS
-            ):
-                raise _TerminalProposalValidationError(
-                    code="terminal.verification.performance_protocol_required",
-                    message=(
-                        "performance verification must use cold, unique inputs "
-                        "in an isolated process"
-                    ),
-                    field="verification.performance_protocol",
-                    rejected_value=(
-                        intent.verification.performance_protocol.value
-                    ),
-                    expected="cold_unique_inputs",
                 )
             mutation = _known_verification_mutation(intent.command)
             if mutation is not None:
@@ -3397,31 +3371,6 @@ class TerminalSequentialPlanner:
                         "a read-only check using disposable names or an "
                         "independent official test"
                     ),
-                )
-            if any(
-                not posixpath.isabs(path)
-                for path in intent.verification.artifact_paths
-            ):
-                raise _TerminalProposalValidationError(
-                    code="terminal.verification.artifact_path_relative",
-                    message="verification artifact paths must be absolute POSIX paths",
-                    field="verification.artifact_paths",
-                    rejected_value="<paths>",
-                    expected="absolute task-container paths",
-                )
-            if (
-                intent.verification.evidence_kind.value == "official_tests"
-                and not any(
-                    _identifies_official_test_source(source)
-                    for source in intent.verification.evidence_sources
-                )
-            ):
-                raise _TerminalProposalValidationError(
-                    code="terminal.verification.official_source_unidentified",
-                    message="official verification must identify the actual official test command or path",
-                    field="verification.evidence_sources",
-                    rejected_value="<sources>",
-                    expected="an official test path or command",
                 )
             if (
                 session.pending_repair_receipt_id is not None
@@ -3444,7 +3393,6 @@ class TerminalSequentialPlanner:
                     previous is not None
                     and previous.intent.command_role
                     is TerminalCommandRole.VERIFY
-                    and previous.intent.verification is not None
                     and previous.intent.command == intent.command
                     and previous.intent.cwd == intent.cwd
                     and previous.intent.env == intent.env

@@ -888,7 +888,10 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 execute_draft("create-artifact"),
                 usage=InferenceUsage(total_tokens=1),
             )
-            environment = FakeTerminalEnvironment(completed_result())
+            environment = FakeTerminalEnvironment(
+                completed_result(),
+                completed_result(stdout="benchmark completed"),
+            )
             app = build_terminal_application(
                 trial_id="trial-exact-token-budget-without-verification",
                 logs_dir=directory,
@@ -1182,11 +1185,12 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
-    async def test_verification_must_cover_runtime_requirement_ids(self) -> None:
+    async def test_partial_verification_is_audited_without_success_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             verification = TerminalVerificationContract(
-                evidence_kind="independent_check",
-                evidence_sources=("task-local check",),
+                evidence_kind="official_tests",
+                evidence_provenance="task_provided",
+                evidence_sources=("/tests/official_verify.py",),
                 artifact_paths=("/app/hello.html",),
                 requirement_coverage=("req-001",),
                 coverage_dimensions=(
@@ -1197,7 +1201,10 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 validation_methods=("HTTP request plus content assertion",),
             )
-            environment = FakeTerminalEnvironment(completed_result())
+            environment = FakeTerminalEnvironment(
+                completed_result(),
+                completed_result(stdout="partial verification passed"),
+            )
             app = build_terminal_application(
                 trial_id="trial-requirement-coverage",
                 logs_dir=directory,
@@ -1219,14 +1226,21 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     "Create the artifact. Serve hello.html over HTTP."
                 )
 
-                self.assertEqual(
-                    artifacts.runtime_result.final_state.status,
-                    RunStatus.FAILED,
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertFalse(artifacts.summary.agent_complete)
+                self.assertIs(
+                    artifacts.summary.completion_disposition,
+                    TerminalCompletionDisposition.SUBMITTED_UNVERIFIED,
                 )
-                self.assertEqual(len(environment.calls), 1)
-                self.assertIn(
-                    "verification requirement coverage is incomplete",
-                    artifacts.runtime_result.final_state.error or "",
+                self.assertEqual(len(environment.calls), 2)
+                session = app.journal.snapshot()
+                self.assertIsNone(session.verified_checkpoint)
+                self.assertIsNotNone(session.latest_verification_receipt)
+                assert session.latest_verification_receipt is not None
+                self.assertTrue(session.latest_verification_receipt.passed)
+                self.assertEqual(
+                    session.latest_verification_receipt.covered_requirement_ids,
+                    ("req-001",),
                 )
             finally:
                 app.close()
@@ -1597,7 +1611,7 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.close()
 
-    async def test_performance_verification_requires_cold_unique_inputs(
+    async def test_performance_protocol_is_assurance_advice_not_execution_gate(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1633,15 +1647,52 @@ class TerminalSequentialProfileTests(unittest.IsolatedAsyncioTestCase):
                     "Make the implementation consistently faster than the reference benchmark."
                 )
 
-                self.assertEqual(
-                    artifacts.runtime_result.final_state.status,
-                    RunStatus.FAILED,
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertFalse(artifacts.summary.agent_complete)
+                self.assertIs(
+                    artifacts.summary.completion_disposition,
+                    TerminalCompletionDisposition.SUBMITTED_UNVERIFIED,
                 )
-                self.assertEqual(len(environment.calls), 1)
-                self.assertIn(
-                    "cold, unique inputs",
-                    artifacts.runtime_result.final_state.error or "",
+                self.assertEqual(len(environment.calls), 2)
+                self.assertIsNone(app.journal.snapshot().verified_checkpoint)
+            finally:
+                app.close()
+
+    async def test_verify_without_evidence_contract_can_submit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capability = ScriptedTerminalTurnCapability(
+                execute_draft(
+                    "read-only-check",
+                    call_key="verification-1",
+                    command_role=TerminalCommandRole.VERIFY,
+                    verification=None,
+                ),
+                complete_draft(),
+            )
+            app = build_terminal_application(
+                trial_id="trial-uncontracted-verify",
+                logs_dir=directory,
+                environment=FakeTerminalEnvironment(
+                    completed_result(stdout="check passed"),
+                ),
+                proposal_capability=capability,
+                policy=TerminalExecutionPolicy(max_completion_rejections=0),
+            )
+            try:
+                artifacts = await app.run("validate the existing artifact")
+
+                self.assertTrue(artifacts.runtime_result.succeeded)
+                self.assertFalse(artifacts.summary.agent_complete)
+                self.assertIs(
+                    artifacts.summary.completion_disposition,
+                    TerminalCompletionDisposition.SUBMITTED_UNVERIFIED,
                 )
+                self.assertEqual(artifacts.summary.command_count, 1)
+                self.assertEqual(len(capability.requests), 2)
+                session = app.journal.snapshot()
+                self.assertIsNone(session.latest_verification_receipt)
+                self.assertIsNone(session.verified_checkpoint)
+                self.assertEqual(session.proposal_rejections, 0)
             finally:
                 app.close()
 

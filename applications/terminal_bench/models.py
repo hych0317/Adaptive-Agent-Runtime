@@ -759,6 +759,16 @@ class TerminalSessionSnapshot(TerminalModel):
                 receipt is not None
                 and receipt.passed
                 and receipt.assurance is TerminalEvidenceAssurance.TRUSTED
+                and self.contract_coverage_complete
+                and ledger is not None
+                and set(receipt.covered_requirement_ids)
+                == {item.requirement_id for item in ledger.entries}
+                and all(
+                    item.state is TerminalRequirementState.SATISFIED
+                    and item.assurance is TerminalEvidenceAssurance.TRUSTED
+                    and item.evidence_generation == self.task_generation
+                    for item in ledger.entries
+                )
             ):
                 raise ValueError(
                     "trusted evidence must not use submitted_unverified"
