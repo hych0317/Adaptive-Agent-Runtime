@@ -7,6 +7,7 @@ from datetime import timedelta
 from pathlib import Path
 import random
 from tempfile import TemporaryDirectory
+from collections.abc import Callable
 from uuid import UUID, uuid5
 
 from adaptive_agent_runtime.decisioning import decision_fingerprint
@@ -25,14 +26,18 @@ from applications.governance_scenario_suite.evidence import (
     EvidenceSource,
     ScenarioExecution,
     ScenarioRunResult,
+    OracleFinding,
 )
 from applications.governance_scenario_suite.oracles import (
     DeterministicScenarioOracle,
 )
 from applications.governance_scenario_suite.variants import (
+    ProposalModel,
     ScenarioExecutorRegistry,
     ScriptedModelStub,
 )
+from adaptive_agent_runtime.llm.errors import InferenceBackendError
+from applications.governance_scenario_suite.contracts import EvaluationVerdict
 
 
 _RUN_NAMESPACE = UUID("1263be59-10f7-425b-8702-bcd20a00bc77")
@@ -46,7 +51,7 @@ class ScenarioRuntimeContext:
     composition: EcommerceComposition
     principal: AuthenticatedPrincipal
     approval_id: str | None
-    model: ScriptedModelStub
+    model: ProposalModel
     random: random.Random
 
 
@@ -56,32 +61,37 @@ class GovernanceScenarioRunner:
         *,
         executors: ScenarioExecutorRegistry,
         oracle: DeterministicScenarioOracle | None = None,
+        model_factory: Callable[[ScenarioSpec], ProposalModel] | None = None,
     ) -> None:
         self._executors = executors
         self._oracle = oracle or DeterministicScenarioOracle()
+        self._model_factory = model_factory
 
     def run(
         self,
         scenario: ScenarioSpec,
         *,
         workspace: str | Path | None = None,
+        run_label: str | None = None,
     ) -> ScenarioRunResult:
         if workspace is None:
             with TemporaryDirectory(prefix="aar-governance-scenario-") as directory:
-                return self._run_in_directory(scenario, Path(directory))
+                return self._run_in_directory(scenario, Path(directory), run_label)
         root = Path(workspace).resolve()
         root.mkdir(parents=True, exist_ok=True)
-        return self._run_in_directory(scenario, root)
+        return self._run_in_directory(scenario, root, run_label)
 
     def _run_in_directory(
         self,
         scenario: ScenarioSpec,
         root: Path,
+        run_label: str | None,
     ) -> ScenarioRunResult:
         spec_fingerprint = decision_fingerprint(scenario)
         run_id = uuid5(
             _RUN_NAMESPACE,
-            f"{scenario.id}|{scenario.profile.value}|{scenario.seed}|{spec_fingerprint}",
+            f"{scenario.id}|{scenario.profile.value}|{scenario.seed}|"
+            f"{spec_fingerprint}|{run_label or ''}",
         )
         scenario_root = root / str(run_id)
         if scenario_root.exists() and any(scenario_root.iterdir()):
@@ -115,7 +125,11 @@ class GovernanceScenarioRunner:
                     ),
                 )
             pre_state = composition.store.snapshot()
-            model = ScriptedModelStub(scenario.model_script.proposals)
+            model: ProposalModel = (
+                self._model_factory(scenario)
+                if self._model_factory is not None
+                else ScriptedModelStub(scenario.model_script.proposals)
+            )
             context = ScenarioRuntimeContext(
                 scenario=scenario,
                 run_id=run_id,
@@ -127,8 +141,18 @@ class GovernanceScenarioRunner:
                 random=random.Random(scenario.seed),
             )
             executor = self._executors.resolve(scenario.profile)
+            provider_failure: str | None = None
             try:
                 execution = executor.execute(context)
+            except InferenceBackendError as exc:
+                provider_failure = exc.__class__.__name__
+                execution = ScenarioExecution(
+                    decision=ScenarioVerdict.FAIL_CLOSED,
+                    model_contexts=model.contexts,
+                    available_sources=frozenset({EvidenceSource.AUDIT}),
+                    model_call_count=model.calls,
+                    metadata={"provider_failure": provider_failure},
+                )
             except DomainPolicyError as exc:
                 execution = ScenarioExecution(
                     decision=ScenarioVerdict.REJECT,
@@ -164,6 +188,17 @@ class GovernanceScenarioRunner:
                 available_sources=available,
             )
             verdict, findings, summary = self._oracle.evaluate(evidence)
+            if provider_failure is not None:
+                verdict = EvaluationVerdict.INCONCLUSIVE
+                findings = (
+                    OracleFinding(
+                        code="PROVIDER_FAILURE",
+                        verdict=EvaluationVerdict.INCONCLUSIVE,
+                        message="Model provider failed before a governance verdict could be established.",
+                    ),
+                    *findings,
+                )
+            model_metadata = dict(model.metadata)
             return ScenarioRunResult(
                 run_id=run_id,
                 scenario_id=scenario.id,
@@ -179,6 +214,9 @@ class GovernanceScenarioRunner:
                     "model_call_count": execution.model_call_count,
                     "external_effect_count": summary.external_effect_count,
                     "external_attempt_count": summary.external_attempt_count,
+                    **({"run_label": run_label} if run_label is not None else {}),
+                    **model_metadata,
+                    **execution.metadata,
                 },
                 started_at=scenario.clock,
                 completed_at=scenario.clock,

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Protocol
+from typing import Mapping, Protocol
+
+from pydantic import JsonValue
 
 from applications.governance_scenario_suite.contracts import (
     EffectSpec,
@@ -21,6 +22,19 @@ class ScenarioExecutor(Protocol):
     profile: ScenarioProfile
 
     def execute(self, context: object) -> ScenarioExecution: ...
+
+
+class ProposalModel(Protocol):
+    @property
+    def calls(self) -> int: ...
+
+    @property
+    def contexts(self) -> tuple[str, ...]: ...
+
+    @property
+    def metadata(self) -> Mapping[str, JsonValue]: ...
+
+    def propose(self, projected_context: str) -> EffectSpec: ...
 
 
 class ScenarioExecutorRegistry:
@@ -60,6 +74,10 @@ class ScriptedModelStub:
     @property
     def contexts(self) -> tuple[str, ...]:
         return tuple(self._contexts)
+
+    @property
+    def metadata(self) -> Mapping[str, JsonValue]:
+        return {"model_kind": "scripted_stub"}
 
     def propose(self, projected_context: str) -> EffectSpec:
         if self._next >= len(self._proposals):
