@@ -67,7 +67,7 @@ def render_markdown(batch: ScenarioBatchResult) -> str:
         "",
         f"- Suite: `{batch.suite_id}`",
         f"- Generated: `{batch.generated_at.isoformat()}`",
-        f"- Release gate: `{'PASS' if batch.release_gate_passed else 'FAIL'}`",
+        f"- All Oracle results: `{'PASS' if batch.release_gate_passed else 'FAIL'}`",
         f"- Results: `{passed} passed / {failed} failed / {inconclusive} inconclusive`",
         "",
         "| Scenario | Profile | Evaluation | Decision | Reason | External effects |",

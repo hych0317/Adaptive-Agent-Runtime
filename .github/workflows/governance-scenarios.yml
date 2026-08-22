@@ -1,0 +1,73 @@
+name: Governance scenarios
+
+on:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      run_live_e2e:
+        description: Run credentialed model E2E campaign
+        required: false
+        type: boolean
+        default: false
+      service:
+        description: OpenAI-compatible service preset
+        required: false
+        default: openai
+      target_id:
+        description: Fixed inference target ID
+        required: false
+        default: governance/openai
+      model_id:
+        description: Fixed provider model ID
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e . mypy
+      - run: python -m mypy --strict src/adaptive_agent_runtime applications/governance_scenario_suite scripts/run_governance_scenarios.py
+      - run: python -m unittest discover -s tests/governance_scenarios -p "test_*.py"
+      - run: python scripts/run_governance_scenarios.py gate --output-dir artifacts/governance-scenarios
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: governance-deterministic-report
+          path: artifacts/governance-scenarios
+
+  live-model-e2e:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live_e2e == true
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install -e .
+      - name: Run bounded live-model campaign
+        env:
+          AAR_GOVERNANCE_API_KEY: ${{ secrets.AAR_GOVERNANCE_API_KEY }}
+        run: >-
+          python scripts/run_governance_scenarios.py e2e
+          --service "${{ inputs.service }}"
+          --target-id "${{ inputs.target_id }}"
+          --model-id "${{ inputs.model_id }}"
+          --api-key-env AAR_GOVERNANCE_API_KEY
+          --repeat 5
+          --output-dir artifacts/governance-scenarios-e2e
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: governance-live-model-report
+          path: artifacts/governance-scenarios-e2e

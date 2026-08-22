@@ -121,7 +121,10 @@ def recover(root: Path, scenario: ScenarioSpec) -> None:
     assert key is not None
     fault = scenario.fault_schedule[0].point
     try:
-        if scenario.profile is ScenarioProfile.NO_RECONCILE_BLIND_RETRY:
+        if scenario.profile in {
+            ScenarioProfile.NO_RECONCILE_BLIND_RETRY,
+            ScenarioProfile.PLAIN_AGENT,
+        }:
             assert scenario.approved_effect.order_id is not None
             assert scenario.approved_effect.amount_cents is not None
             composition.gateway.refund(

@@ -402,6 +402,7 @@ def _check_order(
             expected=expected_value,
             actual=actual_value,
             label=f"order {expected.order_id} {field}",
+            sensitive=field == "address_ref",
         )
 
 
@@ -451,6 +452,7 @@ def _record_equality(
     expected: object,
     actual: object,
     label: str,
+    sensitive: bool = False,
 ) -> None:
     passed = expected == actual
     findings.append(
@@ -463,7 +465,17 @@ def _record_equality(
                 else f"{label} differs from the expected value."
             ),
             source=source,
-            details={"expected": _json_value(expected), "actual": _json_value(actual)},
+            details=(
+                {
+                    "expected_fingerprint": decision_fingerprint(expected),
+                    "actual_fingerprint": decision_fingerprint(actual),
+                }
+                if sensitive
+                else {
+                    "expected": _json_value(expected),
+                    "actual": _json_value(actual),
+                }
+            ),
         )
     )
 

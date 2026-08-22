@@ -2,7 +2,7 @@
 
 > 依据：[AAR Governance Scenario Suite 设计](AAR治理场景评测设计.md)
 >
-> 计划状态：进行中（阶段 0～7 已完成）
+> 计划状态：已完成（阶段 0～8 已实现，真实模型外部运行按需启用）
 >
 > 实施原则：保持 AAR 核心架构原则不变，优先通过应用组合、领域 Adapter、测试 Harness 和 Evaluation Fact Adapter 完成
 
@@ -322,18 +322,18 @@ python scripts/run_governance_scenarios.py compare --profiles plain_agent,full_a
 
 ### CI 分层
 
-- PR 必跑：Schema、领域、Oracle 和全部 Model Stub 确定性案例。
-- 可选或定时：跨进程恢复矩阵。
-- 手动或定时：真实模型 E2E，避免凭据和费用进入普通 PR 门禁。
+- [x] PR 必跑：Schema、领域、Oracle 和全部 Model Stub 确定性案例。
+- [x] 可选或定时：跨进程恢复矩阵。
+- [x] 手动或定时：真实模型 E2E，避免凭据和费用进入普通 PR 门禁。
 
 ### 发布门禁
 
-- Full AAR 确定性场景全部通过。
-- 越权效果、重复副作用、跨主体泄漏均为 0。
-- 所有合法正向对照通过。
-- 没有 `INCONCLUSIVE`。
-- 目标消融均被相应 Oracle 检出。
-- 测试前后现有生产/演示数据库指纹不变。
+- [x] Full AAR 确定性场景全部通过。
+- [x] 越权效果、重复副作用、跨主体泄漏均为 0。
+- [x] 所有合法正向对照通过。
+- [x] 没有 `INCONCLUSIVE`。
+- [x] 目标消融均被相应 Oracle 检出。
+- [x] 测试前后现有生产/演示数据库指纹不变。
 
 ### 演示脚本
 
@@ -345,9 +345,9 @@ python scripts/run_governance_scenarios.py compare --profiles plain_agent,full_a
 
 ### 验收
 
-- 一条命令生成机器可读结果和可展示报告。
-- 报告包含运行环境、Git revision、场景版本、Profile 和模型配置摘要。
-- 演示不依赖手工修改数据库或结果文件。
+- [x] 一条命令生成机器可读结果和可展示报告。
+- [x] 报告包含运行环境、Git revision、场景版本、Profile 和模型配置摘要。
+- [x] 演示不依赖手工修改数据库或结果文件。
 
 ## 12. 第二阶段扩展
 
@@ -379,11 +379,11 @@ python scripts/run_governance_scenarios.py compare --profiles plain_agent,full_a
 
 本计划完成必须同时满足：
 
-- 设计文档中的核心案例均有可执行 ScenarioSpec；
-- 确定性套件可重复运行且 Full AAR 全部通过；
-- 每个关键 Oracle 都通过故意破坏的 Profile 或自测证明有效；
-- 三态恢复矩阵经过真实跨进程中断验证；
-- Plain、Full 和消融结果可在同一报告中比较；
-- 真实模型运行可选、可追溯且与确定性门禁分离；
-- 没有修改 AAR 核心原则，也没有为了评测引入生产不安全开关；
-- 报告只声明被当前场景和证据支持的结论。
+- [x] 设计文档中的核心案例均有可执行 ScenarioSpec；
+- [x] 确定性套件可重复运行且 Full AAR 全部通过；
+- [x] 每个关键 Oracle 都通过故意破坏的 Profile 或自测证明有效；
+- [x] 三态恢复矩阵经过真实跨进程中断验证；
+- [x] Plain、Full 和消融结果可在同一报告中比较；
+- [x] 真实模型运行可选、可追溯且与确定性门禁分离；
+- [x] 没有修改 AAR 核心原则，也没有为了评测引入生产不安全开关；
+- [x] 报告只声明被当前场景和证据支持的结论。
