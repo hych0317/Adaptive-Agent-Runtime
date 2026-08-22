@@ -1,0 +1,66 @@
+schema_version: 1
+suite_id: aar-governance-scenario-suite
+registrations:
+  - family_id: P1_RESOURCE_SCOPE
+    title: Resource scope isolation
+    stage: 3
+    boundary: application_policy
+    variant_ids: [P1_FOREIGN_ORDER, P1_NONEXISTENT_ORDER]
+    positive_control_id: P1_OWN_ORDER
+  - family_id: P2_EFFECT_BINDING
+    title: Approval exact-effect binding
+    stage: 3
+    boundary: aar_core
+    variant_ids:
+      - P2A_APPROVAL_TARGET_TAMPERING
+      - P2B_APPROVAL_AMOUNT_TAMPERING
+      - P2C_APPROVAL_OPERATION_TAMPERING
+    positive_control_id: P2_APPROVED_REFUND
+  - family_id: P3_SINGLE_USE_IDEMPOTENCY
+    title: Authorization replay and business idempotency
+    stage: 3
+    boundary: aar_core
+    variant_ids: [P3A_AUTHORIZATION_REPLAY, P3B_IDEMPOTENT_RETRY, P3C_CONCURRENT_SUBMIT]
+    positive_control_id: P3_DISTINCT_WRITES
+  - family_id: P4_TOCTOU
+    title: State-version freshness
+    stage: 3
+    boundary: aar_core
+    variant_ids: [P4_ADDRESS_AFTER_SHIPMENT]
+    positive_control_id: P4_ADDRESS_CURRENT_VERSION
+  - family_id: P5_PROMPT_INJECTION
+    title: Untrusted tool-content prompt injection
+    stage: 3
+    boundary: application_policy
+    variant_ids: [P5_MALICIOUS_PRODUCT_DESCRIPTION]
+    positive_control_id: P5_BENIGN_PRODUCT_DESCRIPTION
+  - family_id: R1_COMMITTED_RECOVERY
+    title: Committed refund with lost response
+    stage: 4
+    boundary: external_contract
+    variant_ids: [R1_COMMITTED_RESPONSE_LOST]
+    positive_control_id: R1_NORMAL_REFUND
+  - family_id: R2_INCOMPLETE_RECOVERY
+    title: Not-committed and unknown reconciliation
+    stage: 4
+    boundary: external_contract
+    variant_ids: [R2A_NOT_COMMITTED, R2B_RECONCILIATION_UNKNOWN]
+    positive_control_id: R2_NORMAL_REFUND
+  - family_id: C1_AUTHORITATIVE_CONSTRAINT
+    title: Authoritative constraint outside model context
+    stage: 5
+    boundary: application_policy
+    variant_ids: [C1_CONTEXT_PRESSURE_OVER_REFUND]
+    positive_control_id: C1_CONTEXT_PRESSURE_LEGAL_REFUND
+  - family_id: M1_MEMORY_SCOPE
+    title: Tenant and user memory isolation
+    stage: 5
+    boundary: application_policy
+    variant_ids: [M1A_CROSS_TENANT, M1B_CROSS_USER]
+    positive_control_id: M1_OWN_MEMORY
+  - family_id: M2_CONDITIONAL_MEMORY
+    title: Conditional preference coexistence
+    stage: 5
+    boundary: aar_core
+    variant_ids: [M2A_ORTHOGONAL_PREFERENCE, M2B_CONDITIONAL_EXCEPTION]
+    positive_control_id: M2_MATCHING_CONDITION
