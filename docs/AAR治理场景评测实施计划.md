@@ -2,7 +2,7 @@
 
 > 依据：[AAR Governance Scenario Suite 设计](AAR治理场景评测设计.md)
 >
-> 计划状态：进行中（阶段 0 已完成）
+> 计划状态：进行中（阶段 0～1 已完成）
 >
 > 实施原则：保持 AAR 核心架构原则不变，优先通过应用组合、领域 Adapter、测试 Harness 和 Evaluation Fact Adapter 完成
 
@@ -111,27 +111,27 @@ scripts/
 
 ### 1.1 权威状态与持久化
 
-- [ ] 建立 User、Order、Approval、RefundOperation、CouponGrant、AuditEvent 表。
-- [ ] 写操作使用事务和期望版本 CAS。
-- [ ] 保存效果指纹、幂等键、请求指纹、外部引用和提交结果。
-- [ ] 提供运行前后只读快照接口，供 Oracle 使用。
-- [ ] 为每次场景运行创建独立临时 SQLite 数据库。
+- [x] 建立 User、Order、Approval、RefundOperation、CouponGrant、AuditEvent 表。
+- [x] 写操作使用事务和期望版本 CAS。
+- [x] 保存效果指纹、幂等键、请求指纹、外部引用和提交结果。
+- [x] 提供运行前后只读快照接口，供 Oracle 使用。
+- [x] 为每次场景运行创建独立临时 SQLite 数据库。
 
 ### 1.2 领域策略
 
-- [ ] 从可信应用上下文注入 Principal，拒绝模型提供的 tenant/user 字段。
-- [ ] 对读取和写入执行 tenant、owner 和状态机校验。
-- [ ] 实现退款金额、审批阈值、审批有效期和准确效果校验。
-- [ ] 实现地址修改的 `PAID → SHIPPED` 版本冲突规则。
-- [ ] 实现 Memory Candidate 写入策略：用户偏好必须绑定 `subject_user_id`，PII/PCI 字段直接拒绝。
+- [x] 从可信应用上下文注入 Principal，拒绝模型提供的 tenant/user 字段。
+- [x] 对读取和写入执行 tenant、owner 和状态机校验。
+- [x] 实现退款金额、审批阈值、审批有效期和准确效果校验。
+- [x] 实现地址修改的 `PAID → SHIPPED` 版本冲突规则。
+- [x] 实现 Memory Candidate 写入策略：用户偏好必须绑定 `subject_user_id`，PII/PCI 字段直接拒绝。
 
 ### 1.3 Fake Gateway
 
-- [ ] 按幂等键保存独立外部流水。
-- [ ] 同键同请求返回原结果；同键不同请求返回确定性冲突。
-- [ ] 记录尝试次数与实际副作用次数。
-- [ ] 支持 `COMMITTED / NOT_COMMITTED / UNKNOWN` 查询结果。
-- [ ] 故障点通过显式 barrier 或进程退出触发，不使用时间竞争。
+- [x] 按幂等键保存独立外部流水。
+- [x] 同键同请求返回原结果；同键不同请求返回确定性冲突。
+- [x] 记录尝试次数与实际副作用次数。
+- [x] 支持 `COMMITTED / NOT_COMMITTED / UNKNOWN` 查询结果。
+- [x] 故障点通过显式 barrier 或进程退出触发，不使用时间竞争。
 
 ### 验收
 

@@ -60,6 +60,8 @@ class ReasonCode(StrEnum):
     RESOURCE_SCOPE_DENIED = "RESOURCE_SCOPE_DENIED"
     RESOURCE_NOT_AVAILABLE = "RESOURCE_NOT_AVAILABLE"
     EFFECT_NOT_EQUAL_TO_APPROVAL = "EFFECT_NOT_EQUAL_TO_APPROVAL"
+    APPROVAL_REQUIRED = "APPROVAL_REQUIRED"
+    APPROVAL_EXPIRED = "APPROVAL_EXPIRED"
     AUTHORIZATION_ALREADY_CONSUMED = "AUTHORIZATION_ALREADY_CONSUMED"
     IDEMPOTENT_RESULT_REUSED = "IDEMPOTENT_RESULT_REUSED"
     IDEMPOTENCY_KEY_CONFLICT = "IDEMPOTENCY_KEY_CONFLICT"
@@ -106,6 +108,7 @@ class AuditEventType(StrEnum):
 
 class OperationType(StrEnum):
     GET_ORDER = "GET_ORDER"
+    FULFILL_ORDER = "FULFILL_ORDER"
     CHANGE_ADDRESS = "CHANGE_ADDRESS"
     REFUND = "REFUND"
     REFUND_TO_CREDIT = "REFUND_TO_CREDIT"
@@ -216,6 +219,9 @@ class EffectSpec(ScenarioContractModel):
     def validate_operation_fields(self) -> Self:
         required: dict[OperationType, frozenset[str]] = {
             OperationType.GET_ORDER: frozenset({"order_id"}),
+            OperationType.FULFILL_ORDER: frozenset(
+                {"order_id", "state_version", "idempotency_key"}
+            ),
             OperationType.CHANGE_ADDRESS: frozenset(
                 {"order_id", "address_ref", "state_version", "idempotency_key"}
             ),
