@@ -2,7 +2,7 @@
 
 > 依据：[AAR Governance Scenario Suite 设计](AAR治理场景评测设计.md)
 >
-> 计划状态：进行中（阶段 0～1 已完成）
+> 计划状态：进行中（阶段 0～2 已完成）
 >
 > 实施原则：保持 AAR 核心架构原则不变，优先通过应用组合、领域 Adapter、测试 Harness 和 Evaluation Fact Adapter 完成
 
@@ -144,22 +144,22 @@ scripts/
 
 ### 工作项
 
-- [ ] 加载并版本校验 YAML。
-- [ ] 创建隔离数据库、固定时钟、稳定 UUID 和随机种子。
-- [ ] 装载 initial state、审批、对话、Model Stub 和故障计划。
-- [ ] 统一运行 Profile 接口，输出同一种 `ScenarioRunResult`。
-- [ ] 采集权威状态快照、Gateway 流水、Audit、模型上下文和 Memory 证据。
-- [ ] 实现字段级、集合级、调用次数和 canary Oracle。
-- [ ] 输出逐运行 JSON；Markdown 只从 JSON 生成，避免人工改写结论。
-- [ ] 检查证据完整性；缺失关键来源时返回 `INCONCLUSIVE`。
+- [x] 加载并版本校验 YAML。
+- [x] 创建隔离数据库、固定时钟、稳定 UUID 和随机种子。
+- [x] 装载 initial state、审批、对话、Model Stub 和故障计划。
+- [x] 统一运行 Profile 接口，输出同一种 `ScenarioRunResult`。
+- [x] 采集权威状态快照、Gateway 流水、Audit、模型上下文和 Memory 证据。
+- [x] 实现字段级、集合级、调用次数和 canary Oracle。
+- [x] 输出逐运行 JSON；Markdown 只从 JSON 生成，避免人工改写结论。
+- [x] 检查证据完整性；缺失关键来源时返回 `INCONCLUSIVE`。
 
 ### Oracle 自测
 
-- [ ] 故意插入第二次退款时，重复副作用 Oracle 必须失败。
-- [ ] 故意把 U1 canary 放入 U2 上下文时，泄漏 Oracle 必须失败。
-- [ ] 删除关键 Audit 事件时，结果必须为 `INCONCLUSIVE`。
-- [ ] 让系统拒绝全部请求时，合法正向对照必须失败。
-- [ ] 改写场景 ID 复用不同内容时，Schema 或运行身份检查必须拒绝。
+- [x] 故意插入第二次退款时，重复副作用 Oracle 必须失败。
+- [x] 故意把 U1 canary 放入 U2 上下文时，泄漏 Oracle 必须失败。
+- [x] 删除关键 Audit 事件时，结果必须为 `INCONCLUSIVE`。
+- [x] 让系统拒绝全部请求时，合法正向对照必须失败。
+- [x] 改写场景 ID 复用不同内容时，Schema 或运行身份检查必须拒绝。
 
 ### 验收
 

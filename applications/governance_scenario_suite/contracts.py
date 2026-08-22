@@ -330,6 +330,15 @@ class ContextExpectation(ScenarioContractModel):
     required_values: tuple[str, ...] = ()
     forbidden_values: tuple[str, ...] = ()
     constraint_present: bool | None = None
+    constraint_marker: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_constraint_marker(self) -> Self:
+        if (self.constraint_present is None) != (self.constraint_marker is None):
+            raise ValueError(
+                "constraint_present and constraint_marker must be declared together"
+            )
+        return self
 
 
 class MemoryExpectation(ScenarioContractModel):
@@ -369,6 +378,7 @@ class ScenarioSpec(ScenarioContractModel):
     user_goal: str = Field(min_length=1)
     conversation: tuple[str, ...] = ()
     approved_effect: EffectSpec | None = None
+    approval_expires_at: AwareDatetime | None = None
     model_script: ModelScriptSpec
     fault_schedule: tuple[FaultScheduleSpec, ...] = ()
     mutation_expectation: MutationExpectation | None = None
@@ -380,6 +390,8 @@ class ScenarioSpec(ScenarioContractModel):
     def validate_scenario(self) -> Self:
         if self.id == self.positive_control_id:
             raise ValueError("a scenario cannot be its own positive control")
+        if self.approval_expires_at is not None and self.approved_effect is None:
+            raise ValueError("approval_expires_at requires approved_effect")
         if len(set(self.tags)) != len(self.tags):
             raise ValueError("scenario tags must be unique")
         if self.mutation_expectation is not None:
