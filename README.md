@@ -1,142 +1,167 @@
 # Adaptive Agent Runtime
 
-面向复杂、长周期任务的自适应智能体运行框架。项目关注的不是如何再封装一个 Agent 应用，而是如何把任务编排、认知资源、外部能力、运行评估和自治边界组织成可验证的 Runtime。
+Adaptive Agent Runtime（AAR）是面向复杂、长周期任务的自适应智能体运行框架。它将任务编排、认知资源、外部能力、运行评估和自治边界组织为可验证的运行时，并由 Runtime 保留执行、状态变更和配置演化的最终控制权。
 
-仓库同时提供金融研究场景的 Research Agent，用于验证各模块能够沿一条真实执行链路协同工作。
+## 设计目标
 
-## 为什么需要 Agent Runtime
+AAR 处理长周期 Agent 运行中的五类核心问题：
 
-简单 ReAct Loop 或固定 Workflow 适合边界清晰的短任务，但任务持续时间增长后会暴露一组相互关联的问题：
-
-- **计划会失效**：执行产生的新信息可能改变后续任务，静态流程无法吸收反馈。
-- **Context 会退化**：历史信息持续堆积，Token 消耗增加，但真正影响当前推理的信息比例不断下降。
-- **Memory 会污染行为**：未经证据约束的历史记录一旦进入长期记忆，可能在后续任务中被错误复用。
-- **失败难以定位**：只评价最终答案，无法判断问题来自规划、工具、Context 还是 Memory。
-- **自治能力缺少边界**：允许 Agent 修改任务和状态后，系统必须同时回答“能否执行、依据是否充分、是否需要审核”。
-
-Adaptive Agent Runtime 将这些问题视为同一个运行时问题：Agent 不仅要完成任务，还需要在执行过程中管理状态、认知资源和变更权限，并为每次决策保留可评估的证据。
+- **动态规划**：执行反馈可以改变后续任务，但不能绕过图约束和调度规则
+- **认知资源治理**：Context 与 Memory 必须可压缩、可恢复、可追踪，并与证据和作用域绑定
+- **副作用控制**：模型只能提出动作，Runtime 负责校验、授权、执行和幂等保护
+- **跨进程恢复**：已提交状态可以恢复，结果未知的外部动作不会被静默重放
+- **受控演化**：运行轨迹可以形成优化建议，但配置变化必须经过验证、治理和版本化提交
 
 ## 总体架构
 
+AAR 以 Runtime Core 为控制中心，通过版本化状态连接规划、执行、认知资源、评估和治理：
+
 ```mermaid
 flowchart TD
-    A["User Task"] --> B["Runtime Core"]
-    P["SQLite Persistence / Resume"] <--> B
-    B --> C["Dynamic Task Graph"]
-    P <--> C
-    C --> D["Execution Strategy"]
-    D --> E["Tool / Isolated Agent"]
-    E --> F["Observation"]
-    F --> C
-    F --> G["Context-Memory Runtime"]
+    U["Task"] --> R["Runtime Core"]
+    P["Persistence / Resume"] <--> R
+    R --> G["Versioned Dynamic Task Graph"]
     P <--> G
-    G --> D
-    B --> H["Execution Trace"]
-    E --> H
-    G --> H
-    H --> I["Outcome / Trajectory / Component Evaluation"]
-    I --> J["Conservative Optimization Proposal"]
-    J --> L["Isolated Replay Validation"]
-    L --> K
-    K --> M["Versioned Apply / Rollback"]
-    M -. active policy .-> D
-    K["Rule + Confidence + Review"] -. govern .-> E
-    K -. govern .-> G
-    K -. govern .-> J
+    G --> S["Execution Strategy"]
+    C["Context / Memory Runtime"] --> S
+    P <--> C
+    S --> A["Action or Graph Proposal"]
+    A --> V["Validation"]
+    V --> H["Governance"]
+    H --> E["Tool / Isolated Agent"]
+    E --> O["Observation"]
+    O --> G
+    O --> C
+    O --> T["Execution Trace"]
+    R --> T
+    C --> T
+    T --> Q["Outcome / Trajectory / Component Evaluation"]
+    Q --> N["Optimization Proposal"]
+    N --> X["Isolated Replay Validation"]
+    X --> H
+    H --> K["Versioned Apply / Rollback"]
+    K -. "active configuration" .-> S
 ```
 
-Runtime Core 维护顺序反馈循环和不可变状态快照；Orchestration 决定下一项可执行任务；Context-Memory 为当前推理组装信息并管理长期经验；Tool Ecosystem 执行能力调用；Evaluation 将分散的运行记录归一为可分析轨迹；Governance 对可能改变外部环境或内部状态的操作进行分级决策。
+核心模块的职责边界如下：
 
-Persistence 通过各模块已有的窄接口提供可选 SQLite 实现，持久化 State、Trace、Task Graph Cursor、Context、Archive 与 Memory。Core 只暴露通用 `resume(run_id)`，不会感知 SQLite 或把其他模块状态塞入 `AgentState`；未确认结果的外部动作会阻塞恢复，不会静默重放。
+| 模块 | 核心职责 |
+| --- | --- |
+| Runtime Core | 推进顺序反馈循环，冻结运行策略，维护状态快照并统一停止语义 |
+| Orchestration | 维护版本化任务图，选择可执行节点，分类失败并生成恢复计划 |
+| Context / Memory | 组装推理上下文，归档完整快照，恢复必要信息并治理长期记忆 |
+| Tool Ecosystem | 匹配能力和服务，将已授权意图交给工具或隔离 Agent 执行 |
+| Governance | 依据规则、风险、置信度和审核要求决定拒绝、放行或等待复核 |
+| Evaluation / Evolution | 归一化执行事实，定位失败模式，生成建议并执行隔离回放验证 |
+| Persistence | 持久化状态、轨迹、任务图游标、Context、Memory 和治理回执 |
+| 大语言模型（Large Language Model，LLM）Gateway | 以模型无关接口处理后端适配、结构化输出、路由、预算和响应校验 |
 
-模型接入由 provider-neutral LLM Gateway 提供，包括后端适配、结构化输出、路由、预算和响应校验。它属于运行基础设施，不改变 Runtime 对任务、工具和状态的最终控制权。
+Persistence 通过窄接口提供内存或 SQLite 实现。Runtime Core 只暴露通用的 `resume(run_id)`，不感知具体存储后端，也不把模块私有状态塞入 `AgentState`。
 
-Runtime Core 还提供 Run 级统一停止控制：最大动作轮数、聚合 Token/成本、分层时间预算、重复工具调用、状态停滞和关键工具不可恢复失败。墙钟期限默认不启用；长工具使用独立超时和开始前准入，避免被短全局超时误杀。完整语义见 [运行停止机制设计](docs/运行停止机制设计.md)。
+Runtime Core 还统一控制最大动作轮数、Token 与成本预算、分层时间预算、重复工具调用、状态停滞和关键工具失败。长工具拥有独立超时和开始前准入；完整语义见[运行停止机制设计](docs/运行停止机制设计.md)。
 
 ## 核心技术设计
 
-### 1. 运行时控制的提案流水线（Runtime-owned Proposal Pipeline）
+四条设计主线共同约束 Agent 的动态能力、认知状态和系统演化。
 
-模型或 Agent 只产生提案（Proposal），不直接获得工具执行和状态修改权限。动作提案必须落在运行时计算出的可执行集合内；任务图变更（Graph Mutation）必须满足节点、依赖与策略白名单；工具意图还要重新经过能力匹配、服务选择和治理授权。
+### 运行时控制的提案流水线
 
-系统将动态能力统一拆分为 **提案生成（Proposal）→ 校验（Validation）→ 治理决策（Governance）→ 执行（Execution）** 四个阶段，使模型负责语义判断，运行时保留最终控制权。授权信息与请求指纹、策略版本和目标快照绑定，避免审批结果被复用于已经变化的操作。
+模型或 Agent 只产生 Proposal，不直接获得工具执行和状态修改权限。动作提案必须落在 Runtime 计算出的可执行集合内；任务图变更必须满足节点、依赖与策略白名单；工具意图还要重新经过能力匹配、服务选择和治理授权。
 
-### 2. 版本化动态任务图（Versioned Dynamic Task Graph）
+完整链路是 Proposal → Validation → Governance → Execution。授权与请求指纹、策略版本和目标快照绑定，避免审批结果被复用于已经变化的操作。
 
-任务图不是可被任意修改的共享对象，而是经过不变量校验的不可变 DAG 快照。节点状态、图版本、动作和观测结果具有明确关联；只有成功执行产生的合法变更才能形成下一版本，失败则沿依赖关系传播阻塞状态。
+### 版本化动态任务图
 
-这种设计在“固定工作流”和“模型自由规划”之间建立了受约束的动态层：执行反馈能够改变后续任务，同时每次变化都可追踪、可验证，也不会绕过调度规则。节点失败后，由失败分类器（Failure Classifier）与恢复规划器（Recovery Planner）生成重试、策略替换、恢复节点或依赖重连方案；恢复计划经过治理审核后写入新图版本并继续调度，而不是直接终止整个计划。
+任务图采用经过不变量校验的不可变有向无环图（Directed Acyclic Graph，DAG）快照。节点状态、图版本、动作和观测结果具有明确关联；只有成功执行产生的合法变更才能形成下一版本。
 
-### 3. 基于证据约束的认知状态演化（Evidence-bound Cognitive State Evolution）
+失败分类器和恢复规划器可以生成重试、策略替换、恢复节点或依赖重连方案。恢复计划经过治理审核后写入新图版本，再由调度器继续执行。
 
-上下文压缩（Context Compression）不是覆盖原始内容：运行时会先归档完整快照，再保存核心结论和恢复引用。压缩、归档和恢复均采用版本化写入与冲突检查，失败时执行补偿操作。
+### 基于证据约束的认知状态演化
 
-每次节点执行前，上下文生命周期管理（Context Lifecycle Runtime）会测量当前 Token 压力，结合信息重要性、驻留策略和访问历史自动选择压缩或归档动作。缺失必要上下文时，会从归档中自动恢复，随后重新调度，并将实际访问情况写回下一版本快照。
+Context 压缩不会覆盖原始内容。Runtime 先归档完整快照，再保存核心结论和恢复引用；压缩、归档与恢复都采用版本化写入和冲突检查。
 
-记忆更新（Memory Update）同样不是直接覆盖。每个候选记忆必须携带条件、证据、置信度和演化类型。支持关系（Support）用于累积证据，修改关系（Modify）产生新版本，冲突关系（Conflict）保留原结论并记录反证，冲突记忆默认退出召回。通过候选指纹、幂等写入和版本检查共同保证重复执行与并发更新不会静默污染长期状态。
+Memory 更新同样不直接覆盖历史记录。每个候选记忆携带条件、证据、置信度、作用域和演化类型；支持、修改与冲突关系分别累积证据、形成新版本或保留反证。冲突记忆默认退出召回。
 
-### 4. 从运行轨迹到保守优化提案（Trace-to-Proposal Conservative Evolution）
+### 从运行轨迹到保守优化
 
-运行时将不同模块产生的记录统一整理为带有关联信息和覆盖范围的执行事实，而不是简单保存日志文本。结果评估、轨迹分析与组件评估器能够定位失败来源，包括任务结果、执行顺序或具体运行组件；当轨迹信息不完整时，系统会主动降低评估置信度。
+Evaluation 将模块记录归一为具有关联信息和覆盖范围的执行事实。结果、轨迹与组件评估器可以定位失败来源；证据不完整时，评估结果会降低置信度或标记为无法判定。
 
-失败分析器（Failure Analyzer）按照组件和错误模式聚合跨运行记录。只有当重复失败情况、模式置信度、证据数量和预期收益同时达到阈值时，系统才生成优化提案。
+重复失败模式只有同时满足置信度、证据数量和预期收益阈值，才会形成优化建议。建议不会直接改变活动配置；隔离回放、治理授权、版本化激活和回滚构成独立提交链。受控自动适配默认关闭，且只接受满足固定边界的低风险候选。
 
-演化运行时（Evolution Runtime）会将提案转换为候选配置，并在持久化重放案例上通过隔离运行时进行非回归验证。验证通过后，仍需经过治理授权才能原子激活下一配置版本。应用后的配置可跨进程读取，回滚同样属于独立的高风险治理操作。
+## 治理场景评测
 
+AAR Governance Scenario Suite 通过权威状态和运行证据评测治理机制。当前目录包含 4 个治理大类、10 个场景族和 30 个可执行案例，其中有 20 个边界或故障案例，以及 10 个合法正向对照案例。
 
-## Research Agent 验证
+| 治理大类 | 场景族 | 案例数 | 验证重点 |
+| --- | --- | ---: | --- |
+| 权限与执行治理 | P1 至 P5 | 17 | 资源作用域、准确效果授权、单次授权、幂等、状态新鲜度和不可信内容隔离 |
+| 外部副作用恢复 | R1 至 R2 | 5 | 已提交响应丢失、未提交重试、结果未知时关闭执行 |
+| 上下文与权威约束 | C1 | 2 | 将业务约束放在模型 Context 之外，并由 Runtime 强制执行 |
+| 长期记忆治理 | M1 至 M2 | 6 | 租户与用户作用域、条件偏好、局部例外和冲突共存 |
 
-Research Agent 是 Runtime 之上的展示应用。一次研究任务会经过任务图初始化、能力匹配、工具执行、Context 组装、Memory 召回、风险复核、报告生成、轨迹评估和治理记录，最终返回结构化报告及完整运行快照。
+评测不依据模型文本是否合理，而是由确定性判定器（Oracle）检查以下证据：
 
-默认模式使用确定性 Fixture，不需要外部模型或 API Key；也可显式配置 OpenAI-compatible API、Anthropic API、Codex CLI 或 Claude Code 后端。
+- 权威数据库最终状态
+- 外部操作尝试、提交结果和幂等键
+- Governance 决策与 Audit 事件
+- 实际提供给模型的 Context
+- Memory 候选、过滤结果和召回证据
 
-## 快速运行
+### 评测层次
 
-要求 Python 3.11+。
+评测系统将确定性机制验证与真实模型行为分开记录：
+
+- **确定性机制评测**：在相同案例上运行 `plain_agent`、`full_aar` 和精确消融 Profile
+- **发布门禁**：要求 Full AAR 全部通过、合法对照全部完成、无未授权或重复副作用、无 Context 或 Memory 泄漏，并确认每项精确消融都能产生预期安全损失
+- **真实模型端到端评测**：按固定模型和重复次数记录危险提案、拦截、安全恢复、合法完成与审批的 `x/n` 计数；Provider 故障单独标记为 `INCONCLUSIVE`
+- **强制故障恢复矩阵**：在模型结构化输出规范化之后、Runtime 治理之前注入危险提案，验证拒绝后的安全恢复
+
+R1/R2 故障发生在外部提交与对账阶段，M1/M2 故障发生在记忆候选与召回阶段。这些案例由各自的跨进程恢复和 Memory Harness 验证，不伪装成模型提案故障。
+
+评测设计、场景清单和运行说明见以下文档：
+
+- [治理场景评测集介绍](docs/AAR治理场景评测集介绍.md)
+- [治理场景评测设计](docs/AAR治理场景评测设计.md)
+- [Governance Scenario Suite 运行说明](applications/governance_scenario_suite/README.md)
+
+### 当前确定性基线
+
+2026-08-22 在当前工作区执行发布门禁，结果如下：
+
+| Profile | Oracle 通过 | 安全损失 | 未授权副作用 | 重复副作用 | Context / Memory 泄漏 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `full_aar` | 30/30 | 0 | 0 | 0 | 0 |
+| `plain_agent` | 19/30 | 11 | 6 | 6 | 4 |
+
+发布门禁同时确认所有精确消融至少触发一项安全损失，10 个合法正向对照在 Full AAR 下全部完成，且评测前后的生产数据库指纹保持不变。
+
+这些结果只证明 Runtime 在受控案例中的机制行为。它们不代表模型本身具有安全边界，也不能解释为生产成功率或用户价值验证。
+
+## 运行验证
+
+项目要求 Python 3.11 或更高版本。安装开发版本后，可分别运行全量测试、严格类型检查和治理发布门禁：
 
 ```powershell
 python -m pip install -e .
-python examples/minimal_loop.py
-python examples/research_demo.py "分析 Tesla 投资价值"
+python -m unittest discover -s tests -p "test_*.py"
+python -m mypy --strict src/adaptive_agent_runtime `
+  applications/governance_scenario_suite `
+  scripts/run_governance_scenarios.py
+python scripts/run_governance_scenarios.py gate `
+  --output-dir artifacts/governance-scenarios
 ```
 
-启动可视化 Research Runtime Console：
+门禁会生成机器可读 JSON 和由相同类型化结果生成的 Markdown 报告。当前验证基线为 721 个单元测试通过，`mypy --strict` 检查 194 个源文件且未发现问题，治理发布门禁通过。
 
-```powershell
-python examples/research_web.py
-```
+## 实现边界
 
-然后访问 `http://127.0.0.1:8765`。未激活 LLM 时使用 Fixture Demo；激活 Target 后，“自动”模式优先执行 LLM Research。右上角“LLM 设置”支持获取 Provider 实时模型列表、动态切换模型，并将 Provider API Key 与目标级模型选择保存到被 Git 忽略的 `config/llm.local.toml`。Codex CLI Target 使用启动 Web 服务的宿主用户 OAuth 会话。
+当前版本存在以下明确边界：
 
-Research Agent 的双模式、运行边界和操作说明见 [应用文档](applications/research_agent/README.md)。
+- Runtime 使用顺序事件循环，尚不支持通用并行调度
+- Store 可选择内存或 SQLite；SQLite 支持跨进程恢复
+- 自动恢复只跨越已提交的 Observation；已开始但结果未知的外部动作进入 `in-doubt` 状态，并阻止静默重放
+- 受治理配置激活目前完整支持的目标范围有限；部分规划参数只完成建议校验，尚未形成激活闭环
+- Replay 已支持基线与候选非回归验证，但现行配置激活流程尚未强制经过 Replay
+- 生产部署仍需接入真实审批服务、领域策略和可隔离的 Replay Workload Executor
 
-Runtime 的私有配置仓库同时持久化 Provider Key 与目标级模型选择。应用可以调用 `TOMLProviderConfigRepository.save_target_selection()` 写入 `[selections.<target-name>]`；加载 Target 时，私有的 `model` 与 `reasoning_effort` 会覆盖 `config/llm.toml` 中的部署默认值。API Target 的探测结果通过 `BackendProbeResult.available_model_ids` 返回实时可用的文本模型列表，界面如何展示与交互由上层应用负责。
-
-持久化运行时在 Composition Root 中显式装配：
-
-```python
-from adaptive_agent_runtime.persistence import SQLitePersistence
-
-storage = SQLitePersistence("runtime.sqlite3")
-planner = DynamicTaskGraphPlanner(
-    initial_graph,
-    graph_store=storage.task_graph_store,
-)
-runtime = AgentRuntime(
-    planner=planner,
-    executor=executor,
-    state_store=storage.state_store,
-    trace_sink=storage.trace_sink,
-)
-
-# 新运行：await runtime.run(task, run_id=run_id)
-# 进程重启后：await runtime.resume(run_id)
-```
-
-## 工程验证与实现边界
-
-- 647 个 `unittest` 用例覆盖 Core、Orchestration、Persistence/Resume、Context-Memory、Tool、Evaluation、Governance、Evolution/Replay、LLM 与 Research Agent。
-- `mypy --strict` 检查 Runtime 包，数据契约以冻结的 Pydantic Model 和显式 Protocol 为主。
-- 当前版本仍使用顺序事件循环，不支持通用并行调度；Store 可选择内存或 SQLite，SQLite 路径支持跨进程 Run Resume。
-- 恢复只自动跨越已提交的 Observation。已经开始但没有结果的外部动作会标记为 in-doubt 并阻塞静默重放，需要人工或外部幂等证明解除。
-- Evaluation 仍只生成 Proposal；Replay、版本化 Apply 和 Rollback 位于独立 Evolution Runtime，并要求应用注入可隔离重放的执行器。Research Demo 展示 Proposal 与模拟 Review，生产环境需接入真实审批服务和领域 Replay Workload Executor。
+更完整的功能状态与实现边界见[系统功能设计说明](docs/系统功能设计说明.md)。
