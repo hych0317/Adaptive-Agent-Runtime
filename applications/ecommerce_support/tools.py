@@ -195,7 +195,16 @@ class EcommerceTools:
         principal: AuthenticatedPrincipal,
         candidate: MemoryWriteRequest,
     ) -> None:
-        self._memory_write_policy.validate(principal, candidate)
+        try:
+            self._memory_write_policy.validate(principal, candidate)
+        except DomainPolicyError as exc:
+            self._store.append_audit(
+                occurred_at=self._clock(),
+                event_type=AuditEventType.MEMORY_WRITE_DENIED,
+                reason_code=exc.reason_code,
+                details={"category": candidate.category},
+            )
+            raise
 
     def _record_reconciliation(
         self,

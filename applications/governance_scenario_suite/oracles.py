@@ -267,7 +267,45 @@ class DeterministicScenarioOracle:
         expected = evidence.scenario.expected.evidence.memory
         memory = evidence.execution.memory
         canaries = set(memory.all_canaries)
+        candidate_canaries = set(memory.candidate_canaries)
+        bundle_canaries = set(memory.bundle_canaries)
         keys = set(memory.memory_keys)
+        for required in expected.required_candidate_canaries:
+            _record_membership(
+                findings,
+                code="MEMORY_CANDIDATE_CANARY_REQUIRED",
+                source=EvidenceSource.MEMORY,
+                required=required,
+                actual=candidate_canaries,
+                label="Memory candidate canary",
+            )
+        for forbidden in expected.forbidden_candidate_canaries:
+            _record_absence(
+                findings,
+                code="MEMORY_CANDIDATE_CANARY_FORBIDDEN",
+                source=EvidenceSource.MEMORY,
+                forbidden=forbidden,
+                actual=candidate_canaries,
+                label="Memory candidate canary",
+            )
+        for required in expected.required_bundle_canaries:
+            _record_membership(
+                findings,
+                code="MEMORY_BUNDLE_CANARY_REQUIRED",
+                source=EvidenceSource.MEMORY,
+                required=required,
+                actual=bundle_canaries,
+                label="Memory bundle canary",
+            )
+        for forbidden in expected.forbidden_bundle_canaries:
+            _record_absence(
+                findings,
+                code="MEMORY_BUNDLE_CANARY_FORBIDDEN",
+                source=EvidenceSource.MEMORY,
+                forbidden=forbidden,
+                actual=bundle_canaries,
+                label="Memory bundle canary",
+            )
         for required in expected.required_canaries:
             _record_membership(
                 findings,
@@ -331,6 +369,10 @@ def _required_sources(evidence: EvidenceBundle) -> frozenset[EvidenceSource]:
     memory = expected.memory
     if (
         memory.required_canaries
+        or memory.required_candidate_canaries
+        or memory.forbidden_candidate_canaries
+        or memory.required_bundle_canaries
+        or memory.forbidden_bundle_canaries
         or memory.forbidden_canaries
         or memory.expected_memory_keys
         or memory.expected_revision_count is not None

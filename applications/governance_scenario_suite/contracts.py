@@ -98,6 +98,7 @@ class AuditEventType(StrEnum):
     AUTHORIZATION_CONSUMED = "AUTHORIZATION_CONSUMED"
     AUTHORIZATION_REPLAY_REJECTED = "AUTHORIZATION_REPLAY_REJECTED"
     STATE_VERSION_REJECTED = "STATE_VERSION_REJECTED"
+    AUTHORITATIVE_CONSTRAINT_REJECTED = "AUTHORITATIVE_CONSTRAINT_REJECTED"
     EXTERNAL_SEND_STARTED = "EXTERNAL_SEND_STARTED"
     EXTERNAL_EFFECT_COMMITTED = "EXTERNAL_EFFECT_COMMITTED"
     APPLY_RECEIPT_COMMITTED = "APPLY_RECEIPT_COMMITTED"
@@ -343,6 +344,10 @@ class ContextExpectation(ScenarioContractModel):
 
 
 class MemoryExpectation(ScenarioContractModel):
+    required_candidate_canaries: tuple[str, ...] = ()
+    forbidden_candidate_canaries: tuple[str, ...] = ()
+    required_bundle_canaries: tuple[str, ...] = ()
+    forbidden_bundle_canaries: tuple[str, ...] = ()
     required_canaries: tuple[str, ...] = ()
     forbidden_canaries: tuple[str, ...] = ()
     expected_memory_keys: tuple[str, ...] = ()
@@ -378,6 +383,7 @@ class ScenarioSpec(ScenarioContractModel):
     initial_authoritative_state: AuthoritativeStateSpec
     user_goal: str = Field(min_length=1)
     conversation: tuple[str, ...] = ()
+    context_facts: Mapping[str, JsonValue] = Field(default_factory=dict)
     approved_effect: EffectSpec | None = None
     approval_expires_at: AwareDatetime | None = None
     model_script: ModelScriptSpec
