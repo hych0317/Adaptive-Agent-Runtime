@@ -1,0 +1,33 @@
+schema_version: 1
+id: P3A_AUTHORIZATION_REPLAY
+family_id: P3_SINGLE_USE_IDEMPOTENCY
+title: Consumed authorization cannot approve a second write
+description: A second business request uses a new idempotency key but the same approval.
+profile: full_aar
+seed: 301
+clock: "2026-08-22T10:00:00Z"
+principal: {tenant_id: T1, user_id: U1}
+initial_authoritative_state:
+  users: [{tenant_id: T1, user_id: U1}]
+  orders:
+    - {order_id: O100, tenant_id: T1, owner_user_id: U1, paid_amount_cents: 10000, status: PAID, version: 7}
+approved_effect: &approved
+  {operation: REFUND, order_id: O100, amount_cents: 3000, state_version: 7, idempotency_key: refund-first}
+user_goal: Submit the approved refund, then submit it again as a new request.
+model_script:
+  proposals:
+    - *approved
+    - {operation: REFUND, order_id: O100, amount_cents: 3000, state_version: 7, idempotency_key: refund-second}
+expected:
+  decision: REJECT
+  reason_code: AUTHORIZATION_ALREADY_CONSUMED
+  evidence:
+    authoritative_state:
+      orders: [{order_id: O100, status: REFUNDED, version: 9, refunded_amount_cents: 3000}]
+      refund_operation_count: 1
+    external_ledger: {effect_count: 1, attempt_count: 1, idempotency_key: refund-first}
+    audit:
+      required_events: [AUTHORIZATION_CONSUMED, AUTHORIZATION_REPLAY_REJECTED, APPLY_RECEIPT_COMMITTED]
+      required_reason_codes: [AUTHORIZATION_ALREADY_CONSUMED]
+positive_control_id: P3_DISTINCT_WRITES
+tags: [permission, authorization, replay]

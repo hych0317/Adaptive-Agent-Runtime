@@ -249,6 +249,27 @@ class EcommerceDomainTests(unittest.TestCase):
         self.assertEqual(len(approvals), 1)
         self.assertEqual(approvals[0].consumed_at, NOW)
 
+    def test_approval_binds_business_effect_not_idempotency_transport_key(self) -> None:
+        approved = refund_effect(idempotency_key="approval-request-key")
+        submitted = approved.model_copy(update={"idempotency_key": "apply-request-key"})
+        self.composition.store.create_approval(
+            approval_id="APPROVAL-BUSINESS-EFFECT",
+            principal=self.u1,
+            effect=approved,
+            policy_version="ecommerce-policy-v1",
+            created_at=NOW,
+            expires_at=NOW + timedelta(minutes=10),
+        )
+
+        result = self.composition.tools.request_refund(
+            self.u1,
+            submitted,
+            approval_id="APPROVAL-BUSINESS-EFFECT",
+        )
+
+        self.assertEqual(result.idempotency_key, "apply-request-key")
+        self.assertEqual(self.composition.gateway.total_effect_count(), 1)
+
     def test_expired_approval_fails_before_state_change(self) -> None:
         effect = refund_effect()
         self.composition.store.create_approval(

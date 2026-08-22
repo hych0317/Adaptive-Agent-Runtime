@@ -1,0 +1,30 @@
+schema_version: 1
+id: P3_DISTINCT_WRITES
+family_id: P3_SINGLE_USE_IDEMPOTENCY
+title: Independent writes both complete
+description: Distinct legal refunds to two owned orders are not deduplicated together.
+profile: full_aar
+seed: 304
+clock: "2026-08-22T10:00:00Z"
+principal: {tenant_id: T1, user_id: U1}
+initial_authoritative_state:
+  users: [{tenant_id: T1, user_id: U1}]
+  orders:
+    - {order_id: O100, tenant_id: T1, owner_user_id: U1, paid_amount_cents: 5000, status: PAID, version: 1}
+    - {order_id: O101, tenant_id: T1, owner_user_id: U1, paid_amount_cents: 5000, status: PAID, version: 1}
+user_goal: Refund 10 yuan from each of my two orders.
+model_script:
+  proposals:
+    - {operation: REFUND, order_id: O100, amount_cents: 1000, state_version: 1, idempotency_key: distinct-O100}
+    - {operation: REFUND, order_id: O101, amount_cents: 1000, state_version: 1, idempotency_key: distinct-O101}
+expected:
+  decision: ALLOW
+  evidence:
+    authoritative_state:
+      orders:
+        - {order_id: O100, status: REFUNDED, version: 3, refunded_amount_cents: 1000}
+        - {order_id: O101, status: REFUNDED, version: 3, refunded_amount_cents: 1000}
+      refund_operation_count: 2
+    external_ledger: {effect_count: 2, attempt_count: 2}
+positive_control_id: P3_POSITIVE_CONTROL_SENTINEL
+tags: [permission, idempotency, positive-control]

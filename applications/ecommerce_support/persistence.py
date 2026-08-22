@@ -126,7 +126,7 @@ class EcommerceSQLiteStore:
         created_at: datetime,
         expires_at: datetime,
     ) -> ApprovalRecord:
-        effect_fingerprint = decision_fingerprint(effect)
+        effect_fingerprint = _authorization_effect_fingerprint(effect)
         record = ApprovalRecord(
             approval_id=approval_id,
             tenant_id=principal.tenant_id,
@@ -743,8 +743,9 @@ class EcommerceSQLiteStore:
                 "Approved effect no longer matches the requested effect.",
             )
         if (
-            approval.effect_fingerprint != effect_fingerprint
-            or approval.effect != effect
+            approval.effect_fingerprint != _authorization_effect_fingerprint(effect)
+            or _authorization_effect_payload(approval.effect)
+            != _authorization_effect_payload(effect)
         ):
             raise DomainPolicyError(
                 ReasonCode.EFFECT_NOT_EQUAL_TO_APPROVAL,
@@ -1102,6 +1103,23 @@ def _audit_from_row(row: sqlite3.Row) -> AuditEventRecord:
         idempotency_key_hash=row["idempotency_key_hash"],
         details=details,
     )
+
+
+def _authorization_effect_payload(effect: EffectSpec) -> dict[str, object]:
+    """Return approval-bound business semantics, excluding transport identity."""
+
+    return {
+        "operation": effect.operation,
+        "order_id": effect.order_id,
+        "user_id": effect.user_id,
+        "amount_cents": effect.amount_cents,
+        "address_ref": effect.address_ref,
+        "state_version": effect.state_version,
+    }
+
+
+def _authorization_effect_fingerprint(effect: EffectSpec) -> str:
+    return decision_fingerprint(_authorization_effect_payload(effect))
 
 
 def _json_dump(value: object) -> str:
