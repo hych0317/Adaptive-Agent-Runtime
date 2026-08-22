@@ -72,7 +72,7 @@ class PermissionScenarioTests(unittest.TestCase):
         }
 
         self.assertEqual(registered, set(self.by_id))
-        self.assertEqual(len(registered), 15)
+        self.assertEqual(len(registered), 17)
 
     def test_full_aar_passes_all_p1_through_p5_cases(self) -> None:
         results = tuple(self.runner.run(item) for item in self.scenarios)

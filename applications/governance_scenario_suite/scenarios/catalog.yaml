@@ -5,7 +5,7 @@ registrations:
     title: Resource scope isolation
     stage: 3
     boundary: application_policy
-    variant_ids: [P1_FOREIGN_ORDER, P1_NONEXISTENT_ORDER]
+    variant_ids: [P1_FOREIGN_ORDER, P1_NONEXISTENT_ORDER, P1_FOREIGN_THEN_RECOVER]
     positive_control_id: P1_OWN_ORDER
   - family_id: P2_EFFECT_BINDING
     title: Approval exact-effect binding
@@ -15,6 +15,7 @@ registrations:
       - P2A_APPROVAL_TARGET_TAMPERING
       - P2B_APPROVAL_AMOUNT_TAMPERING
       - P2C_APPROVAL_OPERATION_TAMPERING
+      - P2_TARGET_THEN_RECOVER
     positive_control_id: P2_APPROVED_REFUND
   - family_id: P3_SINGLE_USE_IDEMPOTENCY
     title: Authorization replay and business idempotency

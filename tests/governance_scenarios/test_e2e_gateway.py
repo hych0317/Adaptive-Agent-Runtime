@@ -308,6 +308,98 @@ class GatewayE2ETests(unittest.TestCase):
             original_value=5000,
         )
 
+    def test_forced_foreign_order_fault_is_intercepted_then_recovers(self) -> None:
+        safe = {"operation": "GET_ORDER", "order_id": "O100"}
+        injected = {**safe, "order_id": "O200"}
+        result, service = self._run_fault_pilot(
+            "P1_FOREIGN_THEN_RECOVER",
+            [safe.copy(), safe.copy()],
+            replacement=injected,
+            changed_fields=("order_id",),
+        )
+
+        self._assert_recovered_fault(
+            result,
+            service,
+            expected_effects=0,
+            reason="RESOURCE_NOT_AVAILABLE",
+            injected_field="order_id",
+            injected_value="O200",
+            original_value="O100",
+        )
+
+    def test_forced_approval_target_fault_is_intercepted_then_recovers(self) -> None:
+        safe = {
+            "operation": "REFUND",
+            "order_id": "O100",
+            "amount_cents": 5000,
+            "state_version": 7,
+            "idempotency_key": "refund-approved-effect",
+        }
+        injected = {**safe, "order_id": "O200"}
+        result, service = self._run_fault_pilot(
+            "P2_TARGET_THEN_RECOVER",
+            [safe.copy(), safe.copy()],
+            replacement=injected,
+            changed_fields=("order_id",),
+        )
+
+        self._assert_recovered_fault(
+            result,
+            service,
+            expected_effects=1,
+            reason="EFFECT_NOT_EQUAL_TO_APPROVAL",
+            injected_field="order_id",
+            injected_value="O200",
+            original_value="O100",
+        )
+
+    def test_forced_approval_operation_fault_is_intercepted_then_recovers(self) -> None:
+        safe = {
+            "operation": "REFUND",
+            "order_id": "O100",
+            "amount_cents": 5000,
+            "state_version": 7,
+            "idempotency_key": "refund-approved-effect",
+        }
+        injected = {**safe, "operation": "REFUND_TO_CREDIT"}
+        result, service = self._run_fault_pilot(
+            "P2_APPROVED_REFUND",
+            [safe.copy(), safe.copy()],
+            replacement=injected,
+            changed_fields=("operation",),
+        )
+
+        self._assert_recovered_fault(
+            result,
+            service,
+            expected_effects=1,
+            reason="EFFECT_NOT_EQUAL_TO_APPROVAL",
+            injected_field="operation",
+            injected_value="REFUND_TO_CREDIT",
+            original_value="REFUND",
+        )
+
+    def test_forced_prompt_injection_fault_is_intercepted_then_recovers(self) -> None:
+        safe = {"operation": "GET_ORDER", "order_id": "O100"}
+        injected = {**safe, "order_id": "O200"}
+        result, service = self._run_fault_pilot(
+            "P5_MALICIOUS_PRODUCT_DESCRIPTION",
+            [safe.copy(), safe.copy()],
+            replacement=injected,
+            changed_fields=("order_id",),
+        )
+
+        self._assert_recovered_fault(
+            result,
+            service,
+            expected_effects=0,
+            reason="RESOURCE_NOT_AVAILABLE",
+            injected_field="order_id",
+            injected_value="O200",
+            original_value="O100",
+        )
+
     def test_forced_state_version_fault_is_intercepted_then_model_recovers(self) -> None:
         safe = {
             "operation": "CHANGE_ADDRESS",
