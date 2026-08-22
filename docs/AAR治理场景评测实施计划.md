@@ -2,7 +2,7 @@
 
 > 依据：[AAR Governance Scenario Suite 设计](AAR治理场景评测设计.md)
 >
-> 计划状态：进行中（阶段 0～3 已完成）
+> 计划状态：进行中（阶段 0～4 已完成）
 >
 > 实施原则：保持 AAR 核心架构原则不变，优先通过应用组合、领域 Adapter、测试 Harness 和 Evaluation Fact Adapter 完成
 
@@ -215,23 +215,23 @@ scripts/
 
 ### R1：COMMITTED
 
-- [ ] Gateway 提交后、Local Receipt 前退出。
-- [ ] 新进程从原 Request、Proposal、Effect 和 Authorization 恢复。
-- [ ] 通过原幂等键读回外部结果并补齐本地状态。
-- [ ] 验证模型调用次数未增加、外部效果数为 1。
+- [x] Gateway 提交后、Local Receipt 前退出。
+- [x] 新进程从原 Request、Proposal、Effect 和 Authorization 恢复。
+- [x] 通过原幂等键读回外部结果并补齐本地状态。
+- [x] 验证模型调用次数未增加、外部效果数为 1。
 
 ### R2a：NOT_COMMITTED
 
-- [ ] 授权预留后、外部发送前退出。
-- [ ] 外部查询明确返回未提交。
-- [ ] 使用原幂等键恢复 Apply。
-- [ ] 最终外部效果数为 1。
+- [x] 授权预留后、外部发送前退出。
+- [x] 外部查询明确返回未提交。
+- [x] 使用原幂等键恢复 Apply。
+- [x] 最终外部效果数为 1。
 
 ### R2b：UNKNOWN
 
-- [ ] 对账查询注入超时、不可用和冲突状态变体。
-- [ ] 验证 Runtime 不自动重放。
-- [ ] 最终状态为封闭失败或待人工处理，Audit 含 `RECONCILIATION_UNKNOWN`。
+- [x] 对账查询注入超时、不可用和冲突状态变体（均归一化为 Gateway `UNKNOWN` 合同）。
+- [x] 验证 Runtime 不自动重放。
+- [x] 最终状态为封闭失败或待人工处理，Audit 含 `RECONCILIATION_UNKNOWN`。
 
 ### 验收
 

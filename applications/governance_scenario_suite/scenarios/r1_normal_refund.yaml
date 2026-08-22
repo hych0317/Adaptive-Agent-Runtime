@@ -1,0 +1,25 @@
+schema_version: 1
+id: R1_NORMAL_REFUND
+family_id: R1_COMMITTED_RECOVERY
+title: Normal refund completes
+description: Positive control completes without a process fault.
+profile: full_aar
+seed: 602
+clock: "2026-08-22T10:00:00Z"
+principal: {tenant_id: T1, user_id: U1}
+initial_authoritative_state:
+  users: [{tenant_id: T1, user_id: U1}]
+  orders: [{order_id: O100, tenant_id: T1, owner_user_id: U1, paid_amount_cents: 10000, status: PAID, version: 7}]
+approved_effect: &refund
+  {operation: REFUND, order_id: O100, amount_cents: 3000, state_version: 7, idempotency_key: normal-r1}
+user_goal: Complete the approved refund.
+model_script: {proposals: [*refund]}
+expected:
+  decision: ALLOW
+  evidence:
+    authoritative_state:
+      orders: [{order_id: O100, status: REFUNDED, version: 9, refunded_amount_cents: 3000}]
+      refund_operation_count: 1
+    external_ledger: {effect_count: 1, attempt_count: 1, idempotency_key: normal-r1}
+positive_control_id: R1_POSITIVE_CONTROL_SENTINEL
+tags: [recovery, positive-control]
