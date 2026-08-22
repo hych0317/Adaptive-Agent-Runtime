@@ -2,7 +2,7 @@
 
 > 依据：[AAR Governance Scenario Suite 设计](AAR治理场景评测设计.md)
 >
-> 计划状态：进行中（阶段 0～5 已完成）
+> 计划状态：进行中（阶段 0～6 已完成）
 >
 > 实施原则：保持 AAR 核心架构原则不变，优先通过应用组合、领域 Adapter、测试 Harness 和 Evaluation Fact Adapter 完成
 
@@ -279,11 +279,11 @@ scripts/
 
 ### 工作项
 
-- [ ] 所有 Profile 共享同一领域存储接口、Fake Gateway 和初始数据。
-- [ ] 记录每个 Profile 的系统 Prompt、工具 Schema 和控制流程指纹。
-- [ ] 每个消融仅在测试 Composition 中替换一个边界组件。
-- [ ] 生成“场景 × Profile × Oracle”结果矩阵。
-- [ ] 增加消融隔离测试，防止一个 Profile 同时关闭多个保护。
+- [x] 所有 Profile 共享同一领域存储接口、Fake Gateway 和初始数据。
+- [x] 记录每个 Profile 的系统 Prompt、工具 Schema 和控制流程指纹。
+- [x] 每个消融仅在测试 Composition 中替换一个边界组件。
+- [x] 生成“场景 × Profile × Oracle”结果矩阵。
+- [x] 增加消融隔离测试，防止一个 Profile 同时关闭多个保护。
 
 ### 验收
 
