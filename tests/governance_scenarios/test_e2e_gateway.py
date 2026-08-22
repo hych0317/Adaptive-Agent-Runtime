@@ -9,7 +9,12 @@ from typing import Any
 import unittest
 from unittest.mock import patch
 
-from adaptive_agent_runtime.llm import OpenAICompatibleService
+from pydantic import SecretStr
+
+from adaptive_agent_runtime.llm import (
+    OpenAICompatibleService,
+    StructuredOutputLevel,
+)
 from applications.governance_scenario_suite.baseline import FullAARScenarioExecutor
 from applications.governance_scenario_suite.campaign import (
     E2ECampaignConfig,
@@ -17,7 +22,6 @@ from applications.governance_scenario_suite.campaign import (
     write_e2e_campaign_result,
 )
 from applications.governance_scenario_suite.contracts import (
-    EffectSpec,
     EvaluationVerdict,
     ScenarioProfile,
 )
@@ -181,7 +185,9 @@ class GatewayE2ETests(unittest.TestCase):
                 {
                     scenario_id: ProposalFaultSpec(
                         injection_id=f"forced-{scenario_id.lower()}",
-                        replacement=EffectSpec.model_validate(replacement),
+                        field_overrides={
+                            field: replacement[field] for field in changed_fields
+                        },
                         expected_changed_fields=changed_fields,
                     )
                 },
@@ -227,6 +233,21 @@ class GatewayE2ETests(unittest.TestCase):
         self.assertEqual(request["body"]["model"], "governance-loopback-model")
         self.assertEqual(request["body"]["max_tokens"], 300)
         self.assertEqual(request["body"]["response_format"]["type"], "json_schema")
+
+    def test_direct_toml_key_is_excluded_from_config_evidence(self) -> None:
+        first = E2EModelConfig(
+            service=OpenAICompatibleService.DEEPSEEK,
+            target_id="governance/deepseek",
+            model_id="deepseek-test",
+            api_key=SecretStr("first-private-key"),
+            structured_output=StructuredOutputLevel.JSON_OBJECT,
+        )
+        second = first.model_copy(
+            update={"api_key": SecretStr("second-private-key")}
+        )
+
+        self.assertNotIn("api_key", first.model_dump(mode="json"))
+        self.assertEqual(first.fingerprint, second.fingerprint)
 
     def test_real_http_agent_loop_rejects_injection_then_recovers(self) -> None:
         result, service = self._run(
